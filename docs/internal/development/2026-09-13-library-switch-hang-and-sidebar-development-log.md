@@ -278,3 +278,29 @@ refresh.managed-assets.stage  stage=precompute-fingerprints  dur≈35–38 ms   
 
 第二轮的三处准入修复是有效的（加载态也从 ≥90 s 超时降到 2.1–2.7 s），**但「切换必须等离场库的后台对账让出」这一结构问题仍在**：切换请求只有在 Worker 读到它之后才能取消离场库的对账，而阻塞期间连消息都读不进去。彻底解决需要让对账的同步段足够短（或可被外部抢占），属独立的下一步，不在本轮用补丁绕过。
 
+
+## 第四轮：三处界面/文案收敛（用户反馈）
+
+1. **未加载好的资产不再显示文件图标**（`AssetCardMedia.tsx`）：无封面时（还在解码、
+   延迟加载、首屏未到）渲染空白，不再画一个文件图标让「暂时没缩略图」看起来像
+   「文件坏了」。真正的解码/生成失败仍保留裂纹文件图标 —— 那是错误信号，不是占位。
+2. **NAS 提示收敛**（`zh-CN.ts` / `en.ts`）：`shell.networkStorageNotice` 改为
+   「该资源库位于网络共享（NAS）上。可能出现加载较慢等问题。」/ "This library is on
+   a network share (NAS). Loading may be slower."。回滚日志、同一时间只允许一个实例
+   写入、做好备份这些**实现约束**从用户界面移除（用户 2026-09-13 要求；符合
+   `docs/internal/ui/0004`：界面只说用户会遇到的结果）。
+3. **移除 Inspector 的「文件丢失」状态块**（`InspectorPanel.tsx`）：状态行、恢复候选
+   文案、「找回资产」按钮，以及只为它服务的 `probeMissingAssetRecovery` 轮询一并删除
+   （`onRelink` 属性与 App 侧传参同步清理，不留死参数）。回收站/数据损坏两个状态保留。
+   找回资产能力仍在：右键菜单 `asset.relink` 与工作区「批量重新定位」不受影响。
+   后端 `probeMissingAssetRecovery` 读写路径保留（无 UI 消费者，属协议清理的独立议题，
+   不在本轮改动范围）。
+
+测试同步：`tests/e2e/trash-relink-flow.test.ts` 原先断言 Inspector 状态行与其中的
+「找回资产」按钮，改为断言该状态行**不存在**、工作区「批量重新定位」仍在。
+注意该 E2E 目前仍有**既有**失败（导入步骤报内部英文错误
+`A library transition is already in progress.`，已在干净 HEAD 上用 `git stash`
+复跑确认为既有缺陷，另开 Serpent-283094），因此本轮新增的断言暂未能跑到绿色。
+
+验证：typecheck / eslint 干净；`i18n-translate`、`asset-commands`（52 例）、
+`inspector-preview` 共 60 例通过。

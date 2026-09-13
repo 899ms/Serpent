@@ -13397,7 +13397,6 @@ function AppInner() {
         onAssignTagToAsset={(tagId) => void handleInspectorAssignTag(tagId)}
         onCreateAndAssignTag={(tagName) => void handleInspectorCreateAndAssignTag(tagName)}
         onOpenSourceUrl={handleOpenSourceUrl}
-        onRelink={(assetId) => { void relinkMissingAsset(assetId); }}
         onPaletteColorCopy={(color, copied) => {
           if (copied) {
             setNotice(t("toast.colorCopiedAlt", { color }));
