@@ -9,6 +9,9 @@ import {
 
 const STATUS_REQUEST_CAP = 300;
 
+/** Stable empty result so an inactive hook always returns the same identity. */
+const EMPTY_STATUSES: ReadonlyMap<string, SyncCardPersistedStatus> = new Map();
+
 export function useSyncCardStatuses(input: {
   api: SerpentLibraryApi | null | undefined;
   libraryId: string | undefined;
@@ -17,45 +20,55 @@ export function useSyncCardStatuses(input: {
   assetIds: readonly string[];
   syncing: boolean;
 }): ReadonlyMap<string, SyncCardStatus> {
-  const [persisted, setPersisted] = useState<Map<string, SyncCardPersistedStatus>>(
-    () => new Map(),
-  );
   const assetIdKey = useMemo(
     () => input.assetIds.slice(0, STATUS_REQUEST_CAP).join("\n"),
     [input.assetIds],
   );
+  /**
+   * The key the stored statuses belong to. When the hook is inactive (no
+   * library, unbound, badges hidden) or there is nothing to ask about, this is
+   * empty and the stale map is simply not used — writing an empty map from the
+   * effect body instead would be a synchronous setState during render commit
+   * (cascading re-render), which is what the lint rule forbids.
+   */
+  const activeKey = !input.api || !input.libraryId || !input.bound || !input.showBadges
+    ? ""
+    : assetIdKey;
+  const [persistedState, setPersistedState] = useState<{
+    key: string;
+    statuses: ReadonlyMap<string, SyncCardPersistedStatus>;
+  }>(() => ({ key: "", statuses: EMPTY_STATUSES }));
 
   useEffect(() => {
-    if (!input.api || !input.libraryId || !input.bound || !input.showBadges) {
-      setPersisted(new Map());
-      return;
-    }
-    const assetIds = assetIdKey.length === 0 ? [] : assetIdKey.split("\n");
-    if (assetIds.length === 0) {
-      setPersisted(new Map());
-      return;
-    }
+    const api = input.api;
+    const libraryId = input.libraryId;
+    if (!api || !libraryId || activeKey.length === 0) return;
+    const assetIds = activeKey.split("\n");
+    if (assetIds.length === 0) return;
     let cancelled = false;
     let timer: number | undefined;
     const load = () => {
-      if (typeof input.api?.syncListCardStatuses !== "function") return;
+      if (typeof api.syncListCardStatuses !== "function") return;
       if (timer !== undefined) window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         timer = undefined;
-        void input.api!.syncListCardStatuses({
-          libraryId: input.libraryId!,
+        void api.syncListCardStatuses({
+          libraryId,
           assetIds,
         }).then((result) => {
           if (cancelled || !result.ok) return;
-          setPersisted(new Map(
-            result.value.map((entry) => [entry.assetId, entry.status] as const),
-          ));
+          setPersistedState({
+            key: activeKey,
+            statuses: new Map(
+              result.value.map((entry) => [entry.assetId, entry.status] as const),
+            ),
+          });
         }).catch(() => undefined);
       }, 80);
     };
     load();
-    const unsubscribe = input.api.onAssetsChanged((event) => {
-      if (event.libraryId !== input.libraryId) return;
+    const unsubscribe = api.onAssetsChanged((event) => {
+      if (event.libraryId !== libraryId) return;
       load();
     });
     return () => {
@@ -69,8 +82,12 @@ export function useSyncCardStatuses(input: {
     input.bound,
     input.showBadges,
     input.syncing,
-    assetIdKey,
+    activeKey,
   ]);
+
+  const persisted = persistedState.key === activeKey
+    ? persistedState.statuses
+    : EMPTY_STATUSES;
 
   return useMemo(() => {
     const next = new Map<string, SyncCardStatus>();

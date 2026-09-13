@@ -25,6 +25,7 @@ import {
   type SyncManifest,
 } from './manifest';
 import { planSyncActions, type LocalAssetSnapshotEntry } from './sync-plan';
+import type { SyncAssetMetadata } from './sync-metadata';
 import { runSyncActions, withRetry, type SyncRunnerContext } from './sync-runner';
 
 export interface SyncRootConfig {
@@ -47,14 +48,14 @@ export interface SyncLibraryPort {
       contentHash: string;
       size: number;
       modifiedAt: string;
-      metadata?: import('./sync-metadata').SyncAssetMetadata;
+      metadata?: SyncAssetMetadata;
     }>;
   }>;
-  readLocalAssetMetadata?(libraryId: string, syncId: string): Promise<import('./sync-metadata').SyncAssetMetadata>;
+  readLocalAssetMetadata?(libraryId: string, syncId: string): Promise<SyncAssetMetadata>;
   applyRemoteAssetMetadata?(
     libraryId: string,
     syncId: string,
-    metadata: import('./sync-metadata').SyncAssetMetadata,
+    metadata: SyncAssetMetadata,
   ): Promise<void>;
   applySyncContentUpdate(
     libraryId: string,
