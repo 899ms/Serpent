@@ -14,7 +14,10 @@ import type {
 } from './plugin-input-capture-renderer';
 import type { ShellNotifyPayload } from './shell-notify';
 import type { CommandCompletedPayload } from './command-completed';
-import type { ApplicationMenuCommand } from './application-menu';
+import type {
+  ApplicationMenuCommand,
+  ApplicationMenuCommandEvent,
+} from './application-menu';
 
 /**
  * 「在系统浏览器中打开外部链接」的共享规则与类型。
@@ -153,7 +156,7 @@ export interface SerpentShellApi {
   onCopySelection(listener: () => void): () => void;
   /** Main → Renderer: route a native application-menu command. */
   onApplicationMenuCommand(
-    listener: (command: ApplicationMenuCommand) => void,
+    listener: (event: ApplicationMenuCommandEvent) => void,
   ): () => void;
   /** Renderer → Main: sync a native menu item's enabled state (Serpent-q0b1,
    * e.g. business undo is only enabled while an undoable operation exists). */

@@ -7,6 +7,7 @@ import type { AiApiFormat } from '../shared/ai-endpoints';
 import type { AiReliabilitySettings } from '../shared/ai-reliability';
 import type { ViewerVideoShortcutAction } from '../shared/viewer-video-shortcuts';
 import type { BrowseKeyboardAction } from '../shared/browse-keyboard-shortcuts';
+import type { ApplicationMenuCommandEvent } from '../shared/application-menu';
 import type { ApplicationMenuCommand } from '../shared/application-menu';
 import {
   mcpSettingsResponseSchema,
@@ -2707,21 +2708,32 @@ const shell: SerpentShellApi = Object.freeze({
       ipcRenderer.removeListener(COPY_SELECTION_CHANNEL, handler);
     };
   },
-  onApplicationMenuCommand(listener: (command: ApplicationMenuCommand) => void): () => void {
+  onApplicationMenuCommand(listener: (event: ApplicationMenuCommandEvent) => void): () => void {
+    const commands: readonly ApplicationMenuCommand[] = [
+      'invert-selection', 'copy-selection',
+      'file.import-files', 'file.import-folder', 'file.import-linked-folder',
+      'edit.undo', 'edit.redo', 'edit.paste', 'edit.select-all', 'edit.clear-selection',
+      'library.create', 'library.open', 'library.open-recent', 'library.close', 'library.remove',
+      'library.delete-from-disk', 'library.import', 'library.import-eagle', 'library.export', 'library.settings',
+      'window.background-jobs', 'window.diagnostics',
+      'about.serpent', 'about.github', 'about.open-source', 'about.diagnostics', 'settings',
+    ];
     const handler = (_event: Electron.IpcRendererEvent, input: unknown) => {
-      if (typeof input !== 'string') return;
-      const commands: readonly ApplicationMenuCommand[] = [
-        'invert-selection', 'copy-selection',
-        'file.import-files', 'file.import-folder', 'file.import-linked-folder',
-        'edit.undo', 'edit.redo', 'edit.paste', 'edit.select-all', 'edit.clear-selection',
-        'library.create', 'library.open', 'library.close', 'library.remove',
-        'library.delete-from-disk', 'library.import', 'library.import-eagle', 'library.export', 'library.settings',
-        'window.background-jobs', 'window.diagnostics',
-        'about.serpent', 'about.github', 'about.open-source', 'about.diagnostics', 'settings',
-      ];
-      if (commands.includes(input as ApplicationMenuCommand)) {
-        listener(input as ApplicationMenuCommand);
+      // Items with a payload arrive as { command, payload }.
+      if (typeof input === 'string') {
+        if (commands.includes(input as ApplicationMenuCommand)) {
+          listener({ command: input as ApplicationMenuCommand });
+        }
+        return;
       }
+      if (typeof input !== 'object' || input === null) return;
+      const { command, payload } = input as { command?: unknown; payload?: unknown };
+      if (typeof command !== 'string') return;
+      if (!commands.includes(command as ApplicationMenuCommand)) return;
+      listener({
+        command: command as ApplicationMenuCommand,
+        ...(typeof payload === 'string' ? { payload } : {}),
+      });
     };
     ipcRenderer.on(APPLICATION_MENU_COMMAND_CHANNEL, handler);
     return () => {

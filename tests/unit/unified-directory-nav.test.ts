@@ -50,7 +50,7 @@ describe("buildUnifiedDirectoryNavEntries", () => {
         kind: "managed",
         folderId: "root-a",
         name: "A",
-        depth: 1,
+        depth: 0,
         parentFolderId: null,
         directAssetCount: 0,
       },
@@ -58,7 +58,7 @@ describe("buildUnifiedDirectoryNavEntries", () => {
         kind: "managed",
         folderId: "child-a",
         name: "Child",
-        depth: 2,
+        depth: 1,
         parentFolderId: "root-a",
         directAssetCount: 0,
       },
@@ -66,7 +66,7 @@ describe("buildUnifiedDirectoryNavEntries", () => {
         kind: "managed",
         folderId: "root-b",
         name: "B",
-        depth: 1,
+        depth: 0,
         parentFolderId: null,
         directAssetCount: 0,
       },
@@ -110,7 +110,7 @@ describe("buildUnifiedDirectoryNavEntries", () => {
         kind: "managed",
         folderId: "m1",
         name: "Managed",
-        depth: 1,
+        depth: 0,
         parentFolderId: null,
         directAssetCount: 0,
       },
@@ -176,9 +176,9 @@ describe("buildUnifiedDirectoryNavEntries", () => {
 
     expect(entries.map((entry) => [entry.folderId, entry.depth, entry.parentFolderId]))
       .toEqual([
-        ["p", 1, null],
-        ["link", 2, "p"],
-        ["lfv:link/notes", 3, "link"],
+        ["p", 0, null],
+        ["link", 1, "p"],
+        ["lfv:link/notes", 2, "link"],
       ]);
   });
 

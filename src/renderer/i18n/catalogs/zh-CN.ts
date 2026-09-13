@@ -78,6 +78,8 @@ export const zhCN = {
     switchLibrary: "切换资源库…",
     librarySwitchWarning: "当前有一项操作正在进行。Serpent 会等待它完成后再切换资源库；该操作完成后可能仍会改变切换后的显示内容。确定要继续吗？",
     otherLibraries: "其他资源库",
+    recentLibraries: "最近打开",
+    noRecentLibraries: "尚无最近打开",
     createLibrary: "创建资源库",
     createLibraryEllipsis: "新建资源库…",
     openLibrary: "打开资源库",

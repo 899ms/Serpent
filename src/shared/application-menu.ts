@@ -62,6 +62,7 @@ export type ApplicationMenuCommand =
   | "edit.clear-selection"
   | "library.create"
   | "library.open"
+  | "library.open-recent"
   | "library.close"
   | "library.remove"
   | "library.delete-from-disk"
@@ -76,6 +77,13 @@ export type ApplicationMenuCommand =
   | "about.open-source"
   | "about.diagnostics"
   | "settings";
+
+/** A native-menu command click, optionally carrying an item payload. */
+export type ApplicationMenuCommandEvent = {
+  readonly command: ApplicationMenuCommand;
+  /** Item-specific argument, e.g. the recent-library path to open. */
+  readonly payload?: string;
+};
 
 export type ApplicationMenuItemTemplate = {
   readonly role?: ApplicationMenuRole;
@@ -92,6 +100,12 @@ export type ApplicationMenuItemTemplate = {
   readonly submenu?: readonly ApplicationMenuItemTemplate[];
   /** Custom Serpent command (wired in Main when installing the menu). */
   readonly command?: ApplicationMenuCommand;
+  /** Literal display label; when set it wins over `labelKey`. */
+  readonly labelValue?: string;
+  /** Extra argument forwarded with the command click (e.g. a library path). */
+  readonly payload?: string;
+  /** Native enabled state; ignored when a role/command supplies its own. */
+  readonly enabled?: boolean;
 };
 
 export type ApplicationMenuTemplateOptions = {
@@ -102,6 +116,11 @@ export type ApplicationMenuTemplateOptions = {
   readonly locale?: "zh-CN" | "en";
   /** Current app version for the native About submenu. */
   readonly version?: string;
+  /** Known libraries, most recently opened first (native 资源库 menu). */
+  readonly recentLibraries?: readonly {
+    readonly path: string;
+    readonly name: string;
+  }[];
 };
 
 const PAGE_ZOOM_ROLES = new Set(["zoomIn", "zoomOut", "resetZoom"]);
@@ -220,6 +239,30 @@ export function buildApplicationMenuTemplate(
       ]
     : [];
 
+  // Identical, in order, to the renderer's library switcher menu — including its
+  // 其他资源库 section, which opens a recent library directly.
+  const recentLibraryItems: ApplicationMenuItemTemplate[] = (
+    options.recentLibraries ?? []
+  ).map((entry) => ({
+    command: "library.open-recent" as const,
+    labelValue: entry.name,
+    payload: entry.path,
+  }));
+  // User request: 最近打开 is a first-level menu whose submenu lists the
+  // recently opened libraries (the in-app switcher keeps its grouped section).
+  const recentLibrariesMenu: ApplicationMenuItemTemplate = {
+    labelKey: "shell.recentLibraries",
+    submenu:
+      recentLibraryItems.length > 0
+        ? recentLibraryItems
+        : [
+            {
+              labelKey: "shell.noRecentLibraries",
+              enabled: false,
+            } as ApplicationMenuItemTemplate,
+          ],
+  };
+
   const librarySubmenu: ApplicationMenuItemTemplate[] = isMac
     ? [
         commandItem("library.create", "shell.createLibraryEllipsis"),
@@ -233,8 +276,13 @@ export function buildApplicationMenuTemplate(
         commandItem("library.export", "toolbar.exportLibrary"),
         { type: "separator" },
         commandItem("library.settings", "settings.librarySettings"),
+        { type: "separator" },
+        // Hovering 最近打开 expands the recent-library submenu (macOS native
+        // submenu behaviour); each entry opens that library.
+        recentLibrariesMenu,
       ]
     : [];
+
 
   const windowBusinessSubmenu: ApplicationMenuItemTemplate[] = isMac
     ? [
@@ -258,10 +306,12 @@ export function buildApplicationMenuTemplate(
   return isMac
     ? [
         macAppMenu,
+        // User request: the library menu leads (right after the app menu), with
+        // 最近打开 as its own first-level menu beside it.
+        { labelKey: "shell.mainMenuLibrary", submenu: librarySubmenu },
         { labelKey: "shell.mainMenuFile", submenu: fileSubmenu },
         { labelKey: "shell.mainMenuEdit", submenu: editSubmenu },
         { labelKey: "shell.mainMenuView", submenu: viewSubmenu },
-        { labelKey: "shell.mainMenuLibrary", submenu: librarySubmenu },
         {
           labelKey: "shell.mainMenuWindow",
           submenu: [...windowSubmenu, ...windowBusinessSubmenu],

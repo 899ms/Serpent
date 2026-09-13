@@ -150,7 +150,6 @@ import {
 import { resolveSearchFolderResults } from "./search-folder-results";
 import { useT, useLocale, translateForLocale, type AppLocale } from "./i18n";
 import type { AiApiFormat } from "../shared/ai-endpoints";
-import type { ApplicationMenuCommand } from "../shared/application-menu";
 import type { SerpentMcpSettingsApi } from "../shared/mcp";
 import type { HistoryStatus } from "../shared/protocol/responses";
 import { isEditableTextTarget } from "../shared/edit-context-menu";
@@ -5273,17 +5272,27 @@ function AppInner() {
     }
   }
 
-  async function openRecentLibrary(libraryPath: string) {
-    if (!api) return;
-    const recent = recentLibraries.find((entry) => entry.path === libraryPath);
-    await runLibraryOpenPipeline(
-      "opening",
-      () => api.openRecent({ path: libraryPath }),
-      t("toast.openRecentFailed"),
-      undefined,
-      recent?.name ?? null,
-    );
-  }
+  const recentLibrariesRef = useRef(recentLibraries);
+  recentLibrariesRef.current = recentLibraries;
+  const openRecentLibrary = useCallback(
+    async (libraryPath: string) => {
+      if (!api) return;
+      const recent = recentLibrariesRef.current.find(
+        (entry) => entry.path === libraryPath,
+      );
+      await runLibraryOpenPipeline(
+        "opening",
+        () => api.openRecent({ path: libraryPath }),
+        t("toast.openRecentFailed"),
+        undefined,
+        recent?.name ?? null,
+      );
+    },
+    // Stable identity: the native menu effect above subscribes once, and the
+    // pipeline reads live state through refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [api, runLibraryOpenPipeline],
+  );
 
   async function runLibraryOpenPipeline(
     busyState: "creating" | "opening",
@@ -11401,8 +11410,14 @@ function AppInner() {
       }
       return undefined;
     };
-    return shellApi.onApplicationMenuCommand((command: ApplicationMenuCommand) => {
+    return shellApi.onApplicationMenuCommand(({ command, payload }) => {
       const currentMenuSections = mainMenuSectionsRef.current;
+      // Native 资源库 menu: open a recent library by path (same action the
+      // in-app library switcher performs).
+      if (command === "library.open-recent") {
+        if (payload) void openRecentLibrary(payload);
+        return;
+      }
       if (command === "settings") {
         currentMenuSections.find((section) => section.id === "settings")?.onSelect?.();
         return;
@@ -11415,7 +11430,7 @@ function AppInner() {
       // renders greyed out — a native macOS item stays clickable otherwise.
       if (item && !item.disabled) item.onSelect();
     });
-  }, [shellApi]);
+  }, [shellApi, openRecentLibrary]);
 
   useEffect(() => {
     if (!shellApi) return;
@@ -11772,41 +11787,43 @@ function AppInner() {
                   }}
                 />
               )}
-              <LibrarySwitcher
-                busy={busy}
-                disabled={!api}
-                syncStatus={syncBindingStatus}
-                importMenuCopy={importMenuCopy}
-                libraryName={library?.displayName ?? null}
-                libraryOpen={Boolean(library)}
-                onCloseLibrary={() => void closeLibrary()}
-                onRemoveLibrary={() => void removeLibrary()}
-                onDeleteLibraryFromDisk={() => requestDeleteLibraryFromDisk()}
-                onOpenLibrarySettings={() => {
-                  setAppSettingsOpen(false);
-                  setLibrarySettingsOpen(true);
-                }}
-                onCreateLibrary={() => {
-                  setDialogValue(t("shell.myLibrary"));
-                  setCreateLibraryPhase("form");
-                  setDialog("library");
-                }}
-                onExportLibrary={() => setExportDialogOpen(true)}
-                onImportFolder={() => void importAssets("folder")}
-                onImportLibrary={() => {
-                  setOpenLibraryChooserOpen(false);
-                  setImportLibraryChooserOpen(true);
-                }}
-                onImportLinkedFolder={() => void importFolderAsLinked()}
-                onMenuOpen={() => void refreshRecentLibraries()}
-                onOpenLibrary={() => {
-                  setImportLibraryChooserOpen(false);
-                  setOpenLibraryChooserOpen(true);
-                }}
-                onOpenRecent={(path) => void openRecentLibrary(path)}
-                onForgetRecent={(path) => void forgetRecentLibrary(path)}
-                recentLibraries={recentLibraries}
-              />
+              {!leftOpen ? (
+                <LibrarySwitcher
+                  busy={busy}
+                  disabled={!api}
+                  syncStatus={syncBindingStatus}
+                  importMenuCopy={importMenuCopy}
+                  libraryName={library?.displayName ?? null}
+                  libraryOpen={Boolean(library)}
+                  onCloseLibrary={() => void closeLibrary()}
+                  onRemoveLibrary={() => void removeLibrary()}
+                  onDeleteLibraryFromDisk={() => requestDeleteLibraryFromDisk()}
+                  onOpenLibrarySettings={() => {
+                    setAppSettingsOpen(false);
+                    setLibrarySettingsOpen(true);
+                  }}
+                  onCreateLibrary={() => {
+                    setDialogValue(t("shell.myLibrary"));
+                    setCreateLibraryPhase("form");
+                    setDialog("library");
+                  }}
+                  onExportLibrary={() => setExportDialogOpen(true)}
+                  onImportFolder={() => void importAssets("folder")}
+                  onImportLibrary={() => {
+                    setOpenLibraryChooserOpen(false);
+                    setImportLibraryChooserOpen(true);
+                  }}
+                  onImportLinkedFolder={() => void importFolderAsLinked()}
+                  onMenuOpen={() => void refreshRecentLibraries()}
+                  onOpenLibrary={() => {
+                    setImportLibraryChooserOpen(false);
+                    setOpenLibraryChooserOpen(true);
+                  }}
+                  onOpenRecent={(path) => void openRecentLibrary(path)}
+                  onForgetRecent={(path) => void forgetRecentLibrary(path)}
+                  recentLibraries={recentLibraries}
+                />
+              ) : null}
             </div>
             <WorkspaceTabs
               activeTabId={workspaceTabsState.activeTabId}
@@ -11984,6 +12001,45 @@ function AppInner() {
         onManagedAssetCopyModeChange={(copyMode) => {
           setAssetDragPreviewCopyMode(dragPreviewRef.current, copyMode);
         }}
+        libraryHeader={
+          leftOpen ? (
+          <LibrarySwitcher
+            busy={busy}
+            disabled={!api}
+            syncStatus={syncBindingStatus}
+            importMenuCopy={importMenuCopy}
+            libraryName={library?.displayName ?? null}
+            libraryOpen={Boolean(library)}
+            onCloseLibrary={() => void closeLibrary()}
+            onRemoveLibrary={() => void removeLibrary()}
+            onDeleteLibraryFromDisk={() => requestDeleteLibraryFromDisk()}
+            onOpenLibrarySettings={() => {
+              setAppSettingsOpen(false);
+              setLibrarySettingsOpen(true);
+            }}
+            onCreateLibrary={() => {
+              setDialogValue(t("shell.myLibrary"));
+              setCreateLibraryPhase("form");
+              setDialog("library");
+            }}
+            onExportLibrary={() => setExportDialogOpen(true)}
+            onImportFolder={() => void importAssets("folder")}
+            onImportLibrary={() => {
+              setOpenLibraryChooserOpen(false);
+              setImportLibraryChooserOpen(true);
+            }}
+            onImportLinkedFolder={() => void importFolderAsLinked()}
+            onMenuOpen={() => void refreshRecentLibraries()}
+            onOpenLibrary={() => {
+              setImportLibraryChooserOpen(false);
+              setOpenLibraryChooserOpen(true);
+            }}
+            onOpenRecent={(path) => void openRecentLibrary(path)}
+            onForgetRecent={(path) => void forgetRecentLibrary(path)}
+            recentLibraries={recentLibraries}
+          />
+          ) : null
+        }
         onImportFolderAsLinked={() => void importFolderAsLinked()}
         linkedFolderHintActive={linkedFolderHintShow}
         onLinkedFolderHintHover={beginLinkedFolderHintHover}

@@ -186,6 +186,8 @@ export function LibrarySwitcher({
         type="button"
       >
         <span className="library-switcher-name">{label}</span>
+        {/* Selector affordance: the row opens the library menu. */}
+        <Icon name="chevrons-up-down" size={13} />
         {syncStatus !== "none" ? (
           <span
             className="library-switcher-sync-status"
@@ -199,7 +201,6 @@ export function LibrarySwitcher({
             <Icon name={syncStatus === "enabled" ? "link" : "link-off"} size={12} />
           </span>
         ) : null}
-        <Icon name="chevron" size={13} />
       </button>
       {open && (
         <MenuSurface

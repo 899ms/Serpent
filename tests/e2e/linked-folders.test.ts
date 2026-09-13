@@ -485,7 +485,9 @@ test('imports a linked folder as a child of a managed folder', async () => {
         linked: paddingForLabel('linked', 'source'),
       };
     });
-    expect(depth).toEqual({ alpha: '14px', linked: '28px' });
+    // Root-level managed folders sit at depth 0; the linked child hangs one
+    // level below (14px per level).
+    expect(depth).toEqual({ alpha: '0px', linked: '14px' });
 
     // The menu entry is offered on a managed folder…
     await alphaRow.click({ button: 'right' });

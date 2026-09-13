@@ -107,12 +107,15 @@ function enrichMenuTemplate(
     if (item.command !== undefined) {
       const command = item.command;
       return {
-        id: command,
-        label: resolvedLabel,
+        id: item.payload ? `${command}:${item.payload}` : command,
+        label: resolvedLabel ?? item.labelValue,
         ...(item.accelerator ? { accelerator: item.accelerator } : {}),
         click: (_menuItem, window) => {
           const target = window as BrowserWindow | undefined;
-          target?.webContents.send(APPLICATION_MENU_COMMAND_CHANNEL, command);
+          target?.webContents.send(APPLICATION_MENU_COMMAND_CHANNEL, {
+            command,
+            ...(item.payload ? { payload: item.payload } : {}),
+          });
         },
       };
     }
@@ -133,13 +136,15 @@ function enrichMenuTemplate(
         ...item,
         // Serpent review: keep hardcoded brand labels ("Serpent" app menu)
         // when the item carries no labelKey.
-        label: resolvedLabel ?? item.label,
+        label: resolvedLabel ?? item.labelValue ?? item.label,
         submenu: enrichMenuTemplate(item.submenu, locale),
       } as Electron.MenuItemConstructorOptions;
     }
     return {
       ...item,
-      label: resolvedLabel ?? item.label,
+      label: resolvedLabel ?? item.labelValue ?? item.label,
+      // Explicit enabled state survives for submenu leaves without a command.
+      ...(item.enabled === undefined ? {} : { enabled: item.enabled }),
     } as Electron.MenuItemConstructorOptions;
   });
 }
@@ -157,6 +162,8 @@ function enrichMenuTemplate(
 export function installApplicationMenu(options?: {
   showDevTools?: boolean;
   locale?: "zh-CN" | "en";
+  /** Known libraries, most recently opened first, for the native library menu. */
+  recentLibraries?: readonly { path: string; name: string }[];
 }): void {
   const platform = process.platform as ApplicationMenuPlatform;
   if (shouldHideApplicationMenuBar(platform)) {
@@ -170,6 +177,7 @@ export function installApplicationMenu(options?: {
     showDevTools,
     locale: options?.locale,
     version: app.getVersion(),
+    recentLibraries: options?.recentLibraries,
   });
   Menu.setApplicationMenu(
     Menu.buildFromTemplate(enrichMenuTemplate(template, options?.locale)),

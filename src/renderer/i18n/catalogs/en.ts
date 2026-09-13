@@ -87,6 +87,8 @@ export const en = {
     switchLibrary: "Switch library…",
     librarySwitchWarning: "An operation is still in progress. Serpent will wait for it to finish before switching libraries; the operation may still change what is shown after the switch. Continue?",
     otherLibraries: "Other libraries",
+    recentLibraries: "Recent",
+    noRecentLibraries: "No recent libraries",
     createLibrary: "Create library",
     createLibraryEllipsis: "New library…",
     openLibrary: "Open library",

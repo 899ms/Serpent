@@ -25,8 +25,14 @@ export type UnifiedDirectoryNavEntry =
       relativePath: string;
     };
 
+/**
+ * Indentation depth of a managed folder: a root-level folder is depth 0 so it
+ * lines up with the fixed root rows (所有资产 / 资源库根目录 / 回收站 / 标签管理),
+ * and each nested level adds one. Counting the path segments directly made
+ * every managed folder one level too deep.
+ */
 function relativePathDepth(relativePath: string): number {
-  return relativePath.split("/").length;
+  return Math.max(0, relativePath.split("/").length - 1);
 }
 
 /**

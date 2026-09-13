@@ -658,6 +658,17 @@ function schedulePluginInputCaptureFlush(): void {
 }
 let windowsTray: WindowsTrayController | undefined;
 
+/**
+ * Known libraries for the native 资源库 menu, most recently opened first.
+ * Read fresh on every (re)install so the section tracks the store; labels are
+ * literal names, so no i18n resolution is needed for them.
+ */
+function nativeMenuRecentLibraries(): { path: string; name: string }[] {
+  return readRecentLibraryEntries(recentLibraryPath(), (error) => {
+    logger?.error("recent-library.read", error);
+  }).map((entry) => ({ path: entry.path, name: entry.name }));
+}
+
 function recentLibraryPath(): string {
   return path.join(app.getPath("userData"), "recent-library.json");
 }
@@ -771,6 +782,19 @@ function rememberOpenedLibrary(libraryPath: string, displayName: string, library
       },
     },
   );
+  refreshApplicationMenuRecentLibraries();
+}
+
+/**
+ * Re-installs the native menu so its 资源库 → 最近使用的资源库 section tracks the
+ * store. Called after any recent-library mutation (open, forget, remove).
+ */
+function refreshApplicationMenuRecentLibraries(): void {
+  if (process.platform !== "darwin") return;
+  installApplicationMenu({
+    locale: appLocale,
+    recentLibraries: nativeMenuRecentLibraries(),
+  });
 }
 
 let extensionServer: ExtensionServer | undefined;
@@ -3947,6 +3971,7 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
       removeRecentLibrary(recentLibraryPath(), request.libraryPath, (error) => {
         logger?.error("recent-library.forget", error);
       });
+      refreshApplicationMenuRecentLibraries();
       return {
         ok: true,
         type: "library.forgotten",
@@ -6762,6 +6787,7 @@ async function startApplication(): Promise<void> {
           removeRecentLibrary(recentLibraryPath(), libraryPath, (error) => {
             logger?.error('recent-library.remove', error);
           });
+          refreshApplicationMenuRecentLibraries();
           publishLifecycle({
             type: 'library.closed',
             libraryId,
@@ -8335,7 +8361,10 @@ async function startApplication(): Promise<void> {
       return;
     }
     appLocale = parsed.locale;
-    installApplicationMenu({ locale: appLocale });
+    installApplicationMenu({
+      locale: appLocale,
+      recentLibraries: nativeMenuRecentLibraries(),
+    });
     windowsTray?.updateLocale(appLocale);
   });
 
@@ -8438,7 +8467,10 @@ async function startApplication(): Promise<void> {
   // Install before the first window so macOS does not keep Electron's default
   // View→Zoom accelerators that steal Cmd+=/-/0 (Serpent-46i9).
   // Windows: hides menu bar for frameless shell (Serpent-znex).
-  installApplicationMenu({ locale: appLocale });
+  installApplicationMenu({
+    locale: appLocale,
+    recentLibraries: nativeMenuRecentLibraries(),
+  });
 
   registerWindowControls({
     getMainWindow: () => mainWindow,
