@@ -59,7 +59,7 @@ function assertSafeRemoteDirectory(directoryName: string): void {
 
 async function removeRemoteTree(remote: WebDAVDriver, directoryName: string): Promise<void> {
   assertSafeRemoteDirectory(directoryName);
-  let entries: Array<{ path: string; isDirectory: boolean }> = [];
+  let entries: Array<{ path: string; isDirectory: boolean }>;
   try {
     entries = await remote.list(directoryName, 'infinity');
   } catch {
