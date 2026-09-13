@@ -41,6 +41,7 @@ export type IconName =
   | "link-off"
   | "loader"
   | "menu"
+  | "palette"
   | "plus"
   | "refresh"
   | "undo"
@@ -51,6 +52,7 @@ export type IconName =
   | "flip-vertical-2"
   | "search"
   | "settings"
+  | "shapes"
   | "sliders"
   | "chevrons-up-down"
   | "smart"
@@ -443,6 +445,27 @@ const iconPaths: Record<IconName, ReactNode> = {
     <>
       <path d="M12 3 2.8 20h18.4z" />
       <path d="M12 9v5m0 3h.01" />
+    </>
+  ),
+  // Lucide `palette` (https://lucide.dev/icons/palette): the colour-dimension
+  // filter previously borrowed `activity` (an ECG line), which says nothing
+  // about colour.
+  palette: (
+    <>
+      <circle cx="13.5" cy="6.5" fill="currentColor" r=".5" />
+      <circle cx="17.5" cy="10.5" fill="currentColor" r=".5" />
+      <circle cx="8.5" cy="7.5" fill="currentColor" r=".5" />
+      <circle cx="6.5" cy="12.5" fill="currentColor" r=".5" />
+      <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z" />
+    </>
+  ),
+  // Lucide `shapes` (https://lucide.dev/icons/shapes): triangle + square +
+  // circle, for the shape filter that previously borrowed the 4-square `grid`.
+  shapes: (
+    <>
+      <path d="M8.3 10a.7.7 0 0 1-.626-1.079L11.4 3a.7.7 0 0 1 1.198-.043L16.3 8.9a.7.7 0 0 1-.572 1.1Z" />
+      <rect height="7" rx="1" width="7" x="3" y="14" />
+      <circle cx="17.5" cy="17.5" r="3.5" />
     </>
   ),
   // Lucide `vault` (https://lucide.dev/icons/vault).
