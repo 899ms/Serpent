@@ -74,11 +74,13 @@ Windows 安装器（Inno Setup，2026-08-08 决策替代 WiX MSI）：
 - 资产名是运行时选择器的一部分，不能只改 Release 上传名而不改客户端。每个平台和分发形态必须同时上传目标资产与 `.sha256`。
 - GitHub Release 必须是公开、稳定、已发布的 SemVer Release；`/releases/latest` 不会返回 draft/prerelease。当前 `v0.1.2` 已验证包含 macOS DMG/portable ZIP、Windows setup/portable ZIP 及对应校验文件，但没有 `latest*.yml`、`RELEASES` 或 `RELEASES.json`。
 
-#### 更新日志元信息
+#### 更新日志元信息（强制，2026-09-14 用户要求）
 
-可在每个 GitHub Release 附加名为 `release-meta.json` 的 JSON 资产。客户端会校验
-`version` 与 Release tag 一致后，在关于窗口提供「查看更新日志」；该资产缺失、网络失败、
-格式错误或版本不匹配时，仍使用 Release body，不能阻塞更新检查。字段契约示例见
+**每个 Release 都必须上传**名为 `release-meta.json` 的 JSON 资产 —— 它让「关于 Serpent」
+能显示结构化更新日志，不再从 Release 正文里抓文本。同时按上一版约定上传一份带版本号的
+副本 `release-meta-<ver>.json`（便于回溯）。客户端会校验 `version` 与 Release tag 一致后
+显示；该资产缺失（客户端会退回 Release body，但这属于发布事故）、网络失败、格式错误或
+版本不匹配时，仍使用 Release body，不能阻塞更新检查。字段契约示例见
 [`release-meta.example.json`](../../../release-meta.example.json)：`date` 为发布日期，
 `changelog` 是中英文条目数组，`changelogUrl`/`downloadUrl` 为可选 HTTP(S) 链接，
 `mandatory` 表示产品是否要求更新。`downloadUrl` 只作元信息展示，实际安装包仍按已校验的
@@ -114,8 +116,8 @@ gh release upload v<ver> \
   Serpent-win-x86-64-<ver>-portable.zip Serpent-win-x86-64-<ver>-portable.zip.sha256 \
   Serpent-win-x86-64-<ver>-setup.zip Serpent-win-x86-64-<ver>-setup.zip.sha256
 
-# 可选：上传与 tag 版本一致的更新日志元信息
-gh release upload v<ver> release-meta.json
+# 必传：更新日志元信息（version 必须等于 <ver>，见 §4「更新日志元信息（强制）」）
+gh release upload v<ver> release-meta.json release-meta-<ver>.json
 ```
 
 发布后核对 release 页：标题、notes、资产齐全、`--target main` 正确。
@@ -140,9 +142,11 @@ gh release upload v<ver> release-meta.json
 - [ ] main 合流用**单一提交**完成（merge --no-commit → git rm 开发文件 → 一次 commit），禁止「引入又删除」的来回提交
 - [ ] 全部发布门禁通过（media verify / verify-package / ufbx WASM）——**在 dev 分支打包**
 - [ ] 产物按 §4 规范名精确重命名（`win-x86-64` 不是 `win32-x64`；安装包是 `-setup.zip` 不是裸 exe）+ 每个资产同名 `.sha256`（只含哈希）
-- [ ] Changelog 中英双语（中文在前，标题 `**Serpent <版本>** — 一句话 · English one-liner`）、按重要度排序、次要改动概括；已写入 GitHub Release 正文（可选 `release-meta.json`）
+- [ ] Changelog 中英双语（中文在前，标题 `**Serpent <版本>** — 一句话 · English one-liner`）、按重要度排序、次要改动概括；已写入 GitHub Release 正文
+- [ ] **`release-meta.json` 与 `release-meta-<ver>.json` 已上传，且 `version` 等于 tag 版本**（§4 强制项）
+- [ ] Release 正文只面向用户：不写构建/打包/平台流程或内部约束（如「本页只含某平台产物」）
 - [ ] `gh release create v<ver> --title "Serpent <ver>" --notes-file <本地临时草稿.md> --target main`（gh 全路径调用；草稿不提交进仓库）
-- [ ] 资产上传齐全（macOS 4 / Windows 4），release 页核对标题/notes/资产/`--target main`
+- [ ] 资产上传齐全（macOS 4 / Windows 4 + release-meta 2），release 页核对标题/notes/资产/`--target main`
 - [ ] tag `v<ver>` 指向 main 发布基线（`git tag v<ver> <main-commit>` + `git push origin v<ver>`）
 - [ ] `npm run rebuild:native` 已恢复 dev 环境（FTS5 probe OK）
 - [ ] 切回 dev 分支
