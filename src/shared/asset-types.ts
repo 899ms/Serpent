@@ -214,35 +214,16 @@ export const browseLayoutEntrySchema = z.strictObject({
   byteSize: z.number().int().nonnegative().optional(),
   modifiedAt: nonBlankString.optional(),
   rating: z.number().int().min(0).max(5).optional(),
+  /**
+   * Card type, so a virtual slot can render the real card (badges, media
+   * routing) from the complete index before its AssetSummary page arrives.
+   * Without it a synthesized slot would have to guess `other` and change the
+   * card's appearance once the summary landed.
+   */
+  mediaType: z.enum(['image', 'video', 'audio', 'text', 'model', 'document', 'other']).optional(),
 });
 
 export type BrowseLayoutEntry = z.infer<typeof browseLayoutEntrySchema>;
-
-/**
- * A bounded geometry response for one BrowseSession window. Unlike
- * BrowseLayoutEntry, entries carry their logical index so the Renderer can
- * cache only the viewport/overscan blocks it currently needs.
- */
-export const browseGeometryEntrySchema = z.strictObject({
-  index: z.number().int().nonnegative(),
-  assetId: nonBlankString,
-  width: z.number().int().positive().nullable(),
-  height: z.number().int().positive().nullable(),
-  previewArtifactId: nonBlankString.nullable().optional(),
-  previewKind: z.enum(['source']).nullable().optional(),
-  previewRevisionId: nonBlankString.nullable().optional(),
-});
-
-export type BrowseGeometryEntry = z.infer<typeof browseGeometryEntrySchema>;
-
-export const browseGeometryBlockSchema = z.strictObject({
-  sessionId: nonBlankString,
-  startIndex: z.number().int().nonnegative(),
-  changeSequence: z.number().int().nonnegative(),
-  entries: z.array(browseGeometryEntrySchema).max(500),
-});
-
-export type BrowseGeometryBlock = z.infer<typeof browseGeometryBlockSchema>;
 
 export const tagSummarySchema = z.strictObject({
   tagId: nonBlankString,

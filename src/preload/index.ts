@@ -1397,33 +1397,6 @@ const library: SerpentLibraryApi = Object.freeze({
     };
   },
 
-  async fetchBrowseSessionGeometry({ libraryId, sessionId, startIndex, limit }: { libraryId: string; sessionId: string; startIndex: number; limit?: number }) {
-    const result = await request({ type: 'browse.session.geometry.request', libraryId, sessionId, startIndex, limit });
-    if (!result.ok) return failure(result);
-    if (result.type === 'browse.session.stale') {
-      return {
-        ok: true as const,
-        value: {
-          stale: true as const,
-          sessionId: result.sessionId,
-          reason: result.reason,
-        },
-      };
-    }
-    if (result.type !== 'browse.session.geometry') throw new Error('Unexpected browse-session-geometry response.');
-    return {
-      ok: true as const,
-      value: {
-        sessionId: result.sessionId,
-        startIndex: result.startIndex,
-        changeSequence: result.changeSequence,
-        ...(result.catalogSequence === undefined ? {} : { catalogSequence: result.catalogSequence }),
-        ...(result.snapshotGeneration === undefined ? {} : { snapshotGeneration: result.snapshotGeneration }),
-        entries: result.entries,
-      },
-    };
-  },
-
   async fetchBrowseSessionAssetIds({ libraryId, sessionId }: { libraryId: string; sessionId: string }) {
     const result = await request({ type: 'browse.session.ids.request', libraryId, sessionId });
     if (!result.ok) return failure(result);

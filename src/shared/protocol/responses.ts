@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-import { aiSearchPlanSchema, assetMetadataResultSchema, extractedMetadataResultSchema, assetSummarySchema, browseGeometryBlockSchema, browseLayoutEntrySchema, collectionSummarySchema, folderBrowseEntrySchema, ignoredPathSchema, linkedFolderDirectoryMutationSchema, linkedFolderRuleSchema, linkedFolderSummarySchema, managedFolderSummarySchema, portableRelativePathSchema, smartCollectionSummarySchema, tagCooccurrenceGraphSchema, tagSummarySchema, trashedFolderSummarySchema } from '../asset-types';
+import { aiSearchPlanSchema, assetMetadataResultSchema, extractedMetadataResultSchema, assetSummarySchema, browseLayoutEntrySchema, collectionSummarySchema, folderBrowseEntrySchema, ignoredPathSchema, linkedFolderDirectoryMutationSchema, linkedFolderRuleSchema, linkedFolderSummarySchema, managedFolderSummarySchema, portableRelativePathSchema, smartCollectionSummarySchema, tagCooccurrenceGraphSchema, tagSummarySchema, trashedFolderSummarySchema } from '../asset-types';
 import { libraryNavigationSummarySchema } from '../library-navigation';
 import { pluginJobRecordSchema } from '../../plugins/plugin-jobs';
 import { recentLibraryListSchema } from '../recent-libraries';
@@ -1157,14 +1157,6 @@ const assetOperationSuccessSchemas = [
       assetId: nonBlankString,
       text: z.string().max(4_000),
     })).optional(),
-  }),
-  z.strictObject({
-    ok: z.literal(true),
-    type: z.literal('browse.session.geometry'),
-    libraryId: nonBlankString,
-    ...browseGeometryBlockSchema.shape,
-    catalogSequence: z.number().int().nonnegative().optional(),
-    snapshotGeneration: z.number().int().nonnegative().nullable().optional(),
   }),
   z.strictObject({
     ok: z.literal(true),

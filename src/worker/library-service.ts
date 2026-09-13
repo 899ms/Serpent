@@ -31021,6 +31021,22 @@ export class LibraryService {
     };
   }
 
+  /**
+   * Bounded geometry-block read for one BrowseSession window.
+   *
+   * CANVAS-038: the Renderer no longer requests geometry blocks — a scope now
+   * commits its complete compact index once (`asset.search` with `layoutOnly`),
+   * because streaming 128-row blocks rewrote heights and identities mid-scroll.
+   * The `browse.session.geometry` protocol message, its schemas and the Main /
+   * preload forwarding were deleted with it, so **nothing in production reaches
+   * this method**.
+   *
+   * It is retained deliberately as the measurement seam for the 20k worker
+   * baseline (`browseSessionGeometryMs` in `tests/worker/large-library-performance.test.ts`,
+   * recorded in the CANVAS-038 design log) rather than deleted together with the
+   * baseline it produces. Do not re-wire it into a render path without also
+   * restoring the identity guarantees that the one-shot index provides.
+   */
   readBrowseSessionGeometry(input: {
     libraryId: string;
     libraryGeneration: number;
@@ -31743,13 +31759,14 @@ export class LibraryService {
         const row = rows[index]!;
         const width = row.layout_width ?? null;
         const height = row.layout_height ?? null;
+        const mediaType = LibraryService.toSummaryMediaType(
+          LibraryService.detectMediaType(row.relative_file_path),
+        );
         const sourceDirect = row.layout_availability === 'available'
           && !row.layout_deleted_at
           && isSourceDirectPreview({
             fileName: row.relative_file_path,
-            mediaType: LibraryService.toSummaryMediaType(
-              LibraryService.detectMediaType(row.relative_file_path),
-            ),
+            mediaType,
             byteSize: row.layout_byte_size ?? 0,
             width,
             height,
@@ -31761,6 +31778,7 @@ export class LibraryService {
           previewArtifactId: row.layout_preview_artifact_id ?? null,
           displayName: path.posix.basename(row.relative_file_path),
           relativeFilePath: row.relative_file_path,
+          mediaType,
         };
         if (sourceDirect) {
           entry.previewKind = 'source';
@@ -46405,6 +46423,19 @@ export class LibraryService {
   }
 
   /**
+   * Ids of the libraries this Worker currently has open.
+   *
+   * `library.open` needs these to stop the outgoing library's automatic work
+   * before opening its replacement: a switch arrives as `library.open` with no
+   * preceding `library.close` (library.open-recent.request dispatches open
+   * directly), so without this the outgoing library's media churn kept the single
+   * Worker busy and the open command starved behind it.
+   */
+  listOpenLibraryIds(): string[] {
+    return [...this.openById.keys()];
+  }
+
+  /**
    * Worker shutdown/close path: finish the first close-time snapshot before
    * releasing SQLite. The synchronous close method remains for legacy unit
    * seams and does not wait on asynchronous backup I/O.
@@ -46412,18 +46443,46 @@ export class LibraryService {
   async closeLibraryAsync(libraryId: string): Promise<void> {
     const openLibrary = this.openById.get(libraryId);
     if (!openLibrary) throw new LibraryServiceError('LIBRARY_NOT_OPEN');
+    const closeStartedAt = performance.now();
+    const markPhase = (phase: string, from: number): void => {
+      // Closing on a network library blocked a library switch behind the loading
+      // overlay for minutes with no log output at all. A close that cannot
+      // explain itself is undebuggable, so keep the phase timings behind an
+      // explicit switch instead of logging on every close.
+      if (process.env.SERPENT_CLOSE_TRACE !== '1') return;
+      process.stderr.write(
+        `[library.close.phase] ${JSON.stringify({
+          libraryId,
+          networkStorage: openLibrary.summary.networkStorage === true,
+          phase,
+          ms: Math.round(performance.now() - from),
+          totalMs: Math.round(performance.now() - closeStartedAt),
+        })}\n`,
+      );
+    };
     this.cancelDeferredOpenMaintenance(libraryId);
     const reconciliation = this.reconciliationByLibrary.get(libraryId);
     this.cancelOpenBackgroundReconciliation(libraryId);
-    if (reconciliation) await reconciliation.promise;
+    if (reconciliation) {
+      const reconciliationStartedAt = performance.now();
+      await reconciliation.promise;
+      markPhase('reconciliation', reconciliationStartedAt);
+    }
     // Abort and settle every media job before the backup and final SQLite
     // close. The job finally block releases its database lease and may still
     // publish durable state after the decoder has been stopped.
+    const drainStartedAt = performance.now();
     await this.drainLibraryMedia(libraryId);
+    markPhase('drainMedia', drainStartedAt);
     if (!openLibrary.readOnly) {
+      const backupStartedAt = performance.now();
       await this.createDatabaseBackupForOpenLibrary(openLibrary, 'close');
+      markPhase('backup', backupStartedAt);
     }
+    const closeStartedAtInner = performance.now();
     this.closeLibrary(libraryId);
+    markPhase('releaseHandle', closeStartedAtInner);
+    markPhase('total', closeStartedAt);
   }
 
   closeLibrary(libraryId: string): void {

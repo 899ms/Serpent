@@ -37,6 +37,7 @@ import {
   nextUnfilledBrowsePageOffset,
 } from "./browse-window-slots";
 import {
+  shouldFetchCompleteBrowseIndex,
   useVirtualBrowseSession,
   type VirtualBrowseSessionLocalSnapshot,
 } from "./browse/use-virtual-browse-session";
@@ -353,8 +354,9 @@ export function useBrowsePagination(
 
   const {
     begin: beginVirtualBrowseSession,
+    seedIndex: seedVirtualBrowseIndex,
+    noteVisibleRange: noteVirtualVisibleRange,
     applySummaryPage: applyVirtualSummaryPage,
-    ensureRange: ensureVirtualGeometryRange,
     getLayout: getLoadedBrowseLayout,
     getLoadedSummaryAssetIds,
     removeEntries: removeVirtualLayoutEntries,
@@ -364,7 +366,6 @@ export function useBrowsePagination(
     restoreLocalState: restoreVirtualBrowseLocalState,
     snapshotLocalState: snapshotVirtualBrowseLocalState,
   } = useVirtualBrowseSession({
-    api,
     setBrowseLayout,
     setVirtualBrowseLayout,
   });
@@ -418,8 +419,9 @@ export function useBrowsePagination(
       layoutRef.current = getLoadedBrowseLayout();
       // Compact scopes paginate from the first window. Blocking the sentinel
       // until layout-only hydration used to freeze folders >100 on page 0
-      // when that fetch lagged or failed (Serpent-9cfc8c). Virtual 2k+
-      // sessions already have placeholder geometry, so a tail probe is safe.
+      // when that fetch lagged or failed (Serpent-9cfc8c). Virtual sessions
+      // (first page smaller than COUNT) already carry full-range COUNT geometry,
+      // so a tail probe is safe.
       layoutHydrationCompleteRef.current = true;
       setLayoutHydrationVersion((version) => version + 1);
       const filled = new Set<number>();
@@ -435,28 +437,32 @@ export function useBrowsePagination(
       );
       refreshHasMore(firstPage.total, filled);
       applyTarget(definition)([...firstPage.items]);
-      if (api && virtualized) {
-        void ensureVirtualGeometryRange({
-          startIndex: firstPage.offset,
-          endIndex: firstPage.offset + Math.max(0, firstPage.items.length - 1),
-          generation,
-        }).then(() => {
-          if (generation === generationRef.current) {
-            layoutRef.current = getLoadedBrowseLayout();
-          }
-        });
-      } else if (api) {
+      if (api) {
+        // CANVAS-038: a scope within the one-shot bound loads its complete compact
+        // index exactly once, so geometry never changes again while scrolling.
+        // Above the bound that request is O(scope) on the renderer main thread
+        // (payload + Zod validation + index maps + compact array) and stalled the
+        // app behind the loading overlay when switching to a very large library.
+        // Those scopes fill identity and geometry from the bounded 100-row summary
+        // pages instead; slots stay keyed by index, so they still never remount.
+        if (virtualized) noteVirtualVisibleRange(
+          firstPage.offset,
+          firstPage.offset + Math.max(0, firstPage.items.length - 1),
+        );
+        if (virtualized && !shouldFetchCompleteBrowseIndex(totalRef.current)) return;
         void fetchBrowseLayout({ api, definition }).then((layout) => {
           if (generation !== generationRef.current) return;
-          // Whether the full layout succeeded or failed, compact scopes already
-          // paginate from the first window (Serpent-9cfc8c). On success the
-          // complete geometry replaces that prefix so the scrollbar matches COUNT.
           layoutHydrationCompleteRef.current = true;
           setLayoutHydrationVersion((version) => version + 1);
-          // A superseded/failed layout response must never erase the compact
-          // geometry that currently owns the scrollbar. An actually empty
-          // scope is valid only when the first page also reported total=0.
+          // A superseded/failed layout response must never erase the geometry
+          // that currently owns the scrollbar. An actually empty scope is valid
+          // only when the first page also reported total=0.
           if (!layout || (layout.length === 0 && totalRef.current > 0)) return;
+          if (virtualized) {
+            seedVirtualBrowseIndex({ total: totalRef.current, entries: layout });
+            layoutRef.current = getLoadedBrowseLayout();
+            return;
+          }
           layoutRef.current = layout;
           setBrowseLayout(layout);
           applyTarget(definition)((current) =>
@@ -473,7 +479,8 @@ export function useBrowsePagination(
       setSearchSnippets,
       setSearchTotal,
       beginVirtualBrowseSession,
-      ensureVirtualGeometryRange,
+      seedVirtualBrowseIndex,
+      noteVirtualVisibleRange,
       getLoadedBrowseLayout,
       setBrowseLayout,
     ],
@@ -638,11 +645,12 @@ export function useBrowsePagination(
       const definition = definitionRef.current;
       if (!definition || !api) return;
       const generation = generationRef.current;
-      const geometryPromise = ensureVirtualGeometryRange({
-        startIndex: Math.max(0, Math.min(startIndex, endIndex)),
-        endIndex: Math.max(startIndex, endIndex),
-        generation,
-      });
+      // Geometry is already committed for the whole scope, so a viewport change
+      // only needs to keep the visible summary pages hot in the LRU.
+      noteVirtualVisibleRange(
+        Math.max(0, Math.min(startIndex, endIndex)),
+        Math.max(startIndex, endIndex),
+      );
       const firstOffset = browsePageOffset(
         Math.max(0, Math.min(startIndex, endIndex)),
         BROWSE_PAGE_SIZE,
@@ -659,7 +667,6 @@ export function useBrowsePagination(
         ) offsets.push(offset);
       }
       if (offsets.length === 0) {
-        await geometryPromise;
         layoutRef.current = getLoadedBrowseLayout();
         return;
       }
@@ -681,13 +688,10 @@ export function useBrowsePagination(
         500,
         selectedRun.at(-1)! - requestOffset + BROWSE_PAGE_SIZE,
       );
-      await Promise.all([
-        geometryPromise,
-        fetchPageAt(requestOffset, generation, requestLimit),
-      ]);
+      await fetchPageAt(requestOffset, generation, requestLimit);
       layoutRef.current = getLoadedBrowseLayout();
     },
-    [api, ensureVirtualGeometryRange, fetchPageAt, getLoadedBrowseLayout],
+    [api, noteVirtualVisibleRange, fetchPageAt, getLoadedBrowseLayout],
   );
 
   const appendNextPage = useCallback(async () => {

@@ -92,7 +92,7 @@ describe('performance command classification', () => {
 
   it('does not let browse reads and path lookups starve visible thumbnail work', () => {
     expect(shouldPreemptAutomaticMedia(
-      { type: 'browse.session.geometry', libraryId: 'library-1' },
+      { type: 'browse.session.page', libraryId: 'library-1' },
       'interactive-control',
     )).toBe(false);
     expect(shouldPreemptAutomaticMedia(

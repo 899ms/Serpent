@@ -3101,14 +3101,6 @@ async function commandFor(
         limit: request.limit,
         offset: request.offset,
       };
-    case "browse.session.geometry.request":
-      return {
-        type: "browse.session.geometry",
-        libraryId: request.libraryId,
-        sessionId: request.sessionId,
-        startIndex: request.startIndex,
-        limit: request.limit,
-      };
     case "browse.session.ids.request":
       return {
         type: "browse.session.ids",

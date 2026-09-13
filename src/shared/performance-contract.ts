@@ -337,7 +337,6 @@ const NON_PREEMPTIVE_MEDIA_COMMANDS = new Set([
   'linked-folder.list',
   'browse.session.open',
   'browse.session.page',
-  'browse.session.geometry',
   'browse.session.ids',
   'browse.session.close',
   'history.status',

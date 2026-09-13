@@ -288,36 +288,33 @@ describe('renderer request protocol', () => {
     })).toThrow();
   });
 
-  it('round-trips bounded BrowseSession geometry blocks', () => {
+  it('round-trips bounded BrowseSession asset id snapshots', () => {
     expect(parseRendererRequest({
-      type: 'browse.session.geometry.request',
+      type: 'browse.session.ids.request',
       libraryId: 'library-01',
       sessionId: 'session-01',
-      startIndex: 128,
-      limit: 128,
-    })).toMatchObject({ type: 'browse.session.geometry.request', startIndex: 128 });
+    })).toMatchObject({ type: 'browse.session.ids.request' });
     expect(parseWorkerRequest({
-      requestId: 'geometry-01',
+      requestId: 'ids-01',
       command: {
-        type: 'browse.session.geometry',
+        type: 'browse.session.ids',
         libraryId: 'library-01',
         sessionId: 'session-01',
-        startIndex: 128,
-        limit: 128,
       },
-    }).command).toMatchObject({ type: 'browse.session.geometry' });
+    }).command).toMatchObject({ type: 'browse.session.ids' });
+    // Keep all three layers: the worker response shape is what the preload
+    // narrows on, so dropping it would leave the contract half-covered.
     expect(parseWorkerResponse({
-      requestId: 'geometry-01',
+      requestId: 'ids-01',
       result: {
         ok: true,
-        type: 'browse.session.geometry',
+        type: 'browse.session.ids',
         libraryId: 'library-01',
         sessionId: 'session-01',
-        startIndex: 128,
         changeSequence: 4,
-        entries: [{ index: 128, assetId: 'asset-128', width: 1920, height: 1080 }],
+        assetIds: ['asset-1', 'asset-2'],
       },
-    }).result).toMatchObject({ type: 'browse.session.geometry' });
+    }).result).toMatchObject({ type: 'browse.session.ids' });
   });
 
   it('round-trips the coherent navigation summary request', () => {

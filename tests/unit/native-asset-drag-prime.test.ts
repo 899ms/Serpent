@@ -98,7 +98,7 @@ describe("native asset drag cache priming", () => {
       nativeDragAssetsForResult({ ok: false, type: "browse.session.opened" }),
     ).toEqual([]);
     expect(
-      nativeDragAssetsForResult({ ok: true, type: "browse.session.geometry" }),
+      nativeDragAssetsForResult({ ok: true, type: "browse.session.ids" }),
     ).toEqual([]);
   });
 });

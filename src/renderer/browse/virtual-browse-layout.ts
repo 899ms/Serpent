@@ -1,6 +1,5 @@
 import type {
   AssetSummary,
-  BrowseGeometryBlock,
   BrowseLayoutEntry,
 } from "../../shared/asset-types";
 
@@ -50,25 +49,10 @@ function layoutEntryFromAsset(asset: AssetSummary): BrowseLayoutEntry {
     byteSize: asset.byteSize,
     modifiedAt: asset.modifiedAt,
     rating: asset.rating,
-  };
-}
-
-function layoutEntryFromGeometry(
-  entry: BrowseGeometryBlock["entries"][number],
-): BrowseLayoutEntry {
-  return {
-    assetId: entry.assetId,
-    width: entry.width,
-    height: entry.height,
-    ...(entry.previewArtifactId !== undefined
-      ? { previewArtifactId: entry.previewArtifactId }
-      : {}),
-    ...(entry.previewKind !== undefined
-      ? { previewKind: entry.previewKind }
-      : {}),
-    ...(entry.previewRevisionId !== undefined
-      ? { previewRevisionId: entry.previewRevisionId }
-      : {}),
+    // Without this the summary page *overwrites* the index's mediaType with
+    // nothing, `virtualSlotAsset` falls back to `other`, and every image grows
+    // an extension badge the moment its summary lands (CANVAS-038).
+    mediaType: asset.mediaType,
   };
 }
 
@@ -169,6 +153,65 @@ export function createVirtualBrowseLayout(input: {
   return mergeVirtualSummaryPage(current, input.firstPage.offset, input.firstPage.items);
 }
 
+/**
+ * Build the whole-scope virtual layout from ONE complete compact index.
+ *
+ * CANVAS-038: the previous design streamed 128-row geometry blocks, so every
+ * arrival rewrote heights and identities while the user was scrolling — the
+ * scrollbar thumb tracked the loaded subset instead of COUNT, and each revision
+ * re-sliced the window. A scope whose index fits in one `layoutOnly` response
+ * (capped at BROWSE_SCOPE_MAX_ASSETS) instead commits geometry exactly once, so
+ * `geometryRevision` stops moving and no slot identity changes after seeding.
+ *
+ * A truncated index (scope above the cap) still works: positions beyond the
+ * returned prefix stay geometry placeholders and resolve through the summary
+ * pages, and because slots are keyed by index that is a prop update, not a
+ * remount.
+ */
+export function createVirtualBrowseLayoutFromIndex(input: {
+  total: number;
+  entries: readonly BrowseLayoutEntry[];
+}): VirtualBrowseLayout {
+  const empty: VirtualBrowseLayout = {
+    total: Math.max(safeTotal(Math.trunc(input.total)), input.entries.length),
+    geometryRevision: 0,
+    geometryEntries: new Map(),
+    assetIdsByIndex: new Map(),
+    entries: new Map(),
+    indexByAssetId: new Map(),
+  };
+  return mergeLayoutEntries(
+    empty,
+    input.entries.map((entry, index) => ({ index, entry })),
+  );
+}
+
+/**
+ * True when a freshly reported first page is the same ordered scope that the
+ * committed index already describes.
+ *
+ * CANVAS-038: rebuilding the virtual layout from the 100-item first page makes
+ * every not-yet-refetched slot fall back to an estimated height, which moved the
+ * scrollbar by ~20% on a 1442-asset network library (measured 57999 → 69561 px,
+ * placeholders exactly at indices 100+). Deciding by *content* rather than by
+ * comparing browse definitions means a refresh is recognised no matter which
+ * request-scoped field changed (session id, null-vs-undefined filters, …), while
+ * a real navigation to a different scope fails the id check and starts clean.
+ */
+export function virtualIndexMatchesFirstPage(
+  layout: VirtualBrowseLayout | null,
+  firstPage: { offset: number; items: readonly Pick<AssetSummary, "assetId">[] },
+): boolean {
+  if (!layout || layout.total <= 0) return false;
+  const offset = Math.max(0, Math.trunc(firstPage.offset));
+  if (firstPage.items.length === 0) return false;
+  for (let index = 0; index < firstPage.items.length; index += 1) {
+    const entry = layout.entries.get(offset + index);
+    if (!entry || entry.assetId !== firstPage.items[index]!.assetId) return false;
+  }
+  return true;
+}
+
 /** Patch only summaries that have arrived; all other positions remain implicit. */
 export function mergeVirtualSummaryPage(
   current: VirtualBrowseLayout,
@@ -184,27 +227,6 @@ export function mergeVirtualSummaryPage(
       entry: layoutEntryFromAsset(item),
     })),
   );
-}
-
-/** Patch only one geometry block; summary-only fields already in the sparse map survive. */
-export function mergeVirtualGeometryBlock(
-  current: VirtualBrowseLayout,
-  block: BrowseGeometryBlock,
-): VirtualBrowseLayout {
-  const updates = [] as Array<{ index: number; entry: BrowseLayoutEntry }>;
-  for (const entry of block.entries) {
-    const index = safeIndex(entry.index);
-    if (index < 0 || index >= current.total) continue;
-    const previous = current.entries.get(index);
-    const geometry = layoutEntryFromGeometry(entry);
-    updates.push({
-      index,
-      entry: previous && !isGeometryPlaceholder(previous)
-        ? { ...previous, ...geometry }
-        : geometry,
-    });
-  }
-  return mergeLayoutEntries(current, updates);
 }
 
 /** Return a transient slot for one position without allocating a full list. */
@@ -269,6 +291,9 @@ export function evictVirtualSummaryPage(
       ...(entry.previewRevisionId === undefined
         ? {}
         : { previewRevisionId: entry.previewRevisionId }),
+      // Eviction keeps the slot renderable from the index, so it must keep the
+      // card type too; dropping it would flip the card back to `other`.
+      ...(entry.mediaType === undefined ? {} : { mediaType: entry.mediaType }),
     };
     const hasGeometry = geometry.width !== undefined
       || geometry.height !== undefined
@@ -326,31 +351,3 @@ export function removeVirtualLayoutEntries(
   };
 }
 
-/** Evict geometry-only entries when their bounded block leaves the LRU cache. */
-export function evictVirtualGeometryBlock(
-  layout: VirtualBrowseLayout,
-  startIndex: number,
-  blockSize: number,
-): VirtualBrowseLayout {
-  const endIndex = startIndex + Math.max(1, Math.trunc(blockSize));
-  const entries = new Map(layout.entries);
-  const indexByAssetId = new Map(layout.indexByAssetId);
-  const assetIdsByIndex = new Map(layout.assetIdsByIndex);
-  const geometryEntries = new Map(layout.geometryEntries);
-  let geometryRevision = layout.geometryRevision;
-  for (const [index, entry] of layout.entries) {
-    if (index < startIndex || index >= endIndex || entry.displayName) continue;
-    entries.delete(index);
-    indexByAssetId.delete(entry.assetId);
-    assetIdsByIndex.delete(index);
-    if (geometryEntries.delete(index)) geometryRevision += 1;
-  }
-  return {
-    ...layout,
-    entries,
-    indexByAssetId,
-    assetIdsByIndex,
-    geometryEntries,
-    geometryRevision,
-  };
-}

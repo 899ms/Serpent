@@ -13,6 +13,7 @@ import {
   type ImportConflictPlan,
   type ImportSourceFailurePlan,
 } from '../shared/protocol/responses';
+import { stopOutgoingLibrariesForOpen } from './library-open-stop';
 import type { ParentPort } from 'electron';
 import {
   BUNDLED_HDRI_PRESET_IDS,
@@ -1833,6 +1834,41 @@ function syncWebDAVDriver(input: {
   return new WebDAVDriver({ ...input, baseUrl: normalized.value });
 }
 
+/**
+ * Stop every automatic background task one library owns.
+ *
+ * Shared by `library.close`, `library.delete-from-disk` and — critically —
+ * `library.open`. A switch through the recent list sends `library.open` for the
+ * replacement WITHOUT a preceding `library.close`
+ * (`library.open-recent.request` dispatches open directly), so the outgoing
+ * library's media churn kept the single Worker busy and the open command starved
+ * behind it: switching away from a busy network library never completed —
+ * measured as ≥90 s with the loading overlay up and no Worker activity logged,
+ * versus a completed switch once the churn is stopped.
+ *
+ * This stops *scheduling* work (queued jobs, retry loops, dimension probes).
+ * Draining a decoder that is already running is a separate caller decision:
+ * `closeLibraryAsync` and `library.delete-from-disk` do it, `library.open` does
+ * not, because the outgoing library is released by its own close path.
+ */
+function stopAutomaticWorkForLibrary(
+  libraryId: string,
+  options?: { cancelQueuedJobs?: boolean },
+): void {
+  cancelDeferredStartupThumbnailScene(libraryId);
+  cancelAutomaticMediaForLibrary(libraryId);
+  cancelMediaResourceRetry(libraryId);
+  cancelVisibleWindowDimensionProbes(libraryId);
+  lastVisibleWindowKeyByLibrary.delete(libraryId);
+  lastVisibleWindowAssetIdsByLibrary.delete(libraryId);
+  // Closing and deleting destroy the library, so its queued jobs go with it. A
+  // switch does not: `stopOutgoingLibrariesForOpen` passes false so the queued
+  // work survives for the next open instead of being cancelled and re-enqueued.
+  if (options?.cancelQueuedJobs !== false) libraryService.cancelJobs(libraryId);
+  publishAiProgress(libraryId);
+  aiJobAbortRegistry.abort(libraryId);
+}
+
 async function handleRequestWithoutWriteLease(request: WorkerRequest): Promise<WorkerResult> {
   switch (request.command.type) {
     case 'library.list':
@@ -2060,6 +2096,34 @@ async function handleRequestWithoutWriteLease(request: WorkerRequest): Promise<W
       return { ok: true, type: 'library.opened', library };
     }
     case 'library.open': {
+      // Switching libraries through the recent list sends `library.open` for the
+      // replacement WITHOUT a preceding `library.close`
+      // (library.open-recent.request dispatches open directly). Stop the outgoing
+      // libraries' automatic work first, or this command starves behind their
+      // media churn and the switch never completes. Queued jobs are preserved:
+      // a switch will reopen them. See `library-open-stop.ts` for the rules and
+      // the tests that guard them.
+      stopOutgoingLibrariesForOpen({
+        openLibraryIds: libraryService.listOpenLibraryIds(),
+        cancelQueuedJobs: false,
+        stopper: {
+          stopScheduling: (outgoingLibraryId) => {
+            cancelDeferredStartupThumbnailScene(outgoingLibraryId);
+            cancelAutomaticMediaForLibrary(outgoingLibraryId);
+            cancelMediaResourceRetry(outgoingLibraryId);
+            cancelVisibleWindowDimensionProbes(outgoingLibraryId);
+            lastVisibleWindowKeyByLibrary.delete(outgoingLibraryId);
+            lastVisibleWindowAssetIdsByLibrary.delete(outgoingLibraryId);
+          },
+          cancelQueuedJobs: (outgoingLibraryId) => {
+            libraryService.cancelJobs(outgoingLibraryId);
+          },
+          abortAiJobs: (outgoingLibraryId) => {
+            aiJobAbortRegistry.abort(outgoingLibraryId);
+          },
+          publishAiProgress,
+        },
+      });
       // Deterministic renderer E2E seam for the library safety overlay. This
       // is never enabled in production and keeps the opening stage observable
       // long enough to assert that partial navigation stays covered.
@@ -2111,15 +2175,7 @@ async function handleRequestWithoutWriteLease(request: WorkerRequest): Promise<W
       return { ok: true, type: 'library.opened', library };
     }
     case 'library.close':
-      cancelDeferredStartupThumbnailScene(request.command.libraryId);
-      cancelAutomaticMediaForLibrary(request.command.libraryId);
-      cancelMediaResourceRetry(request.command.libraryId);
-      cancelVisibleWindowDimensionProbes(request.command.libraryId);
-      lastVisibleWindowKeyByLibrary.delete(request.command.libraryId);
-      lastVisibleWindowAssetIdsByLibrary.delete(request.command.libraryId);
-      libraryService.cancelJobs(request.command.libraryId);
-      publishAiProgress(request.command.libraryId);
-      aiJobAbortRegistry.abort(request.command.libraryId);
+      stopAutomaticWorkForLibrary(request.command.libraryId);
       if (process.env.SERPENT_E2E === '1') {
         const delayMs = Number.parseInt(
           process.env.SERPENT_E2E_CLOSE_DELAY_MS ?? '',
@@ -2136,15 +2192,7 @@ async function handleRequestWithoutWriteLease(request: WorkerRequest): Promise<W
       return { ok: true, type: 'library.renamed', library: renamed };
     }
     case 'library.delete-from-disk': {
-      cancelDeferredStartupThumbnailScene(request.command.libraryId);
-      cancelAutomaticMediaForLibrary(request.command.libraryId);
-      cancelMediaResourceRetry(request.command.libraryId);
-      cancelVisibleWindowDimensionProbes(request.command.libraryId);
-      lastVisibleWindowKeyByLibrary.delete(request.command.libraryId);
-      lastVisibleWindowAssetIdsByLibrary.delete(request.command.libraryId);
-      libraryService.cancelJobs(request.command.libraryId);
-      publishAiProgress(request.command.libraryId);
-      aiJobAbortRegistry.abort(request.command.libraryId);
+      stopAutomaticWorkForLibrary(request.command.libraryId);
       // Keep the last verified snapshot before the irreversible library-root
       // deletion. The delete operation itself remains synchronous for its
       // existing recovery/reopen contract.
@@ -2938,39 +2986,6 @@ async function handleRequestWithoutWriteLease(request: WorkerRequest): Promise<W
         total: result.total,
         offset: result.offset,
         ...(result.snippets ? { snippets: result.snippets } : {}),
-      };
-    }
-    case 'browse.session.geometry': {
-      const result = libraryService.readBrowseSessionGeometry({
-        libraryId: request.command.libraryId,
-        libraryGeneration: libraryGenerationRegistry.current(request.command.libraryId) ?? 0,
-        sessionId: request.command.sessionId,
-        startIndex: request.command.startIndex,
-        limit: request.command.limit ?? 128,
-      });
-      if (result.status !== 'ready') {
-        return {
-          ok: true,
-          type: 'browse.session.stale',
-          sessionId: request.command.sessionId,
-          reason: result.status === 'missing' ? 'missing' : result.reason,
-        };
-      }
-      const geometryStale = browseCatalogSequenceStale(
-        result.session.sessionId,
-        result.session.changeSequence,
-        request.performance?.minCatalogSequence,
-      );
-      if (geometryStale) return geometryStale;
-      return {
-        ok: true,
-        type: 'browse.session.geometry',
-        libraryId: request.command.libraryId,
-        sessionId: result.session.sessionId,
-        startIndex: result.startIndex,
-        changeSequence: result.session.changeSequence,
-        ...localCatalogSequenceFields(result.session.changeSequence),
-        entries: result.entries,
       };
     }
     case 'browse.session.ids': {
