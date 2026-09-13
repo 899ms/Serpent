@@ -8,6 +8,7 @@ import {
 } from "react";
 
 import type { AssetSummary, BrowseLayoutEntry } from "../../shared/asset-types";
+import { virtualSlotAsset } from "../browse-window-slots";
 import {
   ASSET_GRID_GAP_PX,
   aspectRatioForAsset,
@@ -96,7 +97,23 @@ type IndexedRect = {
 export type BrowseCardRenderOptions = {
   /** High priority is reserved for cards intersecting the real viewport. */
   loadImmediately: boolean;
+  /**
+   * The parent slot owns this card's identity: it is keyed by session index and
+   * survives the loaded summary replacing the index-synthesized card. The card
+   * must therefore not key itself by assetId — that key change is what unmounted
+   * the media subtree and re-requested the cover on every geometry revision
+   * (CANVAS-038).
+   */
+  stableSlot?: boolean;
 };
+
+/**
+ * Slot identity is the session index. Summary/geometry patches change the
+ * card's props, never the node.
+ */
+export function virtualBrowseSlotKey(index: number): string {
+  return `virtual-slot-${Math.max(0, Math.trunc(index))}`;
+}
 
 export function variableWindow(input: {
   heights: readonly number[];
@@ -793,7 +810,6 @@ export function VirtualMasonryColumns({
   showCaption,
   captionBandPx,
   renderCard,
-  renderLayoutPreview,
 }: {
   assets: AssetSummary[];
   layout: VirtualBrowseLayout;
@@ -802,10 +818,6 @@ export function VirtualMasonryColumns({
   captionBandPx?: number;
   renderCard: (
     asset: AssetSummary,
-    options: BrowseCardRenderOptions,
-  ) => ReactNode;
-  renderLayoutPreview?: (
-    entry: ReturnType<typeof virtualLayoutEntryAt>,
     options: BrowseCardRenderOptions,
   ) => ReactNode;
 }) {
@@ -901,7 +913,7 @@ export function VirtualMasonryColumns({
                 const row = visibleWindow.start + offset;
                 const index = row * columnCount + columnIndex;
                 const entry = virtualLayoutEntryAt(layout, index);
-                const asset = assetById.get(entry.assetId);
+                const asset = virtualSlotAsset(assetById, entry);
                 const isLast = row === itemCount - 1;
                 const bodyHeight = column.heightAt(row);
                 const cardTop = column.offsetAt(row);
@@ -913,11 +925,12 @@ export function VirtualMasonryColumns({
                 );
                 return (
                   <div
+                    aria-hidden={asset ? undefined : true}
                     className="masonry-card-slot"
                     data-layout-asset-id={entry.assetId}
                     data-layout-index={index}
                     data-layout-rank={index}
-                    key={`${entry.assetId}-${index}`}
+                    key={virtualBrowseSlotKey(index)}
                     style={virtualMasonryCardSlotStyle({
                       previewHeightPx: Math.max(1, bodyHeight - (showCaption ? resolvedCaptionBandPx : 0)),
                       bodyHeightPx: bodyHeight,
@@ -925,8 +938,8 @@ export function VirtualMasonryColumns({
                     })}
                   >
                     {asset
-                      ? renderCard(asset, { loadImmediately })
-                      : renderLayoutPreview?.(entry, { loadImmediately })}
+                      ? renderCard(asset, { loadImmediately, stableSlot: true })
+                      : null}
                   </div>
                 );
               },
@@ -947,7 +960,6 @@ export function VirtualJustifiedAssetRows({
   cardSize,
   captionBandPx,
   renderCard,
-  renderLayoutPreview,
 }: {
   assets: AssetSummary[];
   layout: VirtualBrowseLayout;
@@ -955,10 +967,6 @@ export function VirtualJustifiedAssetRows({
   captionBandPx: number;
   renderCard: (
     asset: AssetSummary,
-    options: BrowseCardRenderOptions,
-  ) => ReactNode;
-  renderLayoutPreview?: (
-    entry: ReturnType<typeof virtualLayoutEntryAt>,
     options: BrowseCardRenderOptions,
   ) => ReactNode;
 }) {
@@ -1069,14 +1077,14 @@ export function VirtualJustifiedAssetRows({
             {Array.from({ length: Math.max(0, count) }, (_, itemOffset) => {
               const index = start + itemOffset;
               const entry = virtualLayoutEntryAt(layout, index);
-              const asset = assetById.get(entry.assetId);
+              const asset = virtualSlotAsset(assetById, entry);
               return (
                 <div
                   aria-hidden={asset ? undefined : true}
                   className="justified-card-slot"
                   data-layout-asset-id={entry.assetId}
                   data-layout-index={index}
-                  key={`${entry.assetId}-${index}`}
+                  key={virtualBrowseSlotKey(index)}
                   style={virtualJustifiedSlotStyle({
                     id: entry.assetId,
                     width: rowGeometry?.widths[itemOffset] ?? 1,
@@ -1084,8 +1092,8 @@ export function VirtualJustifiedAssetRows({
                   })}
                 >
                   {asset
-                    ? renderCard(asset, { loadImmediately })
-                    : renderLayoutPreview?.(entry, { loadImmediately })}
+                    ? renderCard(asset, { loadImmediately, stableSlot: true })
+                    : null}
                 </div>
               );
             })}

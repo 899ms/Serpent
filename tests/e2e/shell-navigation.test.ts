@@ -132,6 +132,16 @@ test("library switcher, breadcrumbs, and workspace history", async () => {
       await expect(mainSubmenu).toHaveCount(0);
       await window.getByRole("menuitem", { name: "设置", exact: true }).click();
       await expect(window.getByRole("dialog")).toBeVisible();
+      // 2026-09-13 user decision: a modal must not close because the user clicked
+      // beside it. Click on the scrim, well left of the panel, and keep it open.
+      const settingsDialog = window.getByRole("dialog");
+      const settingsBox = await settingsDialog.boundingBox();
+      expect(settingsBox).not.toBeNull();
+      await window.mouse.click(
+        settingsBox!.x / 2,
+        settingsBox!.y + settingsBox!.height / 2,
+      );
+      await expect(settingsDialog).toBeVisible();
       await window.keyboard.press("Escape");
       await expect(window.getByRole("dialog")).toHaveCount(0);
 

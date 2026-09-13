@@ -11,24 +11,64 @@ export type WorkspaceNavLocation =
    * next/prev 用 replaceCurrent 原地更新 assetId，不新增历史条目。
    */
   | { kind: "preview"; assetId: string }
-  | { kind: "tag-management" };
+  | { kind: "tag-management" }
+  | { kind: "plugin-sidebar"; viewId: string };
+
+export interface WorkspaceNavViewport {
+  /** Exact scroll offset, used when the restored extent is unchanged. */
+  scrollTop: number;
+  /** Relative position keeps a location stable when its virtual extent changes. */
+  scrollProgress: number;
+  scrollExtent: number;
+}
+
+/**
+ * One step in the shared workspace timeline. The tab id travels with the
+ * location so Back/Forward can cross tab switches: replaying an entry whose
+ * tab differs first activates that tab, then restores its recorded location.
+ */
+export interface WorkspaceNavEntry {
+  readonly tabId: string;
+  readonly location: WorkspaceNavLocation;
+}
 
 export type WorkspaceNavHistory = {
+  /** Location of the entry the cursor is on. */
   current: WorkspaceNavLocation;
+  /** Tab the current entry belongs to (may differ from the active tab while a
+   *  cross-tab Back/Forward replay is in flight). */
+  currentTabId: string;
+  currentViewport: WorkspaceNavViewport;
   canBack: boolean;
   canForward: boolean;
+  /**
+   * Tells the history which tab subsequent `push`es belong to. Called when the
+   * active tab changes (user switch, new tab, restore) — not a history event
+   * by itself; the tab-switch entry is pushed explicitly by the caller.
+   */
+  setActiveTab: (tabId: string) => void;
   push: (location: WorkspaceNavLocation) => void;
+  saveCurrentViewport: (viewport: WorkspaceNavViewport) => void;
   /** 原地替换当前条目（查看器内切资产用），不清空 forward 分支。 */
   replaceCurrent: (location: WorkspaceNavLocation) => void;
   /** 移除当前条目并回退到前一条（X/Esc 主动关闭查看器用），无 forward 残留。 */
   dismissCurrent: () => void;
   back: () => WorkspaceNavLocation | null;
   forward: () => WorkspaceNavLocation | null;
-  clear: (initial?: WorkspaceNavLocation) => void;
+  clear: (initial?: WorkspaceNavLocation, tabId?: string) => void;
+  /** Drops every entry that belongs to a closed tab (Serpent-b8a853). */
+  removeTab: (tabId: string) => void;
   peek: (delta: number) => WorkspaceNavLocation | null;
+  peekViewport: (delta: number) => WorkspaceNavViewport | null;
+  peekTabId: (delta: number) => string | null;
 };
 
 const DEFAULT_LOCATION: WorkspaceNavLocation = { kind: "all" };
+const DEFAULT_VIEWPORT: WorkspaceNavViewport = {
+  scrollTop: 0,
+  scrollProgress: 0,
+  scrollExtent: 0,
+};
 
 export function workspaceNavLocationsEqual(
   a: WorkspaceNavLocation,
@@ -64,6 +104,8 @@ export function workspaceNavLocationsEqual(
       return a.assetId === (b as Extract<WorkspaceNavLocation, { kind: "preview" }>).assetId;
     case "tag-management":
       return true;
+    case "plugin-sidebar":
+      return a.viewId === (b as Extract<WorkspaceNavLocation, { kind: "plugin-sidebar" }>).viewId;
   }
 }
 
@@ -75,37 +117,76 @@ export function workspaceNavLocationsEqual(
 export function seedRestoreLeafLocation(
   history: WorkspaceNavHistory,
   restored: WorkspaceNavLocation,
+  tabId: string = history.currentTabId,
 ): { canBack: boolean } {
-  const baseIsAll = restored.kind === 'all';
-  history.clear({ kind: 'all' });
+  const baseIsAll = restored.kind === "all";
+  history.clear({ kind: "all" }, tabId);
   if (!baseIsAll) history.push(restored);
   return { canBack: !baseIsAll };
 }
 
+/**
+ * The single shared workspace timeline. Entries are `{tabId, location}` so a
+ * Back/Forward step can cross a tab switch; `setActiveTab` stamps the tab that
+ * later pushes belong to, and `removeTab` drops a closed tab's steps.
+ */
 export function createWorkspaceNavHistory(
   initial: WorkspaceNavLocation = DEFAULT_LOCATION,
+  initialTabId = "workspace-tab-0",
 ): WorkspaceNavHistory {
-  const stack: WorkspaceNavLocation[] = [initial];
+  const stack: Array<{
+    tabId: string;
+    location: WorkspaceNavLocation;
+    viewport: WorkspaceNavViewport;
+  }> = [
+    { tabId: initialTabId, location: initial, viewport: { ...DEFAULT_VIEWPORT } },
+  ];
   let index = 0;
+  let activeTabId = initialTabId;
+
+  const syncCurrent = () => {
+    history.current = stack[index]!.location;
+    history.currentTabId = stack[index]!.tabId;
+    history.currentViewport = stack[index]!.viewport;
+    history.canBack = index > 0;
+    history.canForward = index < stack.length - 1;
+  };
 
   const history: WorkspaceNavHistory = {
     current: initial,
+    currentTabId: initialTabId,
+    currentViewport: { ...DEFAULT_VIEWPORT },
     canBack: false,
     canForward: false,
+    setActiveTab(tabId) {
+      activeTabId = tabId;
+    },
     push(location) {
-      if (workspaceNavLocationsEqual(history.current, location)) {
+      const entry = stack[index]!;
+      if (
+        entry.tabId === activeTabId &&
+        workspaceNavLocationsEqual(entry.location, location)
+      ) {
+        entry.viewport = { ...DEFAULT_VIEWPORT };
+        syncCurrent();
         return;
       }
       stack.length = index + 1;
-      stack.push(location);
+      stack.push({ tabId: activeTabId, location, viewport: { ...DEFAULT_VIEWPORT } });
       index = stack.length - 1;
-      history.current = location;
-      history.canBack = index > 0;
-      history.canForward = false;
+      syncCurrent();
+    },
+    saveCurrentViewport(viewport) {
+      stack[index]!.viewport = {
+        scrollTop: Math.max(0, viewport.scrollTop),
+        scrollProgress: Math.min(1, Math.max(0, viewport.scrollProgress)),
+        scrollExtent: Math.max(0, viewport.scrollExtent),
+      };
+      syncCurrent();
     },
     replaceCurrent(location) {
-      stack[index] = location;
-      history.current = location;
+      stack[index]!.location = location;
+      syncCurrent();
     },
     dismissCurrent() {
       if (index <= 0) {
@@ -113,18 +194,16 @@ export function createWorkspaceNavHistory(
       }
       stack.splice(index, 1);
       index -= 1;
-      history.current = stack[index]!;
-      history.canBack = index > 0;
-      history.canForward = false;
+      activeTabId = stack[index]!.tabId;
+      syncCurrent();
     },
     back() {
       if (index <= 0) {
         return null;
       }
       index -= 1;
-      history.current = stack[index]!;
-      history.canBack = index > 0;
-      history.canForward = index < stack.length - 1;
+      activeTabId = stack[index]!.tabId;
+      syncCurrent();
       return history.current;
     },
     forward() {
@@ -132,25 +211,75 @@ export function createWorkspaceNavHistory(
         return null;
       }
       index += 1;
-      history.current = stack[index]!;
-      history.canBack = index > 0;
-      history.canForward = index < stack.length - 1;
+      activeTabId = stack[index]!.tabId;
+      syncCurrent();
       return history.current;
     },
-    clear(nextInitial = DEFAULT_LOCATION) {
+    clear(nextInitial = DEFAULT_LOCATION, tabId = activeTabId) {
       stack.length = 0;
-      stack.push(nextInitial);
+      stack.push({ tabId, location: nextInitial, viewport: { ...DEFAULT_VIEWPORT } });
       index = 0;
-      history.current = nextInitial;
-      history.canBack = false;
-      history.canForward = false;
+      activeTabId = tabId;
+      syncCurrent();
+    },
+    removeTab(tabId) {
+      const currentEntry = stack[index]!;
+      for (let i = stack.length - 1; i >= 0; i -= 1) {
+        if (stack[i]!.tabId !== tabId) continue;
+        stack.splice(i, 1);
+        if (i <= index) index -= 1;
+      }
+      // Steps that became adjacent duplicates (same tab + location) once the
+      // closed tab's steps are gone would make Back land on a no-op; collapse
+      // them so every Back moves the view.
+      for (let i = 1; i < stack.length; ) {
+        const prev = stack[i - 1]!;
+        const entry = stack[i]!;
+        if (
+          entry.tabId === prev.tabId &&
+          workspaceNavLocationsEqual(entry.location, prev.location)
+        ) {
+          stack.splice(i, 1);
+          if (i <= index) index -= 1;
+        } else {
+          i += 1;
+        }
+      }
+      if (stack.length === 0) {
+        stack.push({
+          tabId: currentEntry.tabId === tabId ? activeTabId : currentEntry.tabId,
+          location: { ...DEFAULT_LOCATION },
+          viewport: { ...DEFAULT_VIEWPORT },
+        });
+        index = 0;
+      } else if (index < 0) {
+        index = 0;
+      } else if (index > stack.length - 1) {
+        index = stack.length - 1;
+      }
+      activeTabId = stack[index]!.tabId;
+      syncCurrent();
     },
     peek(delta) {
       const target = index + delta;
       if (target < 0 || target >= stack.length) {
         return null;
       }
-      return stack[target]!;
+      return stack[target]!.location;
+    },
+    peekViewport(delta) {
+      const target = index + delta;
+      if (target < 0 || target >= stack.length) {
+        return null;
+      }
+      return stack[target]!.viewport;
+    },
+    peekTabId(delta) {
+      const target = index + delta;
+      if (target < 0 || target >= stack.length) {
+        return null;
+      }
+      return stack[target]!.tabId;
     },
   };
 

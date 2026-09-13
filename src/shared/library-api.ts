@@ -1,5 +1,6 @@
 import type { PublicError, PublicErrorReason } from './protocol/errors';
 import type { LibraryNavigationSummary } from './library-navigation';
+import type { MutationReceipt } from './performance-contract';
 
 /** Serpent-xffq：WebDAV 服务端能力探测结果。 */
 export interface SyncCapabilities {
@@ -28,7 +29,6 @@ export interface SyncReport {
 
 import type {
   AssetSummary,
-  BrowseGeometryBlock,
   BrowseLayoutEntry,
   AiSearchPlan,
   AssetMetadataResult,
@@ -197,7 +197,13 @@ export interface PluginJobStatus {
 
 export interface SerpentLibraryApi {
   create(input: { displayName: string }): Promise<LibraryApiResult<RendererLibrarySummary>>;
-  open(): Promise<LibraryApiResult<RendererLibrarySummary>>;
+  open(input?: { libraryPath?: string }): Promise<LibraryApiResult<RendererLibrarySummary>>;
+  /**
+   * Shows the native "choose library location" picker and returns the chosen
+   * path (null when cancelled) without opening anything, so callers can start
+   * their loading UI only after the dialog closes.
+   */
+  chooseLibraryPath(): Promise<LibraryApiResult<string | null>>;
   /** Request cancellation of the active library open/create transition. */
   cancelOpen(): Promise<LibraryApiResult<void>>;
   /** Reveal a Main-owned recovery report without exposing its filesystem path. */
@@ -238,7 +244,7 @@ export interface SerpentLibraryApi {
     libraryId: string;
     parentFolderId?: string;
     name: string;
-  }): Promise<LibraryApiResult<ManagedFolderSummary & { historyEntryId?: string }>>;
+  }): Promise<LibraryApiResult<ManagedFolderSummary & { historyEntryId?: string; mutationReceipt?: MutationReceipt }>>;
   renameFolder(input: {
     libraryId: string;
     folderId: string;
@@ -441,6 +447,11 @@ export interface SerpentLibraryApi {
   importFolderAsLinked(input: {
     libraryId: string;
     displayName?: string;
+    /**
+     * Serpent-316493: managed folder the linked root hangs under; null/omitted
+     * links it at the library root (the folder-section 「+」 / link button).
+     */
+    parentFolderId?: string | null;
   }): Promise<LibraryApiResult<LinkedFolderSummary>>;
   relinkMissingFolder(input: {
     libraryId: string;
@@ -496,10 +507,9 @@ export interface SerpentLibraryApi {
   executeSmartCollection(input: { libraryId: string; collectionId: string; scopeMode?: boolean; idsOnly?: boolean; layoutOnly?: boolean; limit?: number; offset?: number }): Promise<LibraryApiResult<{ items: AssetSummary[]; total: number; offset: number; assetIds?: string[]; layout?: BrowseLayoutEntry[] }>>;
   // Search
   searchAssets(input: { libraryId: string; query?: SearchQuery | null; filters?: FilterClause[]; scope?: SearchScope; sort?: { field: 'name' | 'modified_at' | 'created_at' | 'byte_size' | 'long_edge' | 'duration' | 'rating' | 'color' | 'author'; order: 'asc' | 'desc' }; scopeMode?: boolean; idsOnly?: boolean; layoutOnly?: boolean; limit?: number; offset?: number; showIgnored?: boolean }): Promise<LibraryApiResult<{ items: AssetSummary[]; total: number; offset: number; snippets?: { assetId: string; text: string }[]; assetIds?: string[]; layout?: BrowseLayoutEntry[] }>>;
-  openBrowseSession(input: { libraryId: string; query: SearchQuery | null; filters?: FilterClause[]; scope?: SearchScope; sort?: { field: 'name' | 'modified_at' | 'created_at' | 'byte_size' | 'long_edge' | 'duration' | 'rating' | 'color' | 'author'; order: 'asc' | 'desc' }; smartCollectionId?: string; limit?: number; showIgnored?: boolean }): Promise<LibraryApiResult<{ sessionId: string; libraryGeneration: number; changeSequence: number; queryFingerprint: string; items: AssetSummary[]; total: number; offset: number; snippets?: { assetId: string; text: string }[] }>>;
-  fetchBrowseSessionPage(input: { libraryId: string; sessionId: string; limit?: number; offset?: number }): Promise<LibraryApiResult<{ sessionId: string; changeSequence: number; items: AssetSummary[]; total: number; offset: number; snippets?: { assetId: string; text: string }[] } | { stale: true; sessionId: string; reason: 'library-generation' | 'change-sequence' | 'missing' }>>;
-  fetchBrowseSessionGeometry(input: { libraryId: string; sessionId: string; startIndex: number; limit?: number }): Promise<LibraryApiResult<BrowseGeometryBlock | { stale: true; sessionId: string; reason: 'library-generation' | 'change-sequence' | 'missing' }>>;
-  fetchBrowseSessionAssetIds(input: { libraryId: string; sessionId: string }): Promise<LibraryApiResult<string[] | { stale: true; sessionId: string; reason: 'library-generation' | 'change-sequence' | 'missing' }>>;
+  openBrowseSession(input: { libraryId: string; query: SearchQuery | null; filters?: FilterClause[]; scope?: SearchScope; sort?: { field: 'name' | 'modified_at' | 'created_at' | 'byte_size' | 'long_edge' | 'duration' | 'rating' | 'color' | 'author'; order: 'asc' | 'desc' }; smartCollectionId?: string; limit?: number; showIgnored?: boolean }): Promise<LibraryApiResult<{ sessionId: string; libraryGeneration: number; changeSequence: number; catalogSequence?: number; snapshotGeneration?: number | null; queryFingerprint: string; items: AssetSummary[]; total: number; offset: number; snippets?: { assetId: string; text: string }[] }>>;
+  fetchBrowseSessionPage(input: { libraryId: string; sessionId: string; limit?: number; offset?: number }): Promise<LibraryApiResult<{ sessionId: string; changeSequence: number; catalogSequence?: number; snapshotGeneration?: number | null; items: AssetSummary[]; total: number; offset: number; snippets?: { assetId: string; text: string }[] } | { stale: true; sessionId: string; reason: 'library-generation' | 'change-sequence' | 'catalog-sequence' | 'missing' }>>;
+  fetchBrowseSessionAssetIds(input: { libraryId: string; sessionId: string }): Promise<LibraryApiResult<string[] | { stale: true; sessionId: string; reason: 'library-generation' | 'change-sequence' | 'catalog-sequence' | 'missing' }>>;
   closeBrowseSession(input: { libraryId: string; sessionId: string }): Promise<LibraryApiResult<{ sessionId: string }>>;
   fetchLibraryNavigationSummary(input: { libraryId: string; showIgnored?: boolean; includeTrashedFolders?: boolean }): Promise<LibraryApiResult<LibraryNavigationSummary>>;
   planAiSearch(input: { naturalQuery: string }): Promise<LibraryApiResult<{ plan: AiSearchPlan; apiFormat: AiApiFormat; model: string }>>;
@@ -663,10 +673,12 @@ export interface SerpentLibraryApi {
   syncSaveServer(input: { id?: string; baseUrl: string; username?: string; password?: string; allowInsecureTls?: boolean }): Promise<LibraryApiResult<{ id: string }>>;
   /** Serpent-xffq: 删除同步服务器。 */
   syncDeleteServer(input: { id: string }): Promise<LibraryApiResult<{ id: string }>>;
-  /** Serpent-xffq: 保存库绑定（服务器 + 可选同步文件夹名，默认库名；enabled=自动同步开关；pollIntervalMs=云端轮询间隔）。 */
-  syncSaveBinding(input: { libraryId: string; serverId: string; directoryName?: string; enabled?: boolean; pollIntervalMs?: number }): Promise<LibraryApiResult<void>>;
+  /** Serpent-xffq: 保存库绑定（服务器 + 可选同步文件夹名，默认库名；enabled=自动同步开关；pollIntervalMs=云端轮询间隔；showCardSyncStatus=卡片同步状态）。 */
+  syncSaveBinding(input: { libraryId: string; serverId: string; directoryName?: string; enabled?: boolean; pollIntervalMs?: number; showCardSyncStatus?: boolean }): Promise<LibraryApiResult<void>>;
   /** Serpent-xffq: 读取库绑定。 */
-  syncGetBinding(input: { libraryId: string }): Promise<LibraryApiResult<{ serverId: string; directoryName?: string; lastSyncedAt?: string; enabled?: boolean; pollIntervalMs?: number } | null>>;
+  syncGetBinding(input: { libraryId: string }): Promise<LibraryApiResult<{ serverId: string; directoryName?: string; lastSyncedAt?: string; enabled?: boolean; pollIntervalMs?: number; showCardSyncStatus?: boolean } | null>>;
+  /** Serpent-871f34: 当前页资产的本地同步状态（已同步项不返回）。 */
+  syncListCardStatuses(input: { libraryId: string; assetIds: string[] }): Promise<LibraryApiResult<Array<{ assetId: string; status: 'pending' | 'conflict' }>>>;
   /** Serpent-xffq: 对指定服务器做连接能力探测（不触碰库）。 */
   syncProbe(input: { serverId: string }): Promise<LibraryApiResult<SyncCapabilities>>;
   /** Serpent-xffq: 列出服务器上可打开的同步库（读远端 manifest）。 */

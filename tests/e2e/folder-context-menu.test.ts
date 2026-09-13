@@ -125,6 +125,12 @@ async function openFolderRenameInline(window: Page, folderName: string) {
   await menu.getByRole("menuitem", { name: "重命名…" }).click();
   const input = window.locator(".nav-inline-edit input");
   await expect(input).toBeVisible({ timeout: 5_000 });
+  await expect(input).toHaveValue(folderName);
+  const selection = await input.evaluate((element: HTMLInputElement) => [
+    element.selectionStart,
+    element.selectionEnd,
+  ]);
+  expect(selection).toEqual([folderName.length, folderName.length]);
   return input;
 }
 
@@ -270,17 +276,11 @@ test("renames a folder inline from the context menu and keeps its assets visible
     await expect(assetCard).toBeVisible({ timeout: 15_000 });
 
     const input = await openFolderRenameInline(window, "原画");
-    // The row becomes an input holding the current name, focused and fully
-    // preselected so typing replaces it.
+    // The row becomes an input holding the current name, focused with the
+    // caret at the end so typing appends unless the user moves it.
     await expect(window.getByRole("dialog")).toHaveCount(0);
     await expect(input).toHaveValue("原画");
     await expect(input).toBeFocused();
-    const selection = await input.evaluate((element: HTMLInputElement) => [
-      element.selectionStart,
-      element.selectionEnd,
-    ]);
-    expect(selection).toEqual([0, "原画".length]);
-
     await input.fill("角色原画");
     await input.press("Enter");
 
@@ -312,7 +312,7 @@ test("renames a folder inline from the context menu and keeps its assets visible
     expect(existsSync(path.join(libraryPath, "Assets", "原画"))).toBe(false);
 
     // The asset is still listed from the all-assets (DB) view as well.
-    await window.getByRole("button", { name: /所有资产/ }).click();
+    await window.getByRole("button", { name: "所有资产", exact: true }).click();
     await expect(assetCard).toBeVisible({ timeout: 10_000 });
   } finally {
     await application.close();
@@ -338,7 +338,7 @@ test("keeps the inline rename row open with an inline conflict error and allows 
     await createLibrary(window, libraryName);
     await createFolderViaSidebar(window, "素材甲");
     // 创建后自动进入新文件夹（产品行为）——回根再建第二个，保证两者同父级。
-    await window.getByRole("button", { name: /所有资产/ }).click();
+    await window.getByRole("button", { name: "所有资产", exact: true }).click();
     await createFolderViaSidebar(window, "素材乙");
 
     const input = await openFolderRenameInline(window, "素材甲");

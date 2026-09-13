@@ -281,6 +281,7 @@ import {
   parseAiContentClearedEvent,
 } from "../shared/protocol/responses";
 import { LibraryWorkerClient, WorkerRequestTimeoutError } from "./worker-client";
+import { performanceConsumerIdForWindow } from "../shared/performance-contract";
 import { SyncAutoScheduler, type SyncBindingLike } from "./sync-auto-scheduler";
 import { resolveImageSequenceImportPaths } from "./image-sequence-import";
 import { AppLogger } from "./app-logger";
@@ -332,7 +333,9 @@ import {
   type AiReliabilitySettings,
 } from "../shared/ai-reliability";
 import {
+  DEFAULT_AI_API_FORMAT,
   DEFAULT_AI_LANGUAGES,
+  DEFAULT_AI_MODELS,
   listAiModels,
   migrateLegacyProviderToApiFormat,
   normalizeAiLanguages,
@@ -658,6 +661,17 @@ function schedulePluginInputCaptureFlush(): void {
 }
 let windowsTray: WindowsTrayController | undefined;
 
+/**
+ * Known libraries for the native 资源库 menu, most recently opened first.
+ * Read fresh on every (re)install so the section tracks the store; labels are
+ * literal names, so no i18n resolution is needed for them.
+ */
+function nativeMenuRecentLibraries(): { path: string; name: string }[] {
+  return readRecentLibraryEntries(recentLibraryPath(), (error) => {
+    logger?.error("recent-library.read", error);
+  }).map((entry) => ({ path: entry.path, name: entry.name }));
+}
+
 function recentLibraryPath(): string {
   return path.join(app.getPath("userData"), "recent-library.json");
 }
@@ -771,6 +785,19 @@ function rememberOpenedLibrary(libraryPath: string, displayName: string, library
       },
     },
   );
+  refreshApplicationMenuRecentLibraries();
+}
+
+/**
+ * Re-installs the native menu so its 资源库 → 最近使用的资源库 section tracks the
+ * store. Called after any recent-library mutation (open, forget, remove).
+ */
+function refreshApplicationMenuRecentLibraries(): void {
+  if (process.platform !== "darwin") return;
+  installApplicationMenu({
+    locale: appLocale,
+    recentLibraries: nativeMenuRecentLibraries(),
+  });
 }
 
 let extensionServer: ExtensionServer | undefined;
@@ -1002,8 +1029,8 @@ interface AiConfig {
 }
 
 const DEFAULT_AI_CONFIG: AiConfig = {
-  apiFormat: "dashscope_native",
-  model: "qwen3-vl-plus",
+  apiFormat: DEFAULT_AI_API_FORMAT,
+  model: DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT],
   baseUrl: "",
   descriptionEnabled: true,
   tagEnabled: true,
@@ -1047,6 +1074,8 @@ interface SyncBindingRecord {
   enabled?: boolean;
   /** 云端变化轮询间隔（毫秒，用户可设置；缺省 5000）。 */
   pollIntervalMs?: number;
+  /** 卡片右下角同步状态；缺省 true（Serpent-871f34）。 */
+  showCardSyncStatus?: boolean;
 }
 
 /** 兼容旧格式绑定：directoryName 优先，其次旧 subPath。 */
@@ -2434,7 +2463,8 @@ async function commandFor(
         : undefined;
     }
     case "library.open.request": {
-      const selectedLibraryPath = await selectDirectory("openLibrary");
+      const selectedLibraryPath =
+        request.libraryPath ?? (await selectDirectory("openLibrary"));
       return selectedLibraryPath
         ? { type: "library.open", selectedLibraryPath }
         : undefined;
@@ -2831,6 +2861,7 @@ async function commandFor(
             libraryId: request.libraryId,
             displayName: request.displayName,
             sourceRootPath,
+            parentFolderId: request.parentFolderId,
           }
         : undefined;
     }
@@ -3096,14 +3127,6 @@ async function commandFor(
         sessionId: request.sessionId,
         limit: request.limit,
         offset: request.offset,
-      };
-    case "browse.session.geometry.request":
-      return {
-        type: "browse.session.geometry",
-        libraryId: request.libraryId,
-        sessionId: request.sessionId,
-        startIndex: request.startIndex,
-        limit: request.limit,
       };
     case "browse.session.ids.request":
       return {
@@ -3602,6 +3625,12 @@ async function commandFor(
         libraryId: request.libraryId,
         assetIds: request.assetIds,
       };
+    case "sync.asset-card-status.request":
+      return {
+        type: "sync.asset-card-status",
+        libraryId: request.libraryId,
+        assetIds: request.assetIds,
+      };
     case "sync.probe.request": {
       const server = resolveSyncServerCredentials(request.serverId);
       if (!server) throw new Error("同步服务器不存在，请先在通用设置中配置。");
@@ -3766,6 +3795,9 @@ async function commandFor(
     case "library.open-cancel.request":
       // Main-only request; handled before Worker dispatch.
       return undefined;
+    case "library.choose-path.request":
+      // Main-only request (native picker); handled before Worker dispatch.
+      return undefined;
     default:
       return assertNever(request);
   }
@@ -3830,7 +3862,28 @@ function isRetryableProbeError(error: { code: string; reason?: string }): boolea
   );
 }
 
-async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
+/**
+ * Per-request Main-side trace for library lifecycle requests.
+ *
+ * A switch that stops printing Renderer stage markers, never reaches the
+ * Worker and logs no error is otherwise unattributable: Main's own dispatch
+ * point has to say whether the request was even handled. Opt-in per measurement
+ * (SERPENT_E2E_LIBRARY_TRACE=1) so ordinary E2E runs do not gain log volume.
+ */
+function libraryRequestTraceEnabled(): boolean {
+  return process.env.SERPENT_E2E === "1"
+    && process.env.SERPENT_E2E_LIBRARY_TRACE === "1";
+}
+
+async function handleLibraryRequest(
+  input: unknown,
+  options: { consumerId: string },
+): Promise<RendererResult> {
+  if (libraryRequestTraceEnabled()) {
+    logger?.info("diag.library-request.enter", "Library request entered Main.", {
+      requestType: (input as { type?: unknown } | null)?.type,
+    });
+  }
   let operation: "create" | "open" | "import" | "open-eagle" | "open-billfish" | undefined;
   let lifecyclePublished = false;
   let clipboardStageDirectory: string | undefined;
@@ -3853,6 +3906,16 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
       return {
         ok: true,
         type: "library.open-cancelled",
+      } satisfies RendererResult;
+    }
+    if (request.type === "library.choose-path.request") {
+      // Dialog only. The renderer starts its loading UI/timer only after this
+      // resolves, so the progress overlay never covers the native picker.
+      const chosenPath = await selectDirectory("openLibrary");
+      return {
+        ok: true,
+        type: "library.choose-path",
+        path: chosenPath ?? null,
       } satisfies RendererResult;
     }
     openCancellation = isLibraryOpenRequest(request)
@@ -3924,6 +3987,7 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
       removeRecentLibrary(recentLibraryPath(), request.libraryPath, (error) => {
         logger?.error("recent-library.forget", error);
       });
+      refreshApplicationMenuRecentLibraries();
       return {
         ok: true,
         type: "library.forgotten",
@@ -4008,6 +4072,7 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
         lastSyncedAt: previous?.lastSyncedAt,
         enabled: request.enabled ?? previous?.enabled ?? false,
         pollIntervalMs: request.pollIntervalMs ?? previous?.pollIntervalMs,
+        showCardSyncStatus: request.showCardSyncStatus ?? previous?.showCardSyncStatus ?? true,
       };
       writeSyncBindings(bindings);
       // Serpent-7405ef: 保存绑定（含开启自动同步）后立即触发一次同步，
@@ -4039,6 +4104,7 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
               lastSyncedAt: binding.lastSyncedAt,
               enabled: binding.enabled ?? false,
               pollIntervalMs: binding.pollIntervalMs,
+              showCardSyncStatus: binding.showCardSyncStatus ?? true,
             }
           : null,
       } satisfies RendererResult;
@@ -4205,13 +4271,13 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
       if (request.autoAnalyzeEnabled && !request.disclaimerAccepted) {
         return {
           ok: false,
-          error: createPublicError("INVALID_IMPORT_DECISION"),
+          error: createPublicError("CONFIRMATION_REQUIRED"),
         } satisfies RendererResult;
       }
       if (!request.apiKey && !currentConfig.hasKey) {
         return {
           ok: false,
-          error: createPublicError("INVALID_IMPORT_DECISION"),
+          error: createPublicError("AI_SETTINGS_INCOMPLETE"),
         } satisfies RendererResult;
       }
       const savedConfig: AiConfig = {
@@ -4638,7 +4704,7 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
       if (sequenceIndex !== pending.nextSequenceIndex) {
         return {
           ok: false,
-          error: createPublicError("INVALID_IMPORT_DECISION"),
+          error: createPublicError("IMPORT_NOT_FOUND"),
         } satisfies RendererResult;
       }
       const sequence = stored.sequences[sequenceIndex];
@@ -4653,7 +4719,7 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
       if (decision.sourcePaths.length === 0) {
         return {
           ok: false,
-          error: createPublicError("INVALID_IMPORT_DECISION"),
+          error: createPublicError("INVALID_SELECTION"),
         } satisfies RendererResult;
       }
       command = {
@@ -4928,7 +4994,25 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
       : 0;
     const workerResult = command.type === "sync.probe"
       ? await runSyncProbeWithRetry(command)
-      : await workerClient.request(command);
+      : await (async () => {
+        const traceLibraryRequest = libraryRequestTraceEnabled();
+        if (traceLibraryRequest) {
+          logger?.info(
+            "diag.library-request.dispatch",
+            "Dispatching the library command to the Worker.",
+            { workerCommand: command.type },
+          );
+        }
+        const result = await workerClient.request(command, { consumerId: options.consumerId });
+        if (traceLibraryRequest) {
+          logger?.info(
+            "diag.library-request.dispatched",
+            "The Worker answered the library command.",
+            { workerCommand: command.type, ok: result.ok, resultType: result.ok ? result.type : undefined },
+          );
+        }
+        return result;
+      })();
     if (viewerWorkerStartedAt > 0) {
       logger?.info("viewer.preview-worker-timing", "Preview request resolved.", {
         libraryId: viewerRequest?.libraryId,
@@ -4944,7 +5028,7 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
           await workerClient.request({
             type: "library.close",
             libraryId: workerResult.library.libraryId,
-          });
+          }, { consumerId: options.consumerId });
         } catch (error) {
           logger?.error("library.open.cancel-close", error, {
             libraryId: workerResult.library.libraryId,
@@ -6737,6 +6821,7 @@ async function startApplication(): Promise<void> {
           removeRecentLibrary(recentLibraryPath(), libraryPath, (error) => {
             logger?.error('recent-library.remove', error);
           });
+          refreshApplicationMenuRecentLibraries();
           publishLifecycle({
             type: 'library.closed',
             libraryId,
@@ -7527,7 +7612,7 @@ async function startApplication(): Promise<void> {
 
   // Serpent-bfsb 后续：自动同步调度器。打开同步资源库后自动绑定并开启
   // （见 handleLibraryRequest 的 sync.open-remote-library.request 成功分支）；
-  // 本地资产变更 debounce 后自动同步；固定间隔轮询云端 manifest 变化。
+  // 本地资产变更 5 秒防抖后自动同步；轮询间隔只用于检查云端。
   syncAutoScheduler = new SyncAutoScheduler({
     workerClient,
     deviceId: () => syncDeviceId(),
@@ -7934,6 +8019,21 @@ async function startApplication(): Promise<void> {
     }
   });
 
+  // 主进程事件循环滞后监控（SERPENT_LAG_LOG=1）：Main 也是单线程。若 Main 被
+  // 同步工作堵住，Renderer 的 IPC 会迟迟不返回，表现就是「切换资源库卡住」，
+  // 而 Worker 日志里看不到任何异常。
+  if (process.env.SERPENT_LAG_LOG === "1") {
+    let lagWindowStart = Date.now();
+    const lagTimer = setInterval(() => {
+      const now = Date.now();
+      const driftMs = now - lagWindowStart - 1_000;
+      lagWindowStart = now;
+      if (driftMs >= 200) {
+        logger?.info("main.eventLoop.lag", "Main event loop was blocked.", { driftMs });
+      }
+    }, 1_000);
+    lagTimer.unref?.();
+  }
   ipcMain.handle(LIBRARY_REQUEST_CHANNEL, (event, input: unknown) => {
     if (!mainWindow || event.sender !== mainWindow.webContents) {
       return {
@@ -7941,7 +8041,9 @@ async function startApplication(): Promise<void> {
         error: createPublicError("INTERNAL_ERROR"),
       } satisfies RendererResult;
     }
-    return handleLibraryRequest(input);
+    return handleLibraryRequest(input, {
+      consumerId: performanceConsumerIdForWindow(event.sender.id),
+    });
   });
 
   ipcMain.on(ASSET_NATIVE_DRAG_CHANNEL, (event, input: unknown) => {
@@ -8310,7 +8412,10 @@ async function startApplication(): Promise<void> {
       return;
     }
     appLocale = parsed.locale;
-    installApplicationMenu({ locale: appLocale });
+    installApplicationMenu({
+      locale: appLocale,
+      recentLibraries: nativeMenuRecentLibraries(),
+    });
     windowsTray?.updateLocale(appLocale);
   });
 
@@ -8413,7 +8518,10 @@ async function startApplication(): Promise<void> {
   // Install before the first window so macOS does not keep Electron's default
   // View→Zoom accelerators that steal Cmd+=/-/0 (Serpent-46i9).
   // Windows: hides menu bar for frameless shell (Serpent-znex).
-  installApplicationMenu({ locale: appLocale });
+  installApplicationMenu({
+    locale: appLocale,
+    recentLibraries: nativeMenuRecentLibraries(),
+  });
 
   registerWindowControls({
     getMainWindow: () => mainWindow,

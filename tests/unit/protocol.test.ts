@@ -46,6 +46,65 @@ describe('renderer request protocol', () => {
     });
   });
 
+  it('keeps showCardSyncStatus on sync binding save (Serpent-871f34)', () => {
+    expect(parseRendererRequest({
+      type: 'sync.library.binding.save.request',
+      libraryId: 'lib-1',
+      serverId: 'server-1',
+      enabled: true,
+      showCardSyncStatus: false,
+    })).toMatchObject({
+      type: 'sync.library.binding.save.request',
+      showCardSyncStatus: false,
+    });
+    expect(parseRendererResult({
+      ok: true,
+      type: 'sync.binding.got',
+      libraryId: 'lib-1',
+      binding: {
+        serverId: 'server-1',
+        showCardSyncStatus: false,
+      },
+    })).toMatchObject({
+      binding: { showCardSyncStatus: false },
+    });
+  });
+
+  it('lists visible-card sync statuses without synced entries (Serpent-871f34)', () => {
+    expect(parseRendererRequest({
+      type: 'sync.asset-card-status.request',
+      libraryId: 'lib-1',
+      assetIds: ['asset-1', 'asset-2'],
+    })).toEqual({
+      type: 'sync.asset-card-status.request',
+      libraryId: 'lib-1',
+      assetIds: ['asset-1', 'asset-2'],
+    });
+    expect(parseWorkerRequest({
+      requestId: 'sync-card-status-01',
+      command: {
+        type: 'sync.asset-card-status',
+        libraryId: 'lib-1',
+        assetIds: ['asset-1'],
+      },
+    }).command).toEqual({
+      type: 'sync.asset-card-status',
+      libraryId: 'lib-1',
+      assetIds: ['asset-1'],
+    });
+    expect(parseWorkerResponse({
+      requestId: 'sync-card-status-01',
+      result: {
+        ok: true,
+        type: 'sync.asset-card-status',
+        statuses: [{ assetId: 'asset-1', status: 'pending' }],
+      },
+    }).result).toMatchObject({
+      type: 'sync.asset-card-status',
+      statuses: [{ assetId: 'asset-1', status: 'pending' }],
+    });
+  });
+
   it('keeps recovery report paths on the Worker/Main side', () => {
     expect(parseRendererRequest({
       type: 'library.recovery-report.request',
@@ -229,36 +288,33 @@ describe('renderer request protocol', () => {
     })).toThrow();
   });
 
-  it('round-trips bounded BrowseSession geometry blocks', () => {
+  it('round-trips bounded BrowseSession asset id snapshots', () => {
     expect(parseRendererRequest({
-      type: 'browse.session.geometry.request',
+      type: 'browse.session.ids.request',
       libraryId: 'library-01',
       sessionId: 'session-01',
-      startIndex: 128,
-      limit: 128,
-    })).toMatchObject({ type: 'browse.session.geometry.request', startIndex: 128 });
+    })).toMatchObject({ type: 'browse.session.ids.request' });
     expect(parseWorkerRequest({
-      requestId: 'geometry-01',
+      requestId: 'ids-01',
       command: {
-        type: 'browse.session.geometry',
+        type: 'browse.session.ids',
         libraryId: 'library-01',
         sessionId: 'session-01',
-        startIndex: 128,
-        limit: 128,
       },
-    }).command).toMatchObject({ type: 'browse.session.geometry' });
+    }).command).toMatchObject({ type: 'browse.session.ids' });
+    // Keep all three layers: the worker response shape is what the preload
+    // narrows on, so dropping it would leave the contract half-covered.
     expect(parseWorkerResponse({
-      requestId: 'geometry-01',
+      requestId: 'ids-01',
       result: {
         ok: true,
-        type: 'browse.session.geometry',
+        type: 'browse.session.ids',
         libraryId: 'library-01',
         sessionId: 'session-01',
-        startIndex: 128,
         changeSequence: 4,
-        entries: [{ index: 128, assetId: 'asset-128', width: 1920, height: 1080 }],
+        assetIds: ['asset-1', 'asset-2'],
       },
-    }).result).toMatchObject({ type: 'browse.session.geometry' });
+    }).result).toMatchObject({ type: 'browse.session.ids' });
   });
 
   it('round-trips the coherent navigation summary request', () => {
@@ -2482,6 +2538,19 @@ describe('background asset change events', () => {
       changedCount: 1,
       missingCount: 0,
       source: 'content-replace',
+    });
+    expect(parseAssetChangeEvent({
+      type: 'asset.changed',
+      libraryId: 'library-01',
+      changedCount: 1,
+      missingCount: 0,
+      source: 'sync',
+    })).toEqual({
+      type: 'asset.changed',
+      libraryId: 'library-01',
+      changedCount: 1,
+      missingCount: 0,
+      source: 'sync',
     });
     expect(() => parseAssetChangeEvent({
       type: 'asset.changed',

@@ -43,9 +43,6 @@ export function OpenSourceLicensesDialog({
   return (
     <div
       className="dialog-backdrop"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
       role="presentation"
     >
       <DialogShell

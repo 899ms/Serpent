@@ -83,7 +83,6 @@ export function MasonryColumns(props: MasonryColumnsProps) {
         showCaption={props.showCaption}
         captionBandPx={captionBandPx}
         renderCard={props.renderCard}
-        renderLayoutPreview={props.renderLayoutPreview}
       />
     );
   }

@@ -86,9 +86,14 @@ export function AssetCardMedia({
   // Serpent-2ajm: a failed image load must never paint the browser's broken
   // image glyph — fall back to the themed file/cracked icon instead.
   const [errored, setErrored] = useState(false);
-  const fallbackIcon = (
-    <Icon name={failed ? "broken-file" : "file"} size={28} />
-  );
+  // A card without a cover yet (still decoding, deferred off-screen, or waiting
+  // for its first page) stays blank rather than showing a file glyph: the empty
+  // frame already reads as "not there yet", and the glyph made a momentarily
+  // empty card look like a broken one. A genuine generation/decode failure keeps
+  // the cracked-file icon — that is an error, not a placeholder.
+  const fallbackIcon = failed ? (
+    <Icon name="broken-file" size={28} />
+  ) : null;
 
   useEffect(() => {
     if (!isActive || !isSequence || !sequence) return;

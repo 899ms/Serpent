@@ -1,17 +1,19 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  BrowseGeometryBlockCache,
-  BROWSE_GEOMETRY_BLOCK_SIZE,
-  geometryBlockStartsForRange,
   geometryPlaceholderId,
   isGeometryPlaceholder,
+  BROWSE_FULL_INDEX_MAX_ASSETS,
+  shouldFetchCompleteBrowseIndex,
+  shouldUseVirtualBrowseLayout,
 } from "../../src/renderer/browse/use-virtual-browse-session";
 import {
   createVirtualBrowseLayout,
+  createVirtualBrowseLayoutFromIndex,
   evictVirtualSummaryPage,
   mergeVirtualSummaryPage,
   patchVirtualLayoutGeometry,
+  virtualIndexMatchesFirstPage,
   virtualLayoutEntryAt,
 } from "../../src/renderer/browse/virtual-browse-layout";
 
@@ -58,44 +60,164 @@ describe("virtual browse geometry", () => {
     expect(virtualLayoutEntryAt(layout, 1).assetId).toBe(geometryPlaceholderId(1));
   });
 
-  it("aligns viewport requests to bounded blocks with one block of overscan", () => {
-    expect(geometryBlockStartsForRange({
-      startIndex: 257,
-      endIndex: 300,
+  it("virtualizes exactly the scopes whose COUNT exceeds the first painted page", () => {
+    expect(shouldUseVirtualBrowseLayout({
+      sessionId: "session-1",
       total: 1_000,
-    })).toEqual([128, 256, 384]);
-    expect(geometryBlockStartsForRange({
-      startIndex: 0,
-      endIndex: 20,
+      firstPageCount: 100,
+    })).toBe(true);
+    // One page already covers the scope: the compact path owns it.
+    expect(shouldUseVirtualBrowseLayout({
+      sessionId: "session-1",
       total: 100,
-    })).toEqual([0]);
+      firstPageCount: 100,
+    })).toBe(false);
+    // Without a session there is no full-range COUNT to trust.
+    expect(shouldUseVirtualBrowseLayout({
+      total: 1_000,
+      firstPageCount: 100,
+    })).toBe(false);
+    expect(shouldUseVirtualBrowseLayout({
+      sessionId: "session-1",
+      total: 0,
+      firstPageCount: 0,
+    })).toBe(false);
   });
 
-  it("evicts geometry blocks by LRU and keeps summary fields when geometry arrives", () => {
-    const cache = new BrowseGeometryBlockCache(2);
-    const block = (startIndex: number) => ({
-      sessionId: "session-1",
-      startIndex,
-      changeSequence: 1,
-      entries: [{ index: startIndex, assetId: `asset-${startIndex}`, width: 2, height: 1 }],
-    });
-    cache.set(block(0));
-    cache.set(block(BROWSE_GEOMETRY_BLOCK_SIZE));
-    expect(cache.get(0)?.startIndex).toBe(0);
-    cache.set(block(BROWSE_GEOMETRY_BLOCK_SIZE * 2));
-    expect(cache.has(BROWSE_GEOMETRY_BLOCK_SIZE)).toBe(false);
-    expect(cache.size).toBe(2);
+  /**
+   * CANVAS-038: the whole scope's geometry must arrive in one commit. Streaming
+   * 128-row blocks rewrote heights and identities while the user scrolled, which
+   * made the scrollbar thumb follow the loaded subset and re-sliced the window.
+   */
+  it("commits a complete index in one step so no slot stays a geometry placeholder", () => {
+    const entries = Array.from({ length: 300 }, (_, index) => ({
+      assetId: `asset-${index}`,
+      width: 100 + index,
+      height: 80,
+      displayName: `asset-${index}.png`,
+      previewArtifactId: `artifact-${index}`,
+      mediaType: "image" as const,
+    }));
+    const layout = createVirtualBrowseLayoutFromIndex({ total: 300, entries });
 
-    const current = createVirtualBrowseLayout({
-      total: 2_100,
-      firstPage: { items: [asset("asset-0")], offset: 0 },
+    expect(layout.total).toBe(300);
+    expect(layout.entries.size).toBe(300);
+    for (const index of [0, 127, 128, 299]) {
+      const entry = virtualLayoutEntryAt(layout, index);
+      expect(isGeometryPlaceholder(entry)).toBe(false);
+      expect(entry.assetId).toBe(`asset-${index}`);
+      expect(entry.width).toBe(100 + index);
+      expect(entry.previewArtifactId).toBe(`artifact-${index}`);
+    }
+    // Geometry is committed once; a patch that only changes non-geometry fields
+    // (displayName, ready thumbnail) must not move the geometry revision.
+    const patched = mergeVirtualSummaryPage(layout, 200, [{
+      ...asset("asset-200"),
+      width: 300,
+      height: 80,
+      displayName: "renamed-200.png",
+    }]);
+    expect(patched.geometryRevision).toBe(layout.geometryRevision);
+    expect(patched.geometryEntries).toBe(layout.geometryEntries);
+    expect(virtualLayoutEntryAt(patched, 200).displayName).toBe("renamed-200.png");
+    // A real dimension correction is still allowed to move geometry.
+    const corrected = mergeVirtualSummaryPage(layout, 200, [{
+      ...asset("asset-200"),
+      width: 999,
+      height: 80,
+    }]);
+    expect(corrected.geometryRevision).toBeGreaterThan(layout.geometryRevision);
+  });
+
+  it("keeps COUNT geometry and placeholder tail for a truncated index", () => {
+    const entries = Array.from({ length: 4 }, (_, index) => ({
+      assetId: `asset-${index}`,
+      width: 100,
+      height: 80,
+      displayName: `asset-${index}.png`,
+    }));
+    // A scope above BROWSE_SCOPE_MAX_ASSETS returns only its prefix.
+    const layout = createVirtualBrowseLayoutFromIndex({ total: 90_000, entries });
+
+    expect(layout.total).toBe(90_000);
+    expect(virtualLayoutEntryAt(layout, 3).assetId).toBe("asset-3");
+    expect(isGeometryPlaceholder(virtualLayoutEntryAt(layout, 4))).toBe(true);
+    expect(isGeometryPlaceholder(virtualLayoutEntryAt(layout, 89_999))).toBe(true);
+  });
+
+  /**
+   * CANVAS-038: a refresh must keep the committed index. Rebuilding it from the
+   * 100-item first page left placeholders at indices 100+ whose estimated
+   * heights moved the scrollbar by ~20% on a 1442-asset network library.
+   */
+  it("reuses a committed index for a refresh but not for a different scope", () => {
+    const entries = Array.from({ length: 300 }, (_, index) => ({
+      assetId: `asset-${index}`,
+      width: 100,
+      height: 80,
+      displayName: `asset-${index}.png`,
+    }));
+    const layout = createVirtualBrowseLayoutFromIndex({ total: 300, entries });
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({
+      assetId: `asset-${index}`,
+    }));
+
+    // Same ordered scope re-reported: reuse, so geometry never regresses.
+    expect(virtualIndexMatchesFirstPage(layout, { offset: 0, items: firstPage })).toBe(true);
+    // Different folder that happens to report COUNT 300: never reuse.
+    expect(virtualIndexMatchesFirstPage(layout, {
+      offset: 0,
+      items: firstPage.map((item, index) => (
+        index === 7 ? { assetId: "other-asset" } : item
+      )),
+    })).toBe(false);
+    // Nothing committed yet, or an empty page: nothing to reuse.
+    expect(virtualIndexMatchesFirstPage(null, { offset: 0, items: firstPage })).toBe(false);
+    expect(virtualIndexMatchesFirstPage(layout, { offset: 0, items: [] })).toBe(false);
+  });
+
+  /**
+   * The summary-patch fast path republishes the compact layout only when the
+   * entries map identity changes. That is only sound because every mutation
+   * produces a fresh map — including eviction, which rewrites entry *contents*
+   * without changing `entries.size` or `geometryRevision`. If eviction ever
+   * mutated in place, `browseLayout` would silently diverge from the virtual
+   * index and App's `selectedLayoutEntry` would read a stale copy.
+   */
+  it("reports an identity change when summary eviction rewrites entry contents", () => {
+    const seeded = createVirtualBrowseLayoutFromIndex({
+      total: 300,
+      entries: Array.from({ length: 300 }, (_, index) => ({
+        assetId: `asset-${index}`,
+        width: 100,
+        height: 80,
+        displayName: `asset-${index}.png`,
+      })),
     });
-    const merged = mergeVirtualSummaryPage(current, 128, [asset("asset-128")]);
-    expect(virtualLayoutEntryAt(merged, 128)).toMatchObject({
-      assetId: "asset-128",
-      displayName: "asset-128.png",
-      byteSize: 10,
-    });
+    const withSummary = mergeVirtualSummaryPage(seeded, 128, [asset("asset-128")]);
+    expect(withSummary.entries).not.toBe(seeded.entries);
+
+    const evicted = evictVirtualSummaryPage(withSummary, 128, 100);
+    expect(evicted.entries.size).toBe(withSummary.entries.size);
+    expect(evicted.geometryRevision).toBe(withSummary.geometryRevision);
+    // Size and revision are unchanged, so identity is the only valid signal.
+    expect(evicted.entries).not.toBe(withSummary.entries);
+    expect(virtualLayoutEntryAt(evicted, 128).displayName).toBeUndefined();
+    expect(virtualLayoutEntryAt(evicted, 128).assetId).toBe("asset-128");
+  });
+
+  /**
+   * CANVAS-038 guard: the one-shot index is O(scope) on the renderer main thread
+   * (payload + Zod + index maps + compact array). Switching to a very large
+   * library stalled behind the loading overlay, so above the bound identity and
+   * geometry come from the bounded summary pages instead.
+   */
+  it("bounds the one-shot index so a huge library cannot stall the renderer", () => {
+    expect(shouldFetchCompleteBrowseIndex(0)).toBe(true);
+    expect(shouldFetchCompleteBrowseIndex(1_442)).toBe(true);
+    expect(shouldFetchCompleteBrowseIndex(BROWSE_FULL_INDEX_MAX_ASSETS)).toBe(true);
+    expect(shouldFetchCompleteBrowseIndex(BROWSE_FULL_INDEX_MAX_ASSETS + 1)).toBe(false);
+    expect(shouldFetchCompleteBrowseIndex(50_000)).toBe(false);
   });
 
   it("evicts heavy summary fields without losing a loaded geometry slot", () => {

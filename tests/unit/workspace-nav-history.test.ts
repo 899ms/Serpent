@@ -130,6 +130,34 @@ describe("createWorkspaceNavHistory", () => {
     expect(history.forward()).toBeNull();
   });
 
+  it("keeps an exact viewport on every back and forward entry", () => {
+    const history = createWorkspaceNavHistory();
+    history.saveCurrentViewport({
+      scrollTop: 730,
+      scrollProgress: 0.73,
+      scrollExtent: 1_000,
+    });
+    history.push({ kind: "folder", folderId: "b" });
+    history.saveCurrentViewport({
+      scrollTop: 120,
+      scrollProgress: 0.2,
+      scrollExtent: 600,
+    });
+
+    expect(history.back()).toEqual({ kind: "all" });
+    expect(history.currentViewport).toEqual({
+      scrollTop: 730,
+      scrollProgress: 0.73,
+      scrollExtent: 1_000,
+    });
+    expect(history.forward()).toEqual({ kind: "folder", folderId: "b" });
+    expect(history.currentViewport).toEqual({
+      scrollTop: 120,
+      scrollProgress: 0.2,
+      scrollExtent: 600,
+    });
+  });
+
   it("peek reads relative entries without moving", () => {
     const history = createWorkspaceNavHistory();
     history.push({ kind: "folder", folderId: "a" });
@@ -271,5 +299,78 @@ describe("createWorkspaceNavHistory", () => {
     // back 未移出 preview 的 forward 分支：forward 可重开 C
     expect(history.canForward).toBe(true);
     expect(history.forward()).toEqual({ kind: "preview", assetId: "c" });
+  });
+});
+
+describe("shared timeline across tabs (Serpent-b8a853)", () => {
+  it("stamps pushes with the active tab; Back/Forward span tab switches", () => {
+    const history = createWorkspaceNavHistory({ kind: "all" }, "tab-a");
+    history.setActiveTab("tab-a");
+    history.push({ kind: "folder", folderId: "b" });
+    history.setActiveTab("tab-b");
+    history.push({ kind: "folder", folderId: "d" });
+    expect(history.currentTabId).toBe("tab-b");
+    expect(history.current).toEqual({ kind: "folder", folderId: "d" });
+
+    expect(history.back()).toEqual({ kind: "folder", folderId: "b" });
+    expect(history.currentTabId).toBe("tab-a");
+    expect(history.forward()).toEqual({ kind: "folder", folderId: "d" });
+    expect(history.currentTabId).toBe("tab-b");
+  });
+
+  it("does not merge an equal location pushed from a different tab", () => {
+    const history = createWorkspaceNavHistory({ kind: "all" }, "tab-a");
+    history.setActiveTab("tab-b");
+    history.push({ kind: "all" });
+    expect(history.canBack).toBe(true);
+    expect(history.currentTabId).toBe("tab-b");
+    expect(history.back()).toEqual({ kind: "all" });
+    expect(history.currentTabId).toBe("tab-a");
+  });
+
+  it("removeTab drops every step that belongs to a closed tab", () => {
+    const history = createWorkspaceNavHistory({ kind: "all" }, "tab-a");
+    history.setActiveTab("tab-a");
+    history.push({ kind: "folder", folderId: "a" });
+    history.setActiveTab("tab-b");
+    history.push({ kind: "folder", folderId: "d" });
+    history.setActiveTab("tab-a");
+    history.push({ kind: "folder", folderId: "c" });
+    expect(history.current).toEqual({ kind: "folder", folderId: "c" });
+
+    history.removeTab("tab-b");
+    expect(history.current).toEqual({ kind: "folder", folderId: "c" });
+    expect(history.canBack).toBe(true);
+    expect(history.back()).toEqual({ kind: "folder", folderId: "a" });
+    expect(history.currentTabId).toBe("tab-a");
+  });
+
+  it("collapses adjacent duplicate steps left after a tab closes", () => {
+    const history = createWorkspaceNavHistory({ kind: "all" }, "tab-a");
+    history.setActiveTab("tab-a");
+    history.push({ kind: "folder", folderId: "a" });
+    history.setActiveTab("tab-b");
+    history.push({ kind: "folder", folderId: "b" });
+    history.setActiveTab("tab-a");
+    history.push({ kind: "folder", folderId: "a" });
+    // Without collapsing, Back from here would land on the duplicate folder A
+    // (a visible no-op). Closing tab-b collapses the pair so Back really moves.
+    history.removeTab("tab-b");
+    expect(history.current).toEqual({ kind: "folder", folderId: "a" });
+    expect(history.back()).toEqual({ kind: "all" });
+    expect(history.canBack).toBe(false);
+  });
+
+  it("peekTabId reads the entry owner without moving the cursor", () => {
+    const history = createWorkspaceNavHistory({ kind: "all" }, "tab-a");
+    history.setActiveTab("tab-a");
+    history.push({ kind: "folder", folderId: "a" });
+    history.setActiveTab("tab-b");
+    history.push({ kind: "folder", folderId: "d" });
+    expect(history.peekTabId(0)).toBe("tab-b");
+    expect(history.peekTabId(-1)).toBe("tab-a");
+    expect(history.peekTabId(-2)).toBe("tab-a");
+    expect(history.peekTabId(1)).toBeNull();
+    expect(history.currentTabId).toBe("tab-b");
   });
 });

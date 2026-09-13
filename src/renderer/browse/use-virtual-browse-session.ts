@@ -2,33 +2,59 @@ import { useCallback, useRef } from "react";
 
 import type {
   AssetSummary,
-  BrowseGeometryBlock,
   BrowseLayoutEntry,
 } from "../../shared/asset-types";
-import type { SerpentLibraryApi } from "../../shared/library-api";
 import {
   createVirtualBrowseLayout,
-  evictVirtualGeometryBlock,
+  createVirtualBrowseLayoutFromIndex,
   evictVirtualSummaryPage,
   geometryPlaceholderId,
   isGeometryPlaceholder,
   materializeVirtualLoadedEntries,
-  mergeVirtualGeometryBlock,
   mergeVirtualSummaryPage,
   patchVirtualLayoutGeometry,
   removeVirtualLayoutEntries,
+  virtualIndexMatchesFirstPage,
   virtualSummaryAssetIds,
   type VirtualBrowseLayout,
 } from "./virtual-browse-layout";
 
-/** Keep geometry requests small enough that a jump can be superseded cheaply. */
-export const BROWSE_GEOMETRY_BLOCK_SIZE = 128;
+/**
+ * Largest scope whose complete compact index is fetched in one request.
+ *
+ * CANVAS-038 pulls one `layoutOnly` index so geometry commits exactly once. That
+ * is right for ordinary libraries, but the cost scales linearly with COUNT: the
+ * payload, the Zod validation on both sides of the IPC boundary, the four index
+ * maps and the compact array are all O(scope), and they run on the renderer's
+ * main thread. Switching to a very large library stalled the app behind the
+ * loading overlay, so above this bound the index is no longer fetched in one
+ * shot: identity and geometry fill in from the already bounded (100-row) summary
+ * pages as the user scrolls. Slots stay keyed by index, so nothing remounts —
+ * only the still-unmeasured tail keeps its estimated height.
+ */
+export const BROWSE_FULL_INDEX_MAX_ASSETS = 5_000;
 
-/** Small scopes still use the mature full-layout path; large scopes do not. */
-export const BROWSE_FULL_LAYOUT_THRESHOLD = 2_000;
+/** True when a scope may load its complete compact index in one request. */
+export function shouldFetchCompleteBrowseIndex(total: number): boolean {
+  const safeTotal = Math.max(0, Math.trunc(total));
+  return safeTotal <= BROWSE_FULL_INDEX_MAX_ASSETS;
+}
 
-/** Bound Renderer memory when a user drags through a very large library. */
-export const BROWSE_GEOMETRY_BLOCK_CACHE_LIMIT = 24;
+/**
+ * True when COUNT is larger than the first painted page. Those scopes must keep
+ * a stable full-range canvas from the first frame: publishing only the loaded
+ * prefix makes the scrollbar track the loaded subset (100, 200, …) and then jump.
+ */
+export function shouldUseVirtualBrowseLayout(input: {
+  sessionId?: string;
+  total: number;
+  firstPageCount: number;
+}): boolean {
+  if (!input.sessionId) return false;
+  const total = Math.max(0, Math.trunc(input.total));
+  const firstPageCount = Math.max(0, Math.trunc(input.firstPageCount));
+  return total > 0 && firstPageCount < total;
+}
 
 /** Full summaries are much heavier than geometry; keep only a small LRU. */
 export const BROWSE_SUMMARY_PAGE_CACHE_LIMIT = 24;
@@ -40,74 +66,7 @@ export {
   type VirtualBrowseLayout,
 };
 
-/** Align an index range to bounded geometry block starts, with one block overscan. */
-export function geometryBlockStartsForRange(input: {
-  startIndex: number;
-  endIndex: number;
-  total: number;
-  blockSize?: number;
-}): number[] {
-  const blockSize = Math.max(1, Math.trunc(input.blockSize ?? BROWSE_GEOMETRY_BLOCK_SIZE));
-  const total = Math.max(0, Math.trunc(input.total));
-  if (total === 0) return [];
-  const start = Math.max(0, Math.min(input.startIndex, input.endIndex));
-  const end = Math.min(total - 1, Math.max(input.startIndex, input.endIndex));
-  const first = Math.floor(start / blockSize) * blockSize;
-  const last = Math.floor(end / blockSize) * blockSize;
-  const starts: number[] = [];
-  for (let value = first; value <= last; value += blockSize) starts.push(value);
-  if (first > 0) starts.unshift(first - blockSize);
-  if (last + blockSize < total) starts.push(last + blockSize);
-  return [...new Set(starts)];
-}
-
-export class BrowseGeometryBlockCache {
-  readonly #limit: number;
-  readonly #blocks = new Map<number, BrowseGeometryBlock>();
-
-  constructor(limit = BROWSE_GEOMETRY_BLOCK_CACHE_LIMIT) {
-    if (!Number.isSafeInteger(limit) || limit < 1) {
-      throw new Error("BrowseGeometryBlockCache limit must be a positive integer.");
-    }
-    this.#limit = limit;
-  }
-
-  has(startIndex: number): boolean {
-    return this.#blocks.has(startIndex);
-  }
-
-  get(startIndex: number): BrowseGeometryBlock | undefined {
-    const block = this.#blocks.get(startIndex);
-    if (!block) return undefined;
-    this.#blocks.delete(startIndex);
-    this.#blocks.set(startIndex, block);
-    return block;
-  }
-
-  set(block: BrowseGeometryBlock): number | undefined {
-    this.#blocks.delete(block.startIndex);
-    this.#blocks.set(block.startIndex, block);
-    let evicted: number | undefined;
-    while (this.#blocks.size > this.#limit) {
-      const oldest = this.#blocks.keys().next().value;
-      if (oldest === undefined) break;
-      this.#blocks.delete(oldest);
-      evicted = oldest;
-    }
-    return evicted;
-  }
-
-  clear(): void {
-    this.#blocks.clear();
-  }
-
-  get size(): number {
-    return this.#blocks.size;
-  }
-}
-
 export type VirtualBrowseSessionArgs = {
-  api: SerpentLibraryApi | null;
   setBrowseLayout: (layout: BrowseLayoutEntry[]) => void;
   setVirtualBrowseLayout: (layout: VirtualBrowseLayout | null) => void;
 };
@@ -118,12 +77,16 @@ export type VirtualBrowseSessionLocalSnapshot = {
 };
 
 /**
- * Owns the Renderer-side geometry window for one BrowseSession. Summary pages
- * and geometry blocks share the same generation fence; a stale geometry reply
- * can never overwrite the next folder/search layout.
+ * Owns the Renderer-side geometry index for one BrowseSession.
+ *
+ * CANVAS-038: geometry is committed exactly once per scope, from the complete
+ * compact index, and never revised afterwards. The previous design fetched
+ * 128-row geometry blocks as the user scrolled, so every arrival rewrote heights
+ * and identities mid-scroll — the scrollbar thumb tracked loaded blocks and
+ * each revision re-sliced the window, unmounting and re-requesting visible
+ * covers. Summary pages remain paged and LRU-bounded; they only patch fields.
  */
 export function useVirtualBrowseSession({
-  api,
   setBrowseLayout,
   setVirtualBrowseLayout,
 }: VirtualBrowseSessionArgs) {
@@ -136,9 +99,14 @@ export function useVirtualBrowseSession({
   } | null>(null);
   const layoutRef = useRef<BrowseLayoutEntry[]>([]);
   const virtualLayoutRef = useRef<VirtualBrowseLayout | null>(null);
-  const cacheRef = useRef(new BrowseGeometryBlockCache());
-  const inFlightRef = useRef(new Map<number, Promise<BrowseGeometryBlock | null>>());
   const summaryPagesRef = useRef(new Map<number, true>());
+  /**
+   * Set when the published compact array no longer matches the virtual index.
+   * `getLayout()` rebuilds on demand instead of every patch rebuilding eagerly:
+   * a scope-sized rebuild plus a shell re-render on each summary page measured as
+   * 4–30 extra page-request waves per scroll jump at 20k (CANVAS-038).
+   */
+  const layoutDirtyRef = useRef(false);
 
   const touchSummaryPages = useCallback((startIndex: number, endIndex = startIndex) => {
     const first = Math.max(0, Math.floor(Math.min(startIndex, endIndex) / BROWSE_SUMMARY_PAGE_SIZE) * BROWSE_SUMMARY_PAGE_SIZE);
@@ -169,7 +137,11 @@ export function useVirtualBrowseSession({
     generation: number;
     firstPage: { items: readonly AssetSummary[]; offset: number };
   }) => {
-    const virtualized = Boolean(input.sessionId) && input.total > BROWSE_FULL_LAYOUT_THRESHOLD;
+    const virtualized = shouldUseVirtualBrowseLayout({
+      sessionId: input.sessionId,
+      total: input.total,
+      firstPageCount: input.firstPage.items.length,
+    });
     sessionRef.current = {
       libraryId: input.libraryId,
       sessionId: input.sessionId ?? "",
@@ -177,18 +149,27 @@ export function useVirtualBrowseSession({
       generation: input.generation,
       virtualized,
     };
-    cacheRef.current.clear();
-    inFlightRef.current.clear();
-    summaryPagesRef.current.clear();
+    const previous = virtualLayoutRef.current;
+    // A refresh of the same scope must not throw away the committed index: the
+    // unresolved tail would fall back to estimated heights and move the
+    // scrollbar (CANVAS-038). The fresh index overwrites this in a moment.
+    const reusable = virtualized
+      && previous !== null
+      && previous.total === input.total
+      && virtualIndexMatchesFirstPage(previous, input.firstPage);
+    if (!reusable) summaryPagesRef.current.clear();
     const nextVirtualLayout = virtualized
-      ? createVirtualBrowseLayout(input)
+      ? (reusable ? previous : createVirtualBrowseLayout(input))
       : null;
-    if (virtualized) registerSummaryPages(input.firstPage.offset, input.firstPage.items.length);
+    if (virtualized && !reusable) {
+      registerSummaryPages(input.firstPage.offset, input.firstPage.items.length);
+    }
     virtualLayoutRef.current = nextVirtualLayout;
     // Serpent-9cfc8c: a first window of 100 is not the full geometry index.
     // Publishing it as layout made Masonry/Justified clip the canvas to those
-    // 100 cards, so later pages never appeared when the layout-only fetch
-    // lagged or failed (linked folders with recursive browse).
+    // 100 cards. Scopes that fit in one page keep that compact array; larger
+    // sessions use VirtualBrowseLayout.total for scrollbar height until the
+    // complete index commits a moment later.
     const firstPageCoversScope = input.firstPage.items.length >= input.total;
     layoutRef.current = virtualized
       ? materializeVirtualLoadedEntries(nextVirtualLayout!)
@@ -203,12 +184,46 @@ export function useVirtualBrowseSession({
             byteSize: asset.byteSize,
             modifiedAt: asset.modifiedAt,
             rating: asset.rating,
+            mediaType: asset.mediaType,
           }))
         : [];
     setVirtualBrowseLayout(virtualLayoutRef.current);
     setBrowseLayout(layoutRef.current);
+    layoutDirtyRef.current = false;
     return virtualized;
   }, [registerSummaryPages, setBrowseLayout, setVirtualBrowseLayout]);
+
+  /**
+   * Commit the complete compact index for this scope in one step. Positions the
+   * index did not cover (a scope above BROWSE_SCOPE_MAX_ASSETS) stay geometry
+   * placeholders; they resolve from summary pages without changing slot identity.
+   */
+  const seedIndex = useCallback((input: {
+    total: number;
+    entries: readonly BrowseLayoutEntry[];
+  }): boolean => {
+    const session = sessionRef.current;
+    if (!session?.virtualized) return false;
+    const next = createVirtualBrowseLayoutFromIndex(input);
+    // The seeded index replaces every loaded entry, so the previous summary-page
+    // LRU no longer describes what is loaded; keeping it would let eviction drop
+    // pages that were never registered against the new index.
+    summaryPagesRef.current.clear();
+    const firstPageCount = Math.min(next.total, Math.max(0, input.entries.length));
+    if (firstPageCount > 0) registerSummaryPages(0, firstPageCount);
+    virtualLayoutRef.current = next;
+    layoutRef.current = materializeVirtualLoadedEntries(next);
+    layoutDirtyRef.current = false;
+    setVirtualBrowseLayout(next);
+    setBrowseLayout(layoutRef.current);
+    return true;
+  }, [setBrowseLayout, setVirtualBrowseLayout]);
+
+  /** Keep the visible summary pages at the hot end of the LRU while scrolling. */
+  const noteVisibleRange = useCallback((startIndex: number, endIndex: number) => {
+    if (sessionRef.current?.virtualized !== true) return;
+    touchSummaryPages(startIndex, endIndex);
+  }, [touchSummaryPages]);
 
   const applySummaryPage = useCallback((input: {
     offset: number;
@@ -233,84 +248,47 @@ export function useVirtualBrowseSession({
       evicted.push(oldest);
     }
     virtualLayoutRef.current = next;
-    layoutRef.current = materializeVirtualLoadedEntries(next);
+    // Rendering always follows the virtual index.
     setVirtualBrowseLayout(next);
-    setBrowseLayout(layoutRef.current);
+    // Slot identity is the only thing the compact array's consumers act on
+    // (selection, shuffle, index lookup), and `mergeLayoutEntries` rebuilds
+    // `assetIdsByIndex` exactly when an identity changed. Publishing state only
+    // then avoids re-rendering the shell for caption/artifact-only patches.
+    if (next.assetIdsByIndex !== current.assetIdsByIndex) {
+      layoutRef.current = materializeVirtualLoadedEntries(next);
+      layoutDirtyRef.current = false;
+      setBrowseLayout(layoutRef.current);
+    } else if (next.entries !== current.entries) {
+      // Content-only change (summary fields, or eviction rewriting entries in
+      // place with an unchanged size): imperative readers must not observe a
+      // stale copy, so mark dirty and let `getLayout()` rebuild on demand. This
+      // is what makes the size-based shortcut unsafe and the identity-based one
+      // correct.
+      layoutDirtyRef.current = true;
+    }
     return evicted;
   }, [registerSummaryPages, setBrowseLayout, setVirtualBrowseLayout]);
 
-  const ensureRange = useCallback(async (input: {
-    startIndex: number;
-    endIndex: number;
-    generation: number;
-  }): Promise<void> => {
-    const session = sessionRef.current;
-    if (!api || !session?.virtualized || session.generation !== input.generation) return;
-    touchSummaryPages(input.startIndex, input.endIndex);
-    const starts = geometryBlockStartsForRange({
-      startIndex: input.startIndex,
-      endIndex: input.endIndex,
-      total: session.total,
-    }).filter((startIndex) => !cacheRef.current.has(startIndex));
-    const requests = starts.map((startIndex) => {
-      const inFlight = inFlightRef.current.get(startIndex);
-      if (inFlight) return inFlight;
-      const request = api.fetchBrowseSessionGeometry({
-        libraryId: session.libraryId,
-        sessionId: session.sessionId,
-        startIndex,
-        limit: BROWSE_GEOMETRY_BLOCK_SIZE,
-      }).then((result) => {
-        if (!result.ok || "stale" in result.value) return null;
-        return result.value;
-      }).catch(() => null);
-      inFlightRef.current.set(startIndex, request);
-      void request.finally(() => {
-        if (inFlightRef.current.get(startIndex) === request) {
-          inFlightRef.current.delete(startIndex);
-        }
-      });
-      return request;
-    });
-    const blocks = (await Promise.all(requests)).filter(
-      (block): block is BrowseGeometryBlock => block !== null,
-    );
-    if (
-      blocks.length === 0 ||
-      sessionRef.current?.generation !== input.generation ||
-      sessionRef.current?.sessionId !== session.sessionId
-    ) return;
-    for (const block of blocks) {
-      const evictedStart = cacheRef.current.set(block);
-      const current = virtualLayoutRef.current;
-      if (!current) continue;
-      const afterEviction = evictedStart === undefined
-        ? current
-        : evictVirtualGeometryBlock(
-            current,
-            evictedStart,
-            BROWSE_GEOMETRY_BLOCK_SIZE,
-          );
-      virtualLayoutRef.current = mergeVirtualGeometryBlock(afterEviction, block);
+  /** Compact array for legacy consumers; rebuilt lazily when a patch marked it dirty. */
+  const getLayout = useCallback(() => {
+    if (layoutDirtyRef.current && virtualLayoutRef.current) {
+      layoutRef.current = materializeVirtualLoadedEntries(virtualLayoutRef.current);
+      layoutDirtyRef.current = false;
     }
-    if (!virtualLayoutRef.current) return;
-    layoutRef.current = materializeVirtualLoadedEntries(virtualLayoutRef.current);
-    setVirtualBrowseLayout(virtualLayoutRef.current);
-    setBrowseLayout(layoutRef.current);
-  }, [api, setBrowseLayout, setVirtualBrowseLayout, touchSummaryPages]);
-
-  const getLayout = useCallback(() => layoutRef.current, []);
+    return layoutRef.current;
+  }, []);
 
   const getVirtualLayout = useCallback(() => virtualLayoutRef.current, []);
 
   const snapshotLocalState = useCallback((): VirtualBrowseSessionLocalSnapshot => ({
-    layout: layoutRef.current,
+    layout: getLayout(),
     virtualLayout: virtualLayoutRef.current,
-  }), []);
+  }), [getLayout]);
 
   const restoreLocalState = useCallback((snapshot: VirtualBrowseSessionLocalSnapshot) => {
     layoutRef.current = snapshot.layout;
     virtualLayoutRef.current = snapshot.virtualLayout;
+    layoutDirtyRef.current = false;
     setVirtualBrowseLayout(snapshot.virtualLayout);
     setBrowseLayout(snapshot.layout);
   }, [setBrowseLayout, setVirtualBrowseLayout]);
@@ -329,6 +307,7 @@ export function useVirtualBrowseSession({
       removedCount,
     );
     layoutRef.current = materializeVirtualLoadedEntries(virtualLayoutRef.current);
+    layoutDirtyRef.current = false;
     setVirtualBrowseLayout(virtualLayoutRef.current);
     setBrowseLayout(layoutRef.current);
   }, [setBrowseLayout, setVirtualBrowseLayout]);
@@ -345,25 +324,26 @@ export function useVirtualBrowseSession({
     if (next === current) return;
     virtualLayoutRef.current = next;
     layoutRef.current = materializeVirtualLoadedEntries(next);
+    layoutDirtyRef.current = false;
     setVirtualBrowseLayout(next);
     setBrowseLayout(layoutRef.current);
   }, [setBrowseLayout, setVirtualBrowseLayout]);
 
   const reset = useCallback(() => {
     sessionRef.current = null;
-    cacheRef.current.clear();
-    inFlightRef.current.clear();
     summaryPagesRef.current.clear();
     virtualLayoutRef.current = null;
     layoutRef.current = [];
+    layoutDirtyRef.current = false;
     setVirtualBrowseLayout(null);
     setBrowseLayout([]);
   }, [setBrowseLayout, setVirtualBrowseLayout]);
 
   return {
     begin,
+    seedIndex,
+    noteVisibleRange,
     applySummaryPage,
-    ensureRange,
     getLayout,
     getVirtualLayout,
     snapshotLocalState,

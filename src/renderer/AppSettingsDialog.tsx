@@ -52,6 +52,8 @@ export interface AppSettingsDialogProps {
   libraryId?: string;
   mcpApi?: SerpentMcpSettingsApi;
   syncServerCallbacks: SyncServerSettingsCallbacks;
+  showCardSyncStatus: boolean;
+  onShowCardSyncStatusChange: (checked: boolean) => void;
 }
 
 /**
@@ -82,6 +84,8 @@ export function AppSettingsDialog({
   libraryId,
   mcpApi,
   syncServerCallbacks,
+  showCardSyncStatus,
+  onShowCardSyncStatusChange,
 }: AppSettingsDialogProps): ReactNode {
   const t = useT();
   const [pluginSettingsPluginId, setPluginSettingsPluginId] = useState<string | null>(null);
@@ -136,9 +140,6 @@ export function AppSettingsDialog({
   return (
     <div
       className="dialog-backdrop"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) handleClose();
-      }}
       role="presentation"
     >
       <DialogShell
@@ -275,7 +276,11 @@ export function AppSettingsDialog({
               />
             ) : null}
             {!showingPluginSettings && activeCategory === "sync" ? (
-              <SyncSettingsPage callbacks={syncServerCallbacks} />
+              <SyncSettingsPage
+                callbacks={syncServerCallbacks}
+                onShowCardSyncStatusChange={onShowCardSyncStatusChange}
+                showCardSyncStatus={showCardSyncStatus}
+              />
             ) : null}
           </main>
         </div>

@@ -674,7 +674,7 @@ export function DimensionFilterBar(props: DimensionFilterBarProps) {
             active={colorActive}
             disabled={controlsDisabled}
             excluding={excludeColorFilter && colorActive}
-            icon="activity"
+            icon="palette"
             label={t("filter.dimColor")}
             onClick={handleColorDimensionClick}
             open={openDimension === "color"}
@@ -772,7 +772,7 @@ export function DimensionFilterBar(props: DimensionFilterBarProps) {
           <DimensionButton
             active={shapeActive}
             disabled={controlsDisabled}
-            icon="grid"
+            icon="shapes"
             label={t("filter.dimShape")}
             onClick={handleShapeDimensionClick}
             open={openDimension === "shape"}
@@ -889,7 +889,7 @@ export function DimensionFilterBar(props: DimensionFilterBarProps) {
           <DimensionButton
             active={favoriteActive}
             disabled={controlsDisabled}
-            icon="star"
+            icon="heart"
             label={t("filter.favoriteOnly")}
             onClick={() => setFavoriteFilter(favoriteActive ? "any" : "yes")}
           />

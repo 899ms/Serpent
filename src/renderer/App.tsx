@@ -51,6 +51,8 @@ import {
 } from "../shared/thumbnail-support";
 import { AssetCardMedia } from "./AssetCardMedia";
 import { useAssetCardHoverPreview } from "./use-asset-card-hover-preview";
+import { SyncCardStatusBadge } from "./SyncCardStatusBadge";
+import { useSyncCardStatuses } from "./use-sync-card-status";
 import { resolveSearchSnippetCaption } from "./search-snippet-caption";
 import { parseSearchExpression, splitSearchHighlights } from "./search-expression";
 import { ConvertLinkedDialog } from "./ConvertLinkedDialog";
@@ -98,6 +100,7 @@ import {
 } from "./main-menu-items";
 import { CanvasToolbarControls } from "./CanvasToolbarControls";
 import { ScopeHistoryButtons } from "./ScopeHistoryButtons";
+import { WorkspaceTabs } from "./WorkspaceTabs";
 import {
   ScopeBreadcrumbs,
   buildScopeBreadcrumbSegments,
@@ -147,15 +150,42 @@ import {
 import { resolveSearchFolderResults } from "./search-folder-results";
 import { useT, useLocale, translateForLocale, type AppLocale } from "./i18n";
 import type { AiApiFormat } from "../shared/ai-endpoints";
-import type { ApplicationMenuCommand } from "../shared/application-menu";
+import { DEFAULT_AI_API_FORMAT, DEFAULT_AI_MODELS } from "../shared/ai-endpoints";
 import type { SerpentMcpSettingsApi } from "../shared/mcp";
 import type { HistoryStatus } from "../shared/protocol/responses";
 import { isEditableTextTarget } from "../shared/edit-context-menu";
 import type { SearchQuery } from "../shared/asset-types";
 import {
-  createWorkspaceNavHistory,
   type WorkspaceNavLocation,
+  type WorkspaceNavViewport,
+  workspaceNavLocationsEqual,
 } from "./workspace-nav-history";
+import type {
+  WorkspaceNavigationHistoryMode,
+  WorkspaceNavigationToken,
+} from "./workspace-navigation-coordinator";
+import type {
+  WorkspaceRenderSnapshot,
+  WorkspaceVirtualLayoutSnapshot,
+} from "./workspace-render-snapshot-cache";
+import {
+  createDefaultWorkspaceTabBrowseState,
+  workspaceTabBrowseStateHasDiscoveryInput,
+  type WorkspaceTabBrowseState,
+  type WorkspaceTabSession,
+} from "./workspace-tabs";
+import {
+  buildWorkspaceTabsSession,
+  readWorkspaceTabsSession,
+  writeWorkspaceTabsSession,
+} from "./workspace-tabs-session";
+import { useWorkspaceTabsController } from "./use-workspace-tabs";
+import { presentWorkspaceTab } from "./workspace-tab-presentation";
+import {
+  captureWorkspaceNavViewport,
+  resolveWorkspaceScrollTop,
+  restoreWorkspaceNavViewport,
+} from "./workspace-scroll-position";
 import { mergeAssetSummaries } from "./merge-asset-summaries";
 import {
   RelinkPreview,
@@ -328,7 +358,7 @@ import {
   resolveDialogEscapeAction,
   type DialogEscapeSnapshot,
 } from "./dialog-escape-stack";
-import { useAssetRename } from "./useAssetRename";
+import { splitAssetFileName, useAssetRename } from "./useAssetRename";
 import { useInlineFolderEdit } from "./use-inline-folder-edit";
 import { useInlineSmartCollectionEdit } from "./use-inline-smart-collection-edit";
 import { usePanelResize } from "./use-panel-resize";
@@ -389,6 +419,7 @@ import type {
   TrashedFolderSummary,
 } from "../shared/asset-types";
 import type { LibraryNavigationSummary } from "../shared/library-navigation";
+import { LIBRARY_ROOT_FOLDER_ID, isLibraryRootFolderId } from "../shared/library-root-folder";
 import { hasMeaningfulSmartCollectionCondition } from "../shared/smart-collection-query";
 import { expandFormatFilterTokens } from "../shared/text-media";
 import type {
@@ -511,6 +542,16 @@ const IS_WINDOWS_PLATFORM =
   resolveRendererPlatform(navigator.userAgent) === "windows";
 
 const SHORTCUT_PLATFORM: CommandPlatform = IS_MAC_PLATFORM ? "mac" : "windows";
+/**
+ * Minimum spacing between full browse reloads triggered by a remote library's
+ * change sequence.
+ *
+ * Serpent-yti0 established that `revision_artifacts` / `jobs` writes bump the
+ * shared change sequence, and that a full `searchAssets` per bump freezes the
+ * canvas. Non-network libraries were fixed by ignoring those bumps; network
+ * libraries still re-read, because another computer's asset changes genuinely
+ * only arrive that way. This interval is that cross-instance visibility delay.
+ */
 const NETWORK_LIBRARY_RELOAD_INTERVAL_MS = 750;
 
 type RendererWindow = Window & {
@@ -583,6 +624,7 @@ type QueryFilterSnapshot = {
   widthRange: QueryNumericRangeState;
   heightRange: QueryNumericRangeState;
   aspectRatioRange: QueryNumericRangeState;
+  aspectRatioRanges: Array<{ min: string; max: string }>;
   longEdgeRange: QueryNumericRangeState;
   durationRange: QueryNumericRangeState;
 };
@@ -590,6 +632,14 @@ type QueryFilterSnapshot = {
 // inline in the directory tree (use-inline-folder-edit), not in a dialog.
 type DialogKind = "library" | "tag" | "collection" | null;
 type AssetScope = "all" | "root" | string;
+type WorkspaceNavigationRequest = Readonly<{
+  token?: WorkspaceNavigationToken;
+  historyMode: WorkspaceNavigationHistoryMode;
+  isCurrent: () => boolean;
+  deferReveal?: boolean;
+  browseState?: WorkspaceTabBrowseState;
+  browseStateTabId?: string;
+}>;
 type OrganizationKind = "collection" | "smart";
 type OrganizationRenameTarget = {
   kind: OrganizationKind;
@@ -939,8 +989,11 @@ function AppInner() {
     },
     onResizeEnd: () => panelResizeReleaseRef.current(),
   });
-  const navHistoryRef = useRef(createWorkspaceNavHistory());
-  const suppressNavHistoryRef = useRef(false);
+  const workspaceHistoryReplayQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const workspaceHistoryReplayEpochRef = useRef(0);
+  const workspaceTabTransitionRef = useRef(0);
+  const [workspaceNavigationPending, setWorkspaceNavigationPending] =
+    useState(false);
   const [navHistoryUi, setNavHistoryUi] = useState({
     canBack: false,
     canForward: false,
@@ -1112,7 +1165,7 @@ function AppInner() {
   );
   /** Serpent-hm28: null = normal sort; otherwise client shuffle seed. */
   const [shuffleSeed, setShuffleSeed] = useState<number | null>(null);
-  const [, setSearchOffset] = useState(0);
+  const [searchOffset, setSearchOffset] = useState(0);
   const [searchTotal, setSearchTotal] = useState<number | null>(null);
   const [searchSnippets, setSearchSnippets] = useState<Map<string, string>>(
     new Map(),
@@ -1183,6 +1236,11 @@ function AppInner() {
   const { open: openContextMenu, close: closeContextMenu } =
     useContextMenu();
   const hadDiscoveryInput = useRef(false);
+  const skipDiscoveryReloadSignatureRef = useRef<string | null>(null);
+  const lastAppliedWorkspaceBrowseStateRef = useRef<{
+    tabId: string | null;
+    state: WorkspaceTabBrowseState;
+  } | null>(null);
   // Auto-search requests can resolve out of order while the user is still
   // typing. Only the newest first-page request may replace the canvas.
   const searchRequestGenerationRef = useRef(0);
@@ -1352,6 +1410,13 @@ function AppInner() {
     applyGeometryPatches: applyBrowseGeometryPatches,
     reset: resetBrowsePagination,
   } = browsePagination;
+  function resetBrowsePaginationPreservingVisibleLayout() {
+    const previousLayout = browseLayout;
+    const previousVirtualLayout = virtualBrowseLayout;
+    resetBrowsePagination();
+    setBrowseLayout(previousLayout);
+    setVirtualBrowseLayout(previousVirtualLayout);
+  }
   const applyBrowseGeometryPatchesRef = useRef(applyBrowseGeometryPatches);
   applyBrowseGeometryPatchesRef.current = applyBrowseGeometryPatches;
 
@@ -1504,10 +1569,90 @@ function AppInner() {
   syncProgressRef.current = syncProgress;
   /** 当前库的同步绑定状态（库切换器 link/link-off 图标）。 */
   const [syncBindingStatus, setSyncBindingStatus] = useState<"none" | "disabled" | "enabled">("none");
-  /** 本次同步是否已弹过「正在同步」toast（有实际传输才提示）。 */
+  /** 本次同步是否发生过实际传输（完成音、Inspector 重拉仍用；不再弹 toast）。 */
   const syncRunNotifiedRef = useRef(false);
   const syncRunStartedAtRef = useRef<number | null>(null);
   const [showIgnoredItems, setShowIgnoredItems] = useState(false);
+  const [workspaceTabRevealTarget, setWorkspaceTabRevealTarget] = useState<{
+    kind: "folder" | "collection";
+    id: string;
+    requestId: number;
+  } | null>(null);
+  const workspaceTabRevealRequestRef = useRef(0);
+  const pendingWorkspacePreviewRef = useRef<{
+    assetId: string;
+    viewport: WorkspaceNavViewport;
+    isCurrent: () => boolean;
+  } | null>(null);
+  const pendingWorkspaceTabSelectionRef = useRef<{
+    selectedAssetIds: string[];
+    selectedAssetId: string | null;
+    isCurrent: () => boolean;
+  } | null>(null);
+  const cancelWorkspaceViewportRestoreRef = useRef<(() => void) | null>(null);
+  // True while a Back/Forward replay is being applied. Suppresses viewport
+  // saving and tab-context capture so the replay neither records a new history
+  // step nor overwrites the target's saved viewport (Serpent-b8a853 shared
+  // timeline; previously this was a per-tab history identity comparison).
+  const workspaceHistoryReplayActiveRef = useRef(false);
+  const {
+    state: workspaceTabsState,
+    historyRef: navHistoryRef,
+    selectTab: selectWorkspaceTab,
+    addTab: addWorkspaceTab,
+    closeTab: closeWorkspaceTab,
+    closeOtherTabs: closeOtherWorkspaceTabs,
+    moveTab: moveWorkspaceTab,
+    resetTabs: resetWorkspaceTabs,
+    restoreTabs: restoreWorkspaceTabs,
+    saveActiveContext: saveWorkspaceTabContext,
+    syncActiveTabLocation: syncActiveWorkspaceTabLocation,
+    beginNavigation: beginWorkspaceTabNavigation,
+    isNavigationCurrent: isWorkspaceTabNavigationCurrent,
+    activateRenderSnapshotLibrary,
+    getRenderSnapshot: getWorkspaceRenderSnapshot,
+  } = useWorkspaceTabsController({
+    beginTransition: beginWorkspaceNavigation,
+    captureContext: captureWorkspaceTabContext,
+    restoreTab: restoreWorkspaceTabSession,
+    restoreAll: restoreAllAssetsWorkspaceTab,
+    getDefaultBrowseState: () =>
+      createDefaultWorkspaceTabBrowseState(sortField, sortOrder),
+    onHistoryChanged: (history) => {
+      setNavHistoryUi({
+        canBack: history.canBack,
+        canForward: history.canForward,
+      });
+    },
+    persistTabs: (tabsState) => {
+      const libraryId = library?.libraryId;
+      if (!libraryId) return;
+      writeWorkspaceTabsSession(
+        libraryId,
+        buildWorkspaceTabsSession(tabsState),
+      );
+    },
+  });
+  useEffect(() => {
+    activateRenderSnapshotLibrary(library?.libraryId ?? null);
+  }, [activateRenderSnapshotLibrary, library?.libraryId]);
+  /**
+   * Rebuild the saved tab strip for the library the session restore just opened.
+   * The write is explicit: `persistTabs` reads the library from render state,
+   * which has not caught up with the library being opened yet.
+   */
+  const restoreWorkspaceTabsForLibrary = useCallback(
+    (libraryId: string) => {
+      const restored = restoreWorkspaceTabs(
+        readWorkspaceTabsSession(libraryId),
+      );
+      writeWorkspaceTabsSession(
+        libraryId,
+        buildWorkspaceTabsSession(restored),
+      );
+    },
+    [restoreWorkspaceTabs],
+  );
   const [appLogEntries, setAppLogEntries] = useState<AppLogEntry[]>([]);
   const [appLogLoading, setAppLogLoading] = useState(false);
   const [appLogAutomationCorrelationId, setAppLogAutomationCorrelationId] = useState("");
@@ -1626,8 +1771,8 @@ function AppInner() {
   }
 
   // AI analysis state
-  const [aiApiFormat, setAiApiFormat] = useState<AiApiFormat>("dashscope_native");
-  const [aiModel, setAiModel] = useState("qwen3-vl-plus");
+  const [aiApiFormat, setAiApiFormat] = useState<AiApiFormat>(DEFAULT_AI_API_FORMAT);
+  const [aiModel, setAiModel] = useState(DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT]);
   const [aiBaseUrl, setAiBaseUrl] = useState("");
   const [aiApiKey, setAiApiKey] = useState("");
   const [aiHasKey, setAiHasKey] = useState(false);
@@ -1656,8 +1801,8 @@ function AppInner() {
   /** Fingerprint of credentials last proven by a successful probe. */
   const aiVerifiedFingerprintRef = useRef<string | null>(null);
   const aiConfigPersistDraftRef = useRef({
-    apiFormat: "dashscope_native" as AiApiFormat,
-    model: "qwen3-vl-plus",
+    apiFormat: DEFAULT_AI_API_FORMAT as AiApiFormat,
+    model: DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT],
     baseUrl: "",
     apiKey: "",
     hasKey: false,
@@ -1801,6 +1946,30 @@ function AppInner() {
   const [canvasPrefs, setCanvasPrefs] = useState<CanvasPreferences>(() =>
     loadCanvasPreferences(),
   );
+  const syncCardAssetIds = useMemo(() => {
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    const push = (id: string) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      ids.push(id);
+    };
+    for (const asset of assets) push(asset.assetId);
+    for (const entry of browseLayout) push(entry.assetId);
+    return ids;
+  }, [assets, browseLayout]);
+  const syncCardStatuses = useSyncCardStatuses({
+    api,
+    libraryId: library?.libraryId,
+    bound: syncBindingStatus !== "none",
+    showBadges: canvasPrefs.fields.badgeSync !== false && syncBindingStatus !== "none",
+    assetIds: syncCardAssetIds,
+    syncing: Boolean(
+      syncProgress
+      && syncProgress.phase !== "complete"
+      && syncProgress.filesTotal > 0,
+    ),
+  });
   const [imageSequencePrefs, setImageSequencePrefs] = useState(() =>
     loadImageSequencePreferences(),
   );
@@ -1831,6 +2000,21 @@ function AppInner() {
     [assetCardSize, canvasWidthPx],
   );
   const workspaceCanvasRef = useRef<HTMLDivElement>(null);
+  // A viewport restore waiting to be applied in the same commit the new
+  // content paints in. Set when a navigation targets a saved offset; the
+  // layout effect below positions the canvas before the browser paints, which
+  // removes the "first frame at the top, second frame jumps" flicker when
+  // switching folders or tabs (UX principle 0005: reduce flashing).
+  const pendingViewportRestoreRef = useRef<WorkspaceNavViewport | null>(null);
+  useLayoutEffect(() => {
+    const viewport = pendingViewportRestoreRef.current;
+    if (!viewport) return;
+    const canvas = workspaceCanvasRef.current;
+    if (!canvas) return;
+    const extent = Math.max(0, canvas.scrollHeight - canvas.clientHeight);
+    if (extent <= 0) return;
+    canvas.scrollTop = resolveWorkspaceScrollTop(viewport, extent);
+  });
   const reportedVisibleWindowKeyRef = useRef("");
   // Serpent-wgl2: the marquee box div is always mounted and moved directly
   // through this ref — never through React state (per-frame state re-renders
@@ -2032,6 +2216,29 @@ function AppInner() {
         : null,
     [],
   );
+  // Serpent-374266: the same snapshot for managed-folder drags started from the
+  // browse canvas. The sidebar needs it to tell whether a folder drop target
+  // would change anything; the HTML5 payload itself cannot be read during
+  // dragover (protected mode).
+  const managedFolderDragIdsRef = useRef<readonly string[] | null>(null);
+  const getManagedFolderDragIds = useCallback(
+    () =>
+      managedFolderDragIdsRef.current
+        ? [...managedFolderDragIdsRef.current]
+        : null,
+    [],
+  );
+  useEffect(() => {
+    const clearManagedFolderDragIds = () => {
+      managedFolderDragIdsRef.current = null;
+    };
+    window.addEventListener("dragend", clearManagedFolderDragIds);
+    window.addEventListener("drop", clearManagedFolderDragIds);
+    return () => {
+      window.removeEventListener("dragend", clearManagedFolderDragIds);
+      window.removeEventListener("drop", clearManagedFolderDragIds);
+    };
+  }, []);
   // Escape cancels the renderer-side drag session immediately. Native OS
   // drags are cancelled by Electron/the operating system; this also clears
   // the custom ghost and internal selection fallback so a cancelled gesture
@@ -2215,6 +2422,18 @@ function AppInner() {
     trashedAssets,
     trashedFolders,
   ]);
+  const workspaceTabPresentations = workspaceTabsState.tabs.map((tab) =>
+    presentWorkspaceTab(tab, {
+      folders,
+      linkedFolders,
+      collections,
+      smartCollections,
+      tags,
+      assets: [...visibleAssets, ...assets],
+      pluginViews: pluginSidebarViews,
+      t,
+    }),
+  );
 
   // Serpent-b963a9: masonry/justified canvases use the full-scope layout index
   // for geometry, so shuffling only the loaded summaries leaves the cards in
@@ -2551,6 +2770,34 @@ function AppInner() {
           )
         : [],
     [showTrash, t, trashBrowseTombstoneId, trashedFolders],
+  );
+  const scopeBreadcrumbSegments = buildScopeBreadcrumbSegments(
+    {
+      showTrash,
+      trashBreadcrumbHops,
+      activeTagLabel: activeTagId
+        ? (tags.find((tag) => tag.tagId === activeTagId)?.name ?? null)
+        : null,
+      activeCollectionLabel: activeCollectionId
+        ? (collections.find(
+            (collection) => collection.collectionId === activeCollectionId,
+          )?.name ?? null)
+        : null,
+      activeSmartCollectionLabel: activeSmartCollectionId
+        ? (smartCollections.find(
+            (collection) => collection.collectionId === activeSmartCollectionId,
+          )?.name ?? null)
+        : null,
+      assetScope,
+      folderTrail:
+        assetScope !== "all" && assetScope !== "root"
+          ? buildManagedFolderBreadcrumbTrail(folders, assetScope).length > 0
+            ? buildManagedFolderBreadcrumbTrail(folders, assetScope)
+            : buildLinkedFolderBreadcrumbTrail(linkedFolders, assetScope)
+          : [],
+      linkedFolderLabel: null,
+    },
+    t,
   );
   const browseCanvasBodyLayout = resolveBrowseCanvasBodyLayout(
     visibleAssets.length,
@@ -3183,8 +3430,28 @@ function AppInner() {
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [assetCardSize, previewAsset, resizeAssetCards]);
 
-  const openAssetPreview = useCallback((asset: AssetSummary) => {
+  const saveCurrentWorkspaceHistoryViewport = useCallback(() => {
+    if (workspaceHistoryReplayActiveRef.current) {
+      return;
+    }
+    cancelWorkspaceViewportRestoreRef.current?.();
+    cancelWorkspaceViewportRestoreRef.current = null;
+    navHistoryRef.current.saveCurrentViewport(
+      captureWorkspaceNavViewport(workspaceCanvasRef.current),
+    );
+  }, [navHistoryRef]);
+
+  const openAssetPreview = useCallback((
+    asset: AssetSummary,
+    options?: { recordHistory?: boolean },
+  ) => {
     if (asset.availability !== "available" || asset.deletedAt) return;
+    if (
+      options?.recordHistory !== false &&
+      navHistoryRef.current.current.kind !== "preview"
+    ) {
+      saveCurrentWorkspaceHistoryViewport();
+    }
     // Serpent-ayf: entering the viewer always shows chrome, regardless of
     // whatever idle state accumulated while browsing; only opening (not
     // navigateAssetPreview) wakes it.
@@ -3233,7 +3500,7 @@ function AppInner() {
     setPreviewAsset(asset);
     // Serpent-b7e173：打开查看器注册一个历史状态。已是 preview（重复打开）则
     // 原地替换，避免叠层 preview；applyWorkspaceLocation 回放时 suppress 不重复记。
-    if (!suppressNavHistoryRef.current) {
+    if (options?.recordHistory !== false) {
       const previewLocation: WorkspaceNavLocation = {
         kind: "preview",
         assetId: asset.assetId,
@@ -3242,13 +3509,15 @@ function AppInner() {
         navHistoryRef.current.replaceCurrent(previewLocation);
       } else {
         navHistoryRef.current.push(previewLocation);
+        workspaceHistoryReplayActiveRef.current = false;
       }
+      syncActiveWorkspaceTabLocation();
       setNavHistoryUi({
         canBack: navHistoryRef.current.canBack,
         canForward: navHistoryRef.current.canForward,
       });
     }
-  }, [navHistoryRef, selectionAnchorRef, setNavHistoryUi, suppressNavHistoryRef, wakeViewerChrome]);
+  }, [navHistoryRef, saveCurrentWorkspaceHistoryViewport, selectionAnchorRef, setNavHistoryUi, syncActiveWorkspaceTabLocation, wakeViewerChrome]);
 
   const persistAssetColorSpace = useCallback(async (assetId: string, colorSpace: string | null) => {
     if (!api || !library) return;
@@ -3264,26 +3533,56 @@ function AppInner() {
     setNotice(t("toast.colorSpaceSaved"));
   }, [api, library, setError, setNotice, t]);
 
-  const navigateAssetPreview = useCallback((asset: AssetSummary) => {
+  const navigateAssetPreview = useCallback((
+    asset: AssetSummary,
+    options?: { recordHistory?: boolean },
+  ) => {
     setSelectedAssetIds([asset.assetId]);
     setSelectedAssetId(asset.assetId);
     selectionAnchorRef.current = asset.assetId;
     previewFocusReturnRef.current = asset.assetId;
     setPreviewAsset(asset);
     // Serpent-b7e173：查看器内切资产只更新当前 preview 条目的 assetId，不新增历史。
-    if (!suppressNavHistoryRef.current) {
+    if (options?.recordHistory !== false) {
       navHistoryRef.current.replaceCurrent({
         kind: "preview",
         assetId: asset.assetId,
       });
+      syncActiveWorkspaceTabLocation();
       setNavHistoryUi({
         canBack: navHistoryRef.current.canBack,
         canForward: navHistoryRef.current.canForward,
       });
     }
-  }, [navHistoryRef, selectionAnchorRef, setNavHistoryUi, suppressNavHistoryRef]);
+  }, [navHistoryRef, selectionAnchorRef, setNavHistoryUi, syncActiveWorkspaceTabLocation]);
 
-  const closeAssetPreview = useCallback(async (restoreBrowsePosition = true) => {
+  useEffect(() => {
+    const pendingPreview = pendingWorkspacePreviewRef.current;
+    if (!pendingPreview) return;
+    if (!pendingPreview.isCurrent()) {
+      pendingWorkspacePreviewRef.current = null;
+      return;
+    }
+    const target = [...visibleAssets, ...assets].find(
+      (asset) => asset.assetId === pendingPreview.assetId,
+    );
+    if (!target) return;
+    const canvas = workspaceCanvasRef.current;
+    if (canvas) {
+      const extent = Math.max(0, canvas.scrollHeight - canvas.clientHeight);
+      canvas.scrollTo({
+        top: resolveWorkspaceScrollTop(pendingPreview.viewport, extent),
+        left: 0,
+      });
+    }
+    pendingWorkspacePreviewRef.current = null;
+    openAssetPreview(target, { recordHistory: false });
+  }, [assets, openAssetPreview, visibleAssets]);
+
+  const closeAssetPreview = useCallback(async (
+    restoreBrowsePosition = true,
+    updateHistory = true,
+  ) => {
     // A scope transition can arrive after React has already cleared
     // `previewAsset` but before the two-frame browse restoration runs. Cancel
     // that stale restoration even when there is no longer an asset to close,
@@ -3299,8 +3598,9 @@ function AppInner() {
     // 历史条目仍是 preview 则硬移除——否则「从预览导航到别处」会残留一个已关闭
     // 的 preview，导致 back 回到它。back()/forward() 已移 index（当前非 preview）
     // 或导航 push 会截断，不在此重复处理。
-    if (navHistoryRef.current.current.kind === "preview") {
+    if (updateHistory && navHistoryRef.current.current.kind === "preview") {
       navHistoryRef.current.dismissCurrent();
+      syncActiveWorkspaceTabLocation();
       setNavHistoryUi({
         canBack: navHistoryRef.current.canBack,
         canForward: navHistoryRef.current.canForward,
@@ -3431,7 +3731,7 @@ function AppInner() {
         closingPreviewRef.current = null;
       }
     }
-  }, [api, library, navHistoryRef, previewAsset, setNavHistoryUi]);
+  }, [api, library, navHistoryRef, previewAsset, setNavHistoryUi, syncActiveWorkspaceTabLocation]);
 
   // Collection tree helper
   const collectionTree = useMemo(() => {
@@ -3461,6 +3761,13 @@ function AppInner() {
         navigationPriority?: "normal" | "library-switch";
         /** Keep the workspace covered until the complete navigation snapshot is ready. */
         blockingLibraryLoad?: boolean;
+        /** A tab/history transition may be superseded independently of the library. */
+        navigationIsCurrent?: () => boolean;
+        /** Folder recursion is captured with the request, not read after an await. */
+        folderRecursive?: boolean;
+        /** Return a read-only prepared page so its caller can commit page and route together. */
+        deferCommit?: boolean;
+        onPrepared?: (commit: () => void) => void;
       },
     ) => {
       if (!api) return;
@@ -3471,7 +3778,10 @@ function AppInner() {
         opts?.searchScope ??
         (trashMode
           ? { kind: "trash" }
-          : folderBrowseScope(scope, folderRecursiveRef.current));
+          : folderBrowseScope(
+              scope,
+              opts?.folderRecursive ?? folderRecursiveRef.current,
+            ));
       const viewSession = ensureLibraryView(activeLibrary.libraryId);
       if (!viewSession) return [];
       const libId = { libraryId: activeLibrary.libraryId };
@@ -3481,7 +3791,8 @@ function AppInner() {
       navigationHydrationAbortRef.current = navigationHydrationAbort;
       const isCurrentLoad = () =>
         generation === contentLoadGenerationRef.current &&
-        isCurrentLibraryView(viewSession);
+        isCurrentLibraryView(viewSession) &&
+        (opts?.navigationIsCurrent?.() ?? true);
       const includeLibraryCounts =
         refreshSidebar || trashMode || scope === "all" || scope === "root";
       // Post the primary browse request before sidebar/count hydration. The
@@ -3504,12 +3815,44 @@ function AppInner() {
       // retain the old count-only fallback for mutation paths that explicitly
       // keep sidebar rows untouched. Both paths start after the primary browse
       // request, so sidebar work cannot win the Worker queue race.
+      /**
+       * The navigation summary is a library-scoped read model, not a load-scoped
+       * one: it describes the whole library's folders, collections and counts.
+       * Requiring the *load generation* to still match discarded summaries that
+       * had already arrived successfully. On a library whose writes keep firing
+       * browse-change reloads (a NAS library running thumbnail/palette jobs),
+       * every load was superseded before it could apply the sidebar, so the
+       * sidebar stayed permanently empty ("尚无托管或链接文件夹 / 尚无合集") behind
+       * a loading overlay that never cleared.
+       *
+       * Scope it to the library/view instead: a summary for the library still on
+       * screen is always safe to apply, and applying the newest one wins.
+       */
+      const isCurrentLibraryNavigation = () =>
+        isCurrentLibraryView(viewSession)
+        && (opts?.navigationIsCurrent?.() ?? true);
+      const applyNavigationSummary = (summary: LibraryNavigationSummary) => {
+        setAllAssetCount(summary.allAssetCount);
+        setRootAssetCount(summary.rootAssetCount);
+        setTrashedAssetCount(summary.trashedAssetCount);
+        setFolders(summary.folders);
+        setLinkedFolders(summary.linkedFolders);
+        setTags(summary.tags);
+        setCollections(summary.collections);
+        setSmartCollections(summary.smartCollections);
+        setTrashedFolders(summary.trashedFolders);
+      };
       const loadNavigationSummary = () => {
-        if (!isCurrentLoad()) return Promise.resolve(undefined);
+        if (!isCurrentLibraryView(viewSession)) return Promise.resolve(undefined);
         return api.fetchLibraryNavigationSummary({
           ...libId,
           showIgnored: includeIgnored,
           includeTrashedFolders: trashMode,
+        }).then((result) => {
+          if (result.ok && isCurrentLibraryNavigation()) {
+            applyNavigationSummary(result.value);
+          }
+          return result;
         });
       };
       const navigationPromise = refreshSidebar
@@ -3573,6 +3916,7 @@ function AppInner() {
         }
       }
 
+      const commitPreparedContent = () => {
       // Ordinary browse scopes apply the canvas immediately and hydrate the
       // sidebar later. A library replacement is different: blockingNavigation
       // was read before this point, while the loading overlay still covers
@@ -3618,15 +3962,7 @@ function AppInner() {
       });
 
       if (blockingNavigation) {
-        setAllAssetCount(blockingNavigation.allAssetCount);
-        setRootAssetCount(blockingNavigation.rootAssetCount);
-        setTrashedAssetCount(blockingNavigation.trashedAssetCount);
-        setFolders(blockingNavigation.folders);
-        setLinkedFolders(blockingNavigation.linkedFolders);
-        setTags(blockingNavigation.tags);
-        setCollections(blockingNavigation.collections);
-        setSmartCollections(blockingNavigation.smartCollections);
-        setTrashedFolders(blockingNavigation.trashedFolders);
+        applyNavigationSummary(blockingNavigation);
         return assetResult.value.items;
       }
 
@@ -3638,15 +3974,7 @@ function AppInner() {
           if (!isCurrentLoad()) return;
           if (navigation) {
             if (!navigation.ok) throw new LibraryOperationError(navigation.error);
-            setAllAssetCount(navigation.value.allAssetCount);
-            setRootAssetCount(navigation.value.rootAssetCount);
-            setTrashedAssetCount(navigation.value.trashedAssetCount);
-            setFolders(navigation.value.folders);
-            setLinkedFolders(navigation.value.linkedFolders);
-            setTags(navigation.value.tags);
-            setCollections(navigation.value.collections);
-            setSmartCollections(navigation.value.smartCollections);
-            setTrashedFolders(navigation.value.trashedFolders);
+            applyNavigationSummary(navigation.value);
             return;
           }
           if (!counts) return;
@@ -3667,6 +3995,12 @@ function AppInner() {
             navigationHydrationAbortRef.current = null;
           }
         });
+      };
+      if (opts?.deferCommit) {
+        opts.onPrepared?.(commitPreparedContent);
+        return assetResult.value.items;
+      }
+      commitPreparedContent();
       return assetResult.value.items;
     },
     [
@@ -3704,6 +4038,7 @@ function AppInner() {
     setAssetSelectionAnchor,
     setBrowserSessionReady,
     resetImportTargetFolderRef: managedImportTargetFolderIdRef,
+    restoreWorkspaceTabs: restoreWorkspaceTabsForLibrary,
     pendingRestoredFocusRef,
     navHistoryRef,
     setNavHistoryUi,
@@ -3942,7 +4277,7 @@ function AppInner() {
     library?.libraryId,
     locale,
     refreshRecentLibraries,
-    resetNavHistory,
+    resetWorkspaceTabs,
     scriptSandboxPreviewOpen,
     libraryTransitionLock,
     setError,
@@ -4225,45 +4560,464 @@ function AppInner() {
   }, [api, library, locale, setError, setFatal, setNotice, t]);
 
   function syncNavHistoryUi() {
+    // Keep the active tab's cached location at the shared cursor so the tab
+    // strip reflects the live view (the tabs no longer own their histories).
+    syncActiveWorkspaceTabLocation();
     setNavHistoryUi({
       canBack: navHistoryRef.current.canBack,
       canForward: navHistoryRef.current.canForward,
     });
   }
 
-  function resetNavHistory(initial: WorkspaceNavLocation = { kind: "all" }) {
-    navHistoryRef.current.clear(initial);
-    syncNavHistoryUi();
+  function captureWorkspaceTabBrowseState(): WorkspaceTabBrowseState {
+    return {
+      searchValue,
+      filters: {
+        formatFilter,
+        excludeFormatFilter,
+        colorFilter,
+        excludeColorFilter,
+        tagFilter,
+        excludeTagFilter,
+        includeAiTagFilter,
+        tagFilterMatch,
+        ratingFilter,
+        excludeRatingFilter,
+        includeAiRatingFilter,
+        favoriteFilter,
+        sourceUrlFilter,
+        availabilityFilter,
+        excludeAvailabilityFilter,
+        widthRange,
+        heightRange,
+        aspectRatioRange,
+        aspectRatioRanges,
+        longEdgeRange,
+        durationRange,
+      },
+      sortField,
+      sortOrder,
+      shuffleSeed,
+      folderRecursive,
+      collectionRecursive,
+      showIgnoredItems,
+    };
   }
 
-  function recordNavigation(location: WorkspaceNavLocation) {
-    if (suppressNavHistoryRef.current) return;
+  function beginWorkspaceNavigation(): () => boolean {
+    const token = (workspaceTabTransitionRef.current += 1);
+    workspaceHistoryReplayEpochRef.current += 1;
+    return () => workspaceTabTransitionRef.current === token;
+  }
+
+  function beginWorkspaceNavigationRequest(
+    historyMode: WorkspaceNavigationHistoryMode,
+  ): WorkspaceNavigationRequest {
+    const token = beginWorkspaceTabNavigation(historyMode);
+    const request: WorkspaceNavigationRequest = {
+      token,
+      historyMode,
+      isCurrent: () => isWorkspaceTabNavigationCurrent(token),
+    };
+    setWorkspaceNavigationPending(true);
+    return request;
+  }
+
+  function createWorkspaceNavigationRequest(
+    request: WorkspaceNavigationRequest | undefined,
+    historyMode: WorkspaceNavigationHistoryMode = "push",
+  ): WorkspaceNavigationRequest {
+    return request ?? beginWorkspaceNavigationRequest(historyMode);
+  }
+
+  function applyWorkspaceLocationFlags(location: WorkspaceNavLocation): void {
+    setShowTrash(location.kind === "trash");
+    setShowTagManagement(location.kind === "tag-management");
+    setActivePluginSidebarViewId(
+      location.kind === "plugin-sidebar" ? location.viewId : null,
+    );
+    setActiveTagId(location.kind === "tag" ? location.tagId : null);
+    setActiveCollectionId(
+      location.kind === "collection" ? location.collectionId : null,
+    );
+    setActiveSmartCollectionId(
+      location.kind === "smart-collection" ? location.collectionId : null,
+    );
+    setAssetScope(location.kind === "folder" ? location.folderId : location.kind === "root" ? "root" : "all");
+    if (location.kind === "trash") setTrashBrowseTombstoneId(location.tombstoneId);
+  }
+
+  function virtualLayoutSnapshotForCurrentViewport(): WorkspaceVirtualLayoutSnapshot | null {
+    if (!virtualBrowseLayout) return null;
+    const viewport = captureWorkspaceNavViewport(workspaceCanvasRef.current);
+    const focusIndex = Math.round(
+      viewport.scrollProgress * Math.max(0, virtualBrowseLayout.total - 1),
+    );
+    const nearestIndices = (indices: Iterable<number>) =>
+      [...indices]
+        .sort((a, b) => Math.abs(a - focusIndex) - Math.abs(b - focusIndex))
+        .slice(0, 240);
+    const selectedGeometryIndices = new Set(
+      nearestIndices(virtualBrowseLayout.geometryEntries.keys()),
+    );
+    const selectedAssetIndices = new Set(
+      nearestIndices(virtualBrowseLayout.assetIdsByIndex.keys()),
+    );
+    const selectedEntryIndices = new Set(
+      nearestIndices(virtualBrowseLayout.entries.keys()),
+    );
+    const selectedAssetIds = new Set(
+      [...selectedAssetIndices].map((index) =>
+        virtualBrowseLayout.assetIdsByIndex.get(index),
+      ).filter((assetId): assetId is string => assetId !== undefined),
+    );
+    return {
+      total: virtualBrowseLayout.total,
+      geometryRevision: virtualBrowseLayout.geometryRevision,
+      geometryEntries: [...virtualBrowseLayout.geometryEntries.entries()]
+        .filter(([index]) => selectedGeometryIndices.has(index)),
+      assetIdsByIndex: [...virtualBrowseLayout.assetIdsByIndex.entries()]
+        .filter(([index]) => selectedAssetIndices.has(index)),
+      entries: [...virtualBrowseLayout.entries.entries()]
+        .filter(([index]) => selectedEntryIndices.has(index)),
+      indexByAssetId: [...virtualBrowseLayout.indexByAssetId.entries()]
+        .filter(([assetId]) => selectedAssetIds.has(assetId)),
+    };
+  }
+
+  function captureWorkspaceRenderSnapshot(): WorkspaceRenderSnapshot | null {
+    const history = navHistoryRef.current;
+    const location = history.current.kind === "preview"
+      ? (history.peek(-1) ?? { kind: "all" as const })
+      : history.current;
+    const virtualLayout = virtualLayoutSnapshotForCurrentViewport();
+    if (!virtualLayout && browseLayout.length > 1_200) return null;
+    const pageDescriptor = {
+      sessionId: null,
+      offset: searchOffset,
+      pageSize: BROWSE_PAGE_SIZE,
+      scopeKey: JSON.stringify(location),
+      queryKey: searchValue.trim() || null,
+    };
+    const layout = virtualLayout ? [] : browseLayout;
+    if (showTrash || location.kind === "trash") {
+      return {
+        kind: "trash",
+        location: location.kind === "trash"
+          ? location
+          : { kind: "trash", tombstoneId: trashBrowseTombstoneId },
+        items: trashedAssets.slice(0, 320),
+        folders: trashedFolders.slice(0, 400),
+        layout,
+        virtualLayout,
+        total: virtualBrowseLayout?.total ?? trashedAssetCount,
+        pageDescriptor,
+      };
+    }
+    if (showTagManagement || location.kind === "tag-management") {
+      return { kind: "tag-management", location: { kind: "tag-management" } };
+    }
+    if (activePluginSidebarViewId || location.kind === "plugin-sidebar") {
+      const viewId = location.kind === "plugin-sidebar"
+        ? location.viewId
+        : activePluginSidebarViewId!;
+      return { kind: "plugin-sidebar", location: { kind: "plugin-sidebar", viewId } };
+    }
+    return {
+      kind: "browse",
+      location,
+      items: assets.slice(0, 320),
+      layout,
+      virtualLayout,
+      total: virtualBrowseLayout?.total ?? searchTotal ?? assets.length,
+      snippets: [...searchSnippets.entries()].slice(0, 320),
+      pageDescriptor,
+    };
+  }
+
+  function captureWorkspaceTabContext() {
+    workspaceHistoryReplayEpochRef.current += 1;
+    if (workspaceHistoryReplayActiveRef.current) {
+      return null;
+    }
+    return {
+      viewport: captureWorkspaceNavViewport(workspaceCanvasRef.current),
+      selectedAssetIds,
+      selectedAssetId: selectedAssetId ?? null,
+      browseState: captureWorkspaceTabBrowseState(),
+      cachedTitle:
+        workspaceTabPresentations.find(
+          (tab) => tab.id === workspaceTabsState.activeTabId,
+        )?.title ?? workspaceTitle(),
+      renderSnapshot: captureWorkspaceRenderSnapshot(),
+    };
+  }
+
+  function restoreCurrentWorkspaceHistoryViewport(
+    viewport: WorkspaceNavViewport,
+    isCurrent: () => boolean,
+    onComplete?: () => void,
+  ) {
+    cancelWorkspaceViewportRestoreRef.current?.();
+    const canvas = workspaceCanvasRef.current;
+    if (!canvas) {
+      onComplete?.();
+      return;
+    }
+    cancelWorkspaceViewportRestoreRef.current = restoreWorkspaceNavViewport(
+      canvas,
+      viewport,
+      isCurrent,
+      onComplete,
+    );
+  }
+
+  function applyWorkspaceTabBrowseState(state: WorkspaceTabBrowseState) {
+    setSearchValue(state.searchValue);
+    setFormatFilter(state.filters.formatFilter);
+    setExcludeFormatFilter(state.filters.excludeFormatFilter);
+    setColorFilter(state.filters.colorFilter);
+    setExcludeColorFilter(state.filters.excludeColorFilter);
+    setTagFilter(state.filters.tagFilter);
+    setExcludeTagFilter(state.filters.excludeTagFilter);
+    setIncludeAiTagFilter(state.filters.includeAiTagFilter);
+    setTagFilterMatch(state.filters.tagFilterMatch);
+    setRatingFilter(state.filters.ratingFilter);
+    setExcludeRatingFilter(state.filters.excludeRatingFilter);
+    setIncludeAiRatingFilter(state.filters.includeAiRatingFilter);
+    setFavoriteFilter(state.filters.favoriteFilter);
+    setSourceUrlFilter(state.filters.sourceUrlFilter);
+    setAvailabilityFilter(state.filters.availabilityFilter);
+    setExcludeAvailabilityFilter(state.filters.excludeAvailabilityFilter);
+    setWidthRange({ ...state.filters.widthRange });
+    setHeightRange({ ...state.filters.heightRange });
+    setAspectRatioRange({ ...state.filters.aspectRatioRange });
+    setAspectRatioRanges(state.filters.aspectRatioRanges.map((range) => ({ ...range })));
+    setLongEdgeRange({ ...state.filters.longEdgeRange });
+    setDurationRange({ ...state.filters.durationRange });
+    setSortField(state.sortField);
+    setSortOrder(state.sortOrder);
+    setShuffleSeed(state.shuffleSeed);
+    folderRecursiveRef.current = state.folderRecursive;
+    setFolderRecursive(state.folderRecursive);
+    collectionRecursiveRef.current = state.collectionRecursive;
+    setCollectionRecursive(state.collectionRecursive);
+    setShowIgnoredItems(state.showIgnoredItems);
+  }
+
+  function applyWorkspaceTabBrowseStateForNavigation(
+    request: WorkspaceNavigationRequest,
+  ) {
+    const state = request.browseState;
+    const tabId = request.browseStateTabId ?? null;
+    const lastApplied = lastAppliedWorkspaceBrowseStateRef.current;
+    if (
+      !state ||
+      (lastApplied?.tabId === tabId && lastApplied.state === state)
+    ) return;
+    lastAppliedWorkspaceBrowseStateRef.current = { tabId, state };
+    skipDiscoveryReloadSignatureRef.current = JSON.stringify(
+      queryDefinitionForWorkspaceBrowseState(state),
+    );
+    applyWorkspaceTabBrowseState(state);
+  }
+
+  function restoreVirtualBrowseLayoutSnapshot(
+    snapshot: WorkspaceVirtualLayoutSnapshot | null,
+  ): VirtualBrowseLayout | null {
+    if (!snapshot) return null;
+    const entries = new Map(snapshot.entries);
+    const assetIdsByIndex = new Map(snapshot.assetIdsByIndex);
+    const indexByAssetId = new Map(snapshot.indexByAssetId);
+    return {
+      total: snapshot.total,
+      geometryRevision: snapshot.geometryRevision,
+      geometryEntries: new Map(snapshot.geometryEntries),
+      assetIdsByIndex,
+      entries,
+      indexByAssetId,
+    };
+  }
+
+  function applyWorkspaceRenderSnapshot(snapshot: WorkspaceRenderSnapshot): void {
+    applyWorkspaceLocationFlags(snapshot.location);
+    if (snapshot.kind === "browse") {
+      setAssets([...snapshot.items]);
+      setBrowseLayout([...snapshot.layout]);
+      setVirtualBrowseLayout(restoreVirtualBrowseLayoutSnapshot(snapshot.virtualLayout));
+      setSearchTotal(snapshot.total);
+      setSearchOffset(snapshot.pageDescriptor.offset);
+      setSearchSnippets(new Map(snapshot.snippets));
+      return;
+    }
+    if (snapshot.kind === "trash") {
+      setTrashedAssets([...snapshot.items]);
+      setTrashedFolders([...snapshot.folders]);
+      setBrowseLayout([...snapshot.layout]);
+      setVirtualBrowseLayout(restoreVirtualBrowseLayoutSnapshot(snapshot.virtualLayout));
+      setTrashedAssetCount(snapshot.total);
+      setSearchOffset(snapshot.pageDescriptor.offset);
+      return;
+    }
+    setAssets([]);
+    setBrowseLayout([]);
+    setVirtualBrowseLayout(null);
+  }
+
+  function finishWorkspaceNavigation(
+    request: WorkspaceNavigationRequest,
+    viewport: WorkspaceNavViewport = {
+      scrollTop: 0,
+      scrollProgress: 0,
+      scrollExtent: 0,
+    },
+  ): void {
+    if (!request.isCurrent()) return;
+    const canvas = workspaceCanvasRef.current;
+    if (canvas) {
+      // Content may already be committed (cached snapshot / history entry):
+      // flush anything pending and place the offset now, still pre-paint.
+      flushSync(() => {});
+      const extent = Math.max(0, canvas.scrollHeight - canvas.clientHeight);
+      canvas.scrollTop = resolveWorkspaceScrollTop(viewport, extent);
+    }
+    restoreCurrentWorkspaceHistoryViewport(viewport, request.isCurrent, () => {
+      pendingViewportRestoreRef.current = null;
+      if (request.isCurrent()) setWorkspaceNavigationPending(false);
+    });
+    // Arm the same-commit restore *after* the previous restore was cancelled
+    // (its onComplete clears the ref): the layout effect above positions the
+    // canvas before the browser paints the commit in which the new content
+    // lands, so the restored folder never shows a top-of-list first frame.
+    pendingViewportRestoreRef.current = viewport;
+  }
+
+  async function restoreAllAssetsWorkspaceTab(isCurrent: () => boolean) {
+    const request: WorkspaceNavigationRequest = {
+      historyMode: "none",
+      isCurrent,
+      deferReveal: true,
+    };
+    await chooseFolder("all", { navigation: request });
+    if (isCurrent()) finishWorkspaceNavigation(request);
+  }
+
+  async function restoreWorkspaceTabSession(
+    tab: WorkspaceTabSession,
+    isCurrent: () => boolean,
+  ) {
+    const current = tab.location;
+    const firstLocation =
+      current.kind === "preview"
+        ? (navHistoryRef.current.peek(-1) ?? { kind: "all" as const })
+        : current;
+    const targetViewport =
+      current.kind === "preview"
+        ? (navHistoryRef.current.peekViewport(-1) ?? tab.viewport)
+        : tab.viewport;
+    const pendingSelection = tab.browseState &&
+      workspaceTabBrowseStateHasDiscoveryInput(tab.browseState)
+      ? {
+          selectedAssetIds: [...tab.selectedAssetIds],
+          selectedAssetId: tab.selectedAssetId,
+          isCurrent,
+        }
+      : null;
+    const request: WorkspaceNavigationRequest = {
+      historyMode: "none",
+      isCurrent,
+      deferReveal: true,
+      ...(tab.browseState
+        ? { browseState: tab.browseState, browseStateTabId: tab.id }
+        : {}),
+    };
+    setWorkspaceNavigationPending(true);
+    pendingWorkspaceTabSelectionRef.current = pendingSelection;
+    pendingWorkspacePreviewRef.current =
+      current.kind === "preview"
+        ? { assetId: current.assetId, viewport: targetViewport, isCurrent }
+        : null;
+    const renderSnapshot = getWorkspaceRenderSnapshot(tab.id);
+    if (
+      renderSnapshot &&
+      workspaceNavLocationsEqual(renderSnapshot.location, firstLocation)
+    ) {
+      // Commit the cached DOM and its scroll position before the browser paints;
+      // the translucent hold layer must never expose the prior tab's offset.
+      flushSync(() => {
+        applyWorkspaceRenderSnapshot(renderSnapshot);
+        applyWorkspaceTabBrowseStateForNavigation(request);
+      });
+      if (isCurrent()) {
+        const canvas = workspaceCanvasRef.current;
+        if (canvas) {
+          const extent = Math.max(0, canvas.scrollHeight - canvas.clientHeight);
+          canvas.scrollTop = resolveWorkspaceScrollTop(targetViewport, extent);
+        }
+      }
+    }
+    if (!isCurrent()) return;
+    try {
+      await applyWorkspaceLocation(firstLocation, request);
+    } catch {
+      if (isCurrent()) setWorkspaceNavigationPending(false);
+    }
+    if (!isCurrent()) {
+      const pending = pendingWorkspacePreviewRef.current;
+      if (current.kind === "preview" && pending?.assetId === current.assetId) {
+        pendingWorkspacePreviewRef.current = null;
+      }
+      if (pendingWorkspaceTabSelectionRef.current === pendingSelection) {
+        pendingWorkspaceTabSelectionRef.current = null;
+      }
+      return;
+    }
+    setSelectedAssetIds([...tab.selectedAssetIds]);
+    setSelectedAssetId(tab.selectedAssetId ?? undefined);
+    if (current.kind === "preview") {
+      const target = [...visibleAssets, ...assets].find(
+        (candidate) => candidate.assetId === current.assetId,
+      );
+      if (target) openAssetPreview(target);
+    }
+    finishWorkspaceNavigation(request, targetViewport);
+  }
+
+  function recordNavigation(
+    location: WorkspaceNavLocation,
+    request: WorkspaceNavigationRequest,
+  ) {
+    if (!request.isCurrent() || request.historyMode !== "push") return;
     navHistoryRef.current.push(location);
+    workspaceHistoryReplayActiveRef.current = false;
     syncNavHistoryUi();
   }
 
-  async function applyWorkspaceLocation(location: WorkspaceNavLocation) {
+  async function applyWorkspaceLocation(
+    location: WorkspaceNavLocation,
+    request: WorkspaceNavigationRequest,
+  ) {
     switch (location.kind) {
       case "all":
-        await chooseFolder("all");
+        await chooseFolder("all", { navigation: request });
         return;
       case "root":
-        await chooseFolder("root");
+        await chooseFolder("root", { navigation: request });
         return;
       case "folder":
-        await chooseFolder(location.folderId);
+        await chooseFolder(location.folderId, { navigation: request });
         return;
       case "tag":
-        await chooseTag(location.tagId);
+        await chooseTag(location.tagId, request);
         return;
       case "collection":
-        await chooseCollection(location.collectionId, location.recursive);
+        await chooseCollection(location.collectionId, location.recursive, request);
         return;
       case "smart-collection":
-        await chooseSmartCollection(location.collectionId);
+        await chooseSmartCollection(location.collectionId, request);
         return;
       case "trash":
-        await enterTrashAt(location.tombstoneId);
+        await enterTrashAt(location.tombstoneId, request);
         return;
       case "preview": {
         // 回放查看器状态：preview 条目总是在某浏览 scope 之后打开，其资产应在
@@ -4282,43 +5036,83 @@ function AppInner() {
         return;
       }
       case "tag-management":
-        await enterTagManagement();
+        await enterTagManagement(request);
+        return;
+      case "plugin-sidebar":
+        await enterPluginSidebarView(location.viewId, request);
         return;
     }
   }
 
-  async function goWorkspaceBack() {
-    const location = navHistoryRef.current.back();
+  function enqueueWorkspaceHistoryReplay(operation: () => Promise<void>) {
+    const requestedEpoch = workspaceHistoryReplayEpochRef.current;
+    const pending = workspaceHistoryReplayQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (requestedEpoch !== workspaceHistoryReplayEpochRef.current) return;
+        await operation();
+      });
+    workspaceHistoryReplayQueueRef.current = pending.catch(() => undefined);
+    return pending;
+  }
+
+  async function replayWorkspaceHistoryStep(direction: "back" | "forward") {
+    cancelWorkspaceViewportRestoreRef.current?.();
+    cancelWorkspaceViewportRestoreRef.current = null;
+    navHistoryRef.current.saveCurrentViewport(
+      captureWorkspaceNavViewport(workspaceCanvasRef.current),
+    );
+    // Sync the outgoing tab's cached location to the pre-replay cursor before
+    // moving it, so a later switch/replay back to that tab lands where it was.
+    saveWorkspaceTabContext();
+    const location =
+      direction === "back"
+        ? navHistoryRef.current.back()
+        : navHistoryRef.current.forward();
     if (!location) return;
+    workspaceHistoryReplayActiveRef.current = true;
     syncNavHistoryUi();
-    if (previewAsset) {
-      // Serpent-b7e173：查看器是从当前浏览 scope 打开的，back() 已把 index 移出
-      // preview。浏览界面本就显示在查看器下层，直接关查看器恢复滚动位置即可，
-      // 不要走 applyWorkspaceLocation → chooseFolder 的全量重载（会把滚动归零）。
-      await closeAssetPreview();
-      return;
-    }
-    suppressNavHistoryRef.current = true;
+    const targetTabId = navHistoryRef.current.currentTabId;
+    const targetViewport = navHistoryRef.current.currentViewport;
+    let replayRequest: WorkspaceNavigationRequest | null = null;
     try {
-      await applyWorkspaceLocation(location);
+      if (targetTabId !== workspaceTabsState.activeTabId) {
+        // The step belongs to another tab: activate it and restore the entry's
+        // recorded location. Replaying must not record a new history step.
+        await selectWorkspaceTab(targetTabId, {
+          location,
+          viewport: targetViewport,
+        });
+      } else {
+        replayRequest = {
+          ...beginWorkspaceNavigationRequest("replay"),
+          deferReveal: true,
+        };
+        await applyWorkspaceLocation(location, replayRequest);
+        if (replayRequest.isCurrent()) {
+          finishWorkspaceNavigation(replayRequest, targetViewport);
+        }
+      }
+    } catch (caught) {
+      if (replayRequest === null || replayRequest.isCurrent()) {
+        setWorkspaceNavigationPending(false);
+        setError(toMessage(caught, t("toast.readAssetsFailed"), locale));
+      }
     } finally {
-      suppressNavHistoryRef.current = false;
+      workspaceHistoryReplayActiveRef.current = false;
     }
   }
 
-  async function goWorkspaceForward() {
-    // 前进只走历史（Serpent-b7e173）。查看器开着时 preview 必在栈顶，
-    // forward() 返回 null；能前进时查看器必然已关（back 或导航已离开），
-    // 故前进无需任何 preview 特判；前进到 preview 由 applyWorkspaceLocation 重开查看器。
-    const location = navHistoryRef.current.forward();
-    if (!location) return;
-    syncNavHistoryUi();
-    suppressNavHistoryRef.current = true;
-    try {
-      await applyWorkspaceLocation(location);
-    } finally {
-      suppressNavHistoryRef.current = false;
-    }
+  function goWorkspaceBack() {
+    return enqueueWorkspaceHistoryReplay(() =>
+      replayWorkspaceHistoryStep("back"),
+    );
+  }
+
+  function goWorkspaceForward() {
+    return enqueueWorkspaceHistoryReplay(() =>
+      replayWorkspaceHistoryStep("forward"),
+    );
   }
 
   async function refreshRecentLibraries(currentLibraryPath?: string | null) {
@@ -4341,15 +5135,27 @@ function AppInner() {
 
   async function runLibraryOperation(kind: "create" | "open") {
     if (!api) return;
+    if (kind === "open") {
+      // Pick the location first (dialog only) so the loading overlay and its
+      // timer start with the actual load, never while the picker is open
+      // (Serpent-565785 feedback).
+      const chosen = await api.chooseLibraryPath();
+      if (!chosen.ok || chosen.value === null) return;
+      await runLibraryOpenPipeline(
+        "opening",
+        () => api.open({ libraryPath: chosen.value! }),
+        t("toast.libraryOpFailed"),
+        undefined,
+        null,
+      );
+      return;
+    }
     await runLibraryOpenPipeline(
-      kind === "create" ? "creating" : "opening",
-      () =>
-        kind === "create"
-          ? api.create({ displayName: dialogValue.trim() })
-          : api.open(),
+      "creating",
+      () => api.create({ displayName: dialogValue.trim() }),
       t("toast.libraryOpFailed"),
       undefined,
-      kind === "create" ? dialogValue.trim() || null : null,
+      dialogValue.trim() || null,
     );
   }
 
@@ -4493,17 +5299,27 @@ function AppInner() {
     }
   }
 
-  async function openRecentLibrary(libraryPath: string) {
-    if (!api) return;
-    const recent = recentLibraries.find((entry) => entry.path === libraryPath);
-    await runLibraryOpenPipeline(
-      "opening",
-      () => api.openRecent({ path: libraryPath }),
-      t("toast.openRecentFailed"),
-      undefined,
-      recent?.name ?? null,
-    );
-  }
+  const recentLibrariesRef = useRef(recentLibraries);
+  recentLibrariesRef.current = recentLibraries;
+  const openRecentLibrary = useCallback(
+    async (libraryPath: string) => {
+      if (!api) return;
+      const recent = recentLibrariesRef.current.find(
+        (entry) => entry.path === libraryPath,
+      );
+      await runLibraryOpenPipeline(
+        "opening",
+        () => api.openRecent({ path: libraryPath }),
+        t("toast.openRecentFailed"),
+        undefined,
+        recent?.name ?? null,
+      );
+    },
+    // Stable identity: the native menu effect above subscribes once, and the
+    // pipeline reads live state through refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [api, runLibraryOpenPipeline],
+  );
 
   async function runLibraryOpenPipeline(
     busyState: "creating" | "opening",
@@ -4726,84 +5542,90 @@ function AppInner() {
 
   async function chooseFolder(
     scope: AssetScope,
-    options?: { refreshSidebar?: boolean; blockingNavigation?: boolean },
+    options?: {
+      refreshSidebar?: boolean;
+      blockingNavigation?: boolean;
+      navigation?: WorkspaceNavigationRequest;
+    },
   ) {
     if (!library) return;
+    const request = createWorkspaceNavigationRequest(options?.navigation);
+    if (!request.isCurrent()) return;
+    if (request.historyMode === "push") saveCurrentWorkspaceHistoryViewport();
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
-    // REQ-VIEW-004: leave the browse affiliate viewer when the browse scope changes.
-    await closeAssetPreview(false);
-    if (!isCurrentLibraryView(viewSession)) return;
-    closeContextMenu();
-    workspaceCanvasRef.current?.scrollTo({ top: 0, left: 0 });
-    setShowTrash(false);
-    setShowTagManagement(false);
-    setActivePluginSidebarViewId(null);
-    setAssetScope(scope);
-    if (scope !== "all" && scope !== "root") {
-        const enabled = isFolderRecursiveEnabled(
-        folderRecursivePrefs,
-        targetLibraryId,
-        scope,
-      );
-      folderRecursiveRef.current = enabled;
-      setFolderRecursive(enabled);
-    } else {
-      folderRecursiveRef.current = false;
-      setFolderRecursive(false);
-    }
-    clearAssetSelection();
-    setActiveTagId(null);
-    setActiveCollectionId(null);
-    setActiveSmartCollectionId(null);
-    clearDiscoveryControls();
-    setSearchTotal(null);
-    setSearchSnippets(new Map());
-    resetBrowsePagination();
-    setAssets([]);
     const folderId = scope === "all" || scope === "root" ? undefined : scope;
-    // 不做 folders 列表校验：新建文件夹后自动进入时，新文件夹尚未出现在
-    // folders state（异步刷新），校验会误伤并把导入目标降级为根目录。
-    // folderId 来源可信（创建结果/导航），loadContent 会处理无效值。
-    managedImportTargetFolderIdRef.current = folderId ?? undefined;
-    api?.setActiveContext(targetLibraryId, folderId);
-    setUiState("loading");
+    const recursive = request.browseState
+      ? request.browseState.folderRecursive
+      : scope !== "all" && scope !== "root"
+        ? isFolderRecursiveEnabled(folderRecursivePrefs, targetLibraryId, scope)
+        : false;
+    let commitPreparedContent: (() => void) | undefined;
     try {
+      // REQ-VIEW-004: leave the browse affiliate viewer when the browse scope changes.
+      await closeAssetPreview(false);
+      if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
       await loadContent({ ...library, libraryId: targetLibraryId }, scope, {
-        discovery: { sort: { field: sortField, order: sortOrder } },
+        showIgnored: request.browseState?.showIgnoredItems ?? showIgnoredItems,
+        folderRecursive: recursive,
+        discovery: request.browseState
+          ? queryDefinitionForWorkspaceBrowseState(request.browseState)
+          : { sort: { field: sortField, order: sortOrder } },
         // Ordinary navigation keeps sidebar queries out of the hot path for
         // large libraries. A destructive mutation that removed the current
         // folder opts in once so the deleted row cannot remain visible.
-        // Re-entering the library-wide/root scopes is also the explicit
-        // refresh boundary for organization changes made through another
-        // window, an extension, or the test bridge. Folder-to-folder
-        // navigation remains cheap for giant libraries, while returning to a
-        // top-level scope cannot leave a newly-created collection hidden.
-        // Re-entering the current folder is also a mutation refresh boundary.
-        // This matters after creating a child folder: the create request may
-        // still be hydrating the sidebar, and a same-scope click must not start
-        // the cheap navigation path that would cancel that refresh and leave
-        // the new folder invisible until a later navigation.
         refreshSidebar:
           options?.refreshSidebar ??
           (scope === "all" || scope === "root" || scope === assetScope),
         blockingLibraryLoad: options?.blockingNavigation,
+        navigationIsCurrent: request.isCurrent,
+        deferCommit: true,
+        onPrepared: (commit) => {
+          commitPreparedContent = commit;
+        },
       });
-      if (!isCurrentLibraryView(viewSession)) return;
+      if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
+      if (!commitPreparedContent) {
+        setWorkspaceNavigationPending(false);
+        return;
+      }
+
+      // Commit the prepared browse page and its route in one React batch. The
+      // old committed canvas remains untouched while Worker reads are pending.
+      resetBrowsePaginationPreservingVisibleLayout();
+      commitPreparedContent();
+      applyWorkspaceTabBrowseStateForNavigation(request);
+      closeContextMenu();
+      setShowTrash(false);
+      setShowTagManagement(false);
+      setActivePluginSidebarViewId(null);
+      setAssetScope(scope);
+      folderRecursiveRef.current = recursive;
+      setFolderRecursive(recursive);
+      clearAssetSelection();
+      setActiveTagId(null);
+      setActiveCollectionId(null);
+      setActiveSmartCollectionId(null);
+      if (!request.browseState) clearDiscoveryControls();
+      managedImportTargetFolderIdRef.current = folderId;
+      api?.setActiveContext(targetLibraryId, folderId);
+      setUiState("ready");
       recordNavigation(
         scope === "all"
           ? { kind: "all" }
           : scope === "root"
             ? { kind: "root" }
             : { kind: "folder", folderId: scope },
+        request,
       );
+      if (!request.deferReveal) finishWorkspaceNavigation(request);
     } catch (caught) {
-      if (isCurrentLibraryView(viewSession)) {
+      if (request.isCurrent() && isCurrentLibraryView(viewSession)) {
         setError(toMessage(caught, t("toast.readAssetsFailed"), locale));
+        setWorkspaceNavigationPending(false);
+        setUiState("ready");
       }
-    } finally {
-      if (isCurrentLibraryView(viewSession)) setUiState("ready");
     }
   }
   chooseFolderRef.current = chooseFolder;
@@ -4812,108 +5634,146 @@ function AppInner() {
     await enterTrashAt(null);
   }
 
-  async function enterTrashAt(tombstoneId: string | null) {
+  async function enterTrashAt(
+    tombstoneId: string | null,
+    navigation?: WorkspaceNavigationRequest,
+  ) {
     if (!library) return;
+    const request = createWorkspaceNavigationRequest(navigation);
+    if (!request.isCurrent()) return;
+    if (request.historyMode === "push") saveCurrentWorkspaceHistoryViewport();
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
-    managedImportTargetFolderIdRef.current = undefined;
     await closeAssetPreview(false);
-    if (!isCurrentLibraryView(viewSession)) return;
-    workspaceCanvasRef.current?.scrollTo({ top: 0, left: 0 });
-    if (showTrash) {
+    if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
+    if (showTrash && !request.deferReveal) {
+      managedImportTargetFolderIdRef.current = undefined;
       setTrashBrowseTombstoneId(tombstoneId);
       clearAssetSelection();
-      if (!suppressNavHistoryRef.current) {
-        recordNavigation({ kind: "trash", tombstoneId });
-      }
+      recordNavigation({ kind: "trash", tombstoneId }, request);
+      if (!request.deferReveal) finishWorkspaceNavigation(request);
       return;
     }
-    setShowTrash(true);
-    setTrashBrowseTombstoneId(tombstoneId);
-    setShowTagManagement(false);
-    setActivePluginSidebarViewId(null);
-    setActiveTagId(null);
-    setActiveCollectionId(null);
-    setActiveSmartCollectionId(null);
-    setSearchTotal(null);
-    setSearchSnippets(new Map());
-    resetBrowsePagination();
-    setTrashedAssets([]);
-    clearAssetSelection();
-    setAssetScope("all");
-    clearDiscoveryControls();
-    api?.setActiveContext(targetLibraryId);
-    setUiState("loading");
+    let commitPreparedContent: (() => void) | undefined;
     try {
+      managedImportTargetFolderIdRef.current = undefined;
       await loadContent({ ...library, libraryId: targetLibraryId }, "all", {
         trashMode: true,
+        showIgnored: request.browseState?.showIgnoredItems ?? showIgnoredItems,
         // Trash browse renders folder tombstone cards from the sidebar query;
         // unlike ordinary folder navigation, this transition must refresh
         // that list after a destructive mutation.
         refreshSidebar: true,
+        ...(request.browseState
+          ? { discovery: queryDefinitionForWorkspaceBrowseState(request.browseState) }
+          : {}),
+        navigationIsCurrent: request.isCurrent,
+        deferCommit: true,
+        onPrepared: (commit) => {
+          commitPreparedContent = commit;
+        },
       });
-      if (!isCurrentLibraryView(viewSession)) return;
-      recordNavigation({ kind: "trash", tombstoneId });
-    } catch (caught) {
-      if (isCurrentLibraryView(viewSession)) {
-        setError(toMessage(caught, t("toast.readTrashFailed"), locale));
+      if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
+      if (!commitPreparedContent) {
+        setWorkspaceNavigationPending(false);
+        return;
       }
-    } finally {
-      if (isCurrentLibraryView(viewSession)) setUiState("ready");
+      resetBrowsePaginationPreservingVisibleLayout();
+      commitPreparedContent();
+      applyWorkspaceTabBrowseStateForNavigation(request);
+      setShowTrash(true);
+      setTrashBrowseTombstoneId(tombstoneId);
+      setShowTagManagement(false);
+      setActivePluginSidebarViewId(null);
+      setActiveTagId(null);
+      setActiveCollectionId(null);
+      setActiveSmartCollectionId(null);
+      if (!request.browseState) {
+        setSearchTotal(null);
+        setSearchSnippets(new Map());
+        clearDiscoveryControls();
+      }
+      clearAssetSelection();
+      setAssetScope("all");
+      api?.setActiveContext(targetLibraryId);
+      setUiState("ready");
+      recordNavigation({ kind: "trash", tombstoneId }, request);
+      if (!request.deferReveal) finishWorkspaceNavigation(request);
+    } catch (caught) {
+      if (request.isCurrent() && isCurrentLibraryView(viewSession)) {
+        setError(toMessage(caught, t("toast.readTrashFailed"), locale));
+        setWorkspaceNavigationPending(false);
+        setUiState("ready");
+      }
     }
   }
 
-  async function enterTagManagement() {
+  async function enterTagManagement(navigation?: WorkspaceNavigationRequest) {
     if (!library) return;
+    const request = createWorkspaceNavigationRequest(navigation);
+    if (!request.isCurrent()) return;
+    if (request.historyMode === "push") saveCurrentWorkspaceHistoryViewport();
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
-    managedImportTargetFolderIdRef.current = undefined;
-    await closeAssetPreview(false);
-    if (!isCurrentLibraryView(viewSession)) return;
-    closeContextMenu();
-    workspaceCanvasRef.current?.scrollTo({ top: 0, left: 0 });
-    setShowTagManagement(true);
-    setActivePluginSidebarViewId(null);
-    setShowTrash(false);
-    setActiveTagId(null);
-    setActiveCollectionId(null);
-    setActiveSmartCollectionId(null);
-    setAssetScope("all");
-    clearAssetSelection();
-    clearDiscoveryControls();
-    setSearchTotal(null);
-    setSearchSnippets(new Map());
-    api?.setActiveContext(targetLibraryId);
-    setUiState("loading");
     try {
-      if (!api) return;
+      await closeAssetPreview(false);
+      if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
+      if (!api) {
+        setWorkspaceNavigationPending(false);
+        return;
+      }
       const tagResult = await api.listTags({ libraryId: targetLibraryId });
       if (!tagResult.ok) throw new LibraryOperationError(tagResult.error);
-      if (!isCurrentLibraryView(viewSession)) return;
+      if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
+      managedImportTargetFolderIdRef.current = undefined;
+      closeContextMenu();
       setTags(tagResult.value);
-      // Serpent-b7e173：进入标签管理注册历史状态（apply 回放时被 suppress）。
-      recordNavigation({ kind: "tag-management" });
+      applyWorkspaceTabBrowseStateForNavigation(request);
+      setShowTagManagement(true);
+      setActivePluginSidebarViewId(null);
+      setShowTrash(false);
+      setActiveTagId(null);
+      setActiveCollectionId(null);
+      setActiveSmartCollectionId(null);
+      setAssetScope("all");
+      clearAssetSelection();
+      if (!request.browseState) {
+        clearDiscoveryControls();
+        setSearchTotal(null);
+        setSearchSnippets(new Map());
+      }
+      api.setActiveContext(targetLibraryId);
+      setUiState("ready");
+      recordNavigation({ kind: "tag-management" }, request);
+      if (!request.deferReveal) finishWorkspaceNavigation(request);
     } catch (caught) {
-      if (isCurrentLibraryView(viewSession)) {
+      if (request.isCurrent() && isCurrentLibraryView(viewSession)) {
         setError(toMessage(caught, t("toast.readTagAssetsFailed"), locale));
+        if (request.deferReveal) setWorkspaceNavigationPending(false);
       }
     } finally {
-      if (isCurrentLibraryView(viewSession)) setUiState("ready");
+      if (request.isCurrent() && isCurrentLibraryView(viewSession)) setUiState("ready");
     }
   }
 
-  async function enterPluginSidebarView(viewId: string) {
+  async function enterPluginSidebarView(
+    viewId: string,
+    navigation?: WorkspaceNavigationRequest,
+  ) {
     if (!library) return;
+    const request = createWorkspaceNavigationRequest(navigation);
+    if (!request.isCurrent()) return;
+    if (request.historyMode === "push") saveCurrentWorkspaceHistoryViewport();
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
-    managedImportTargetFolderIdRef.current = undefined;
     await closeAssetPreview(false);
-    if (!isCurrentLibraryView(viewSession)) return;
+    if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
+    managedImportTargetFolderIdRef.current = undefined;
     closeContextMenu();
-    workspaceCanvasRef.current?.scrollTo({ top: 0, left: 0 });
+    applyWorkspaceTabBrowseStateForNavigation(request);
     setShowTrash(false);
     setShowTagManagement(false);
     setActivePluginSidebarViewId(viewId);
@@ -4922,10 +5782,14 @@ function AppInner() {
     setActiveTagId(null);
     setActiveCollectionId(null);
     setActiveSmartCollectionId(null);
-    clearDiscoveryControls();
-    setSearchTotal(null);
-    setSearchSnippets(new Map());
+    if (!request.browseState) {
+      clearDiscoveryControls();
+      setSearchTotal(null);
+      setSearchSnippets(new Map());
+    }
     api?.setActiveContext(targetLibraryId);
+    recordNavigation({ kind: "plugin-sidebar", viewId }, request);
+    if (!request.deferReveal) finishWorkspaceNavigation(request);
   }
 
   async function handleCreateTagInManagement(name: string): Promise<boolean> {
@@ -5030,35 +5894,22 @@ function AppInner() {
     match: "all" | "any",
   ) {
     if (!api || !library || tagNames.length === 0) return;
+    const request = beginWorkspaceNavigationRequest("push");
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
     managedImportTargetFolderIdRef.current = undefined;
+    saveCurrentWorkspaceHistoryViewport();
     await closeAssetPreview(false);
-    if (!isCurrentLibraryView(viewSession)) return;
-    closeContextMenu();
+    if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
     const joined = tagNames.join(", ");
-    workspaceCanvasRef.current?.scrollTo({ top: 0, left: 0 });
-    setShowTrash(false);
-    setShowTagManagement(false);
-    setActivePluginSidebarViewId(null);
-    setActiveTagId(null);
-    setActiveCollectionId(null);
-    setActiveSmartCollectionId(null);
-    setAssetScope("all");
-    clearAssetSelection();
-    setTagFilter(joined);
-    setTagFilterMatch(match);
-    setSearchOffset(0);
-    api.setActiveContext(targetLibraryId);
-    resetBrowsePagination();
-    setAssets([]);
-    setUiState("loading");
     try {
       const definition = currentQueryDefinition({
         tagFilter: joined,
         tagFilterMatch: match,
       });
+      const includeIgnored =
+        request.browseState?.showIgnoredItems ?? showIgnoredItems;
       const result = await api.openBrowseSession({
         libraryId: targetLibraryId,
         query: definition.search ?? null,
@@ -5066,10 +5917,25 @@ function AppInner() {
         sort: definition.sort,
         // Serpent-87pd: first window only; scrollbar jumps fetch other offsets.
         limit: BROWSE_PAGE_SIZE,
-        showIgnored: showIgnoredItems,
+        showIgnored: includeIgnored,
       });
       if (!result.ok) throw new LibraryOperationError(result.error);
-      if (!isCurrentLibraryView(viewSession)) return;
+      if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
+      closeContextMenu();
+      resetBrowsePaginationPreservingVisibleLayout();
+      skipDiscoveryReloadSignatureRef.current = JSON.stringify(definition);
+      setShowTrash(false);
+      setShowTagManagement(false);
+      setActivePluginSidebarViewId(null);
+      setActiveTagId(null);
+      setActiveCollectionId(null);
+      setActiveSmartCollectionId(null);
+      setAssetScope("all");
+      clearAssetSelection();
+      setTagFilter(joined);
+      setTagFilterMatch(match);
+      setSearchOffset(0);
+      api.setActiveContext(targetLibraryId);
       applySearchResult(result.value);
       registerBrowseSearchPage(beginBrowsePage, {
         libraryId: targetLibraryId,
@@ -5077,7 +5943,7 @@ function AppInner() {
         filters: definition.filters,
         sort: definition.sort,
         scope: null,
-        showIgnored: showIgnoredItems,
+        showIgnored: includeIgnored,
         target: "assets",
         items: result.value.items,
         total: result.value.total,
@@ -5085,44 +5951,42 @@ function AppInner() {
         sessionId: result.value.sessionId,
         snippets: result.value.snippets,
       });
+      recordNavigation({ kind: "all" }, request);
+      finishWorkspaceNavigation(request);
     } catch (caught) {
-      if (isCurrentLibraryView(viewSession)) {
+      if (request.isCurrent() && isCurrentLibraryView(viewSession)) {
         setError(toMessage(caught, t("toast.readTagAssetsFailed"), locale));
+        setWorkspaceNavigationPending(false);
       }
     } finally {
-      if (isCurrentLibraryView(viewSession)) setUiState("ready");
+      if (request.isCurrent() && isCurrentLibraryView(viewSession)) setUiState("ready");
     }
   }
 
-  async function chooseTag(tagId: string) {
+  async function chooseTag(
+    tagId: string,
+    navigation?: WorkspaceNavigationRequest,
+  ) {
     if (!api || !library) return;
+    const request = createWorkspaceNavigationRequest(navigation);
+    if (!request.isCurrent()) return;
+    if (request.historyMode === "push") saveCurrentWorkspaceHistoryViewport();
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
-    managedImportTargetFolderIdRef.current = undefined;
     await closeAssetPreview(false);
-    if (!isCurrentLibraryView(viewSession)) return;
-    closeContextMenu();
+    if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
     const tag = tags.find((candidate) => candidate.tagId === tagId);
-    if (!tag) return;
-    workspaceCanvasRef.current?.scrollTo({ top: 0, left: 0 });
-    setShowTrash(false);
-    setShowTagManagement(false);
-    setActivePluginSidebarViewId(null);
-    setActiveTagId(tagId);
-    setActiveCollectionId(null);
-    setActiveSmartCollectionId(null);
-    setAssetScope("all");
-    clearAssetSelection();
-    setTagFilter(tag.name);
-    setTagFilterMatch("any");
-    setSearchOffset(0);
-    api.setActiveContext(library.libraryId);
-    resetBrowsePagination();
-    setAssets([]);
-    setUiState("loading");
+    if (!tag) {
+      setWorkspaceNavigationPending(false);
+      return;
+    }
     try {
-      const definition = currentQueryDefinition({ tagFilter: tag.name });
+      const definition = request.browseState
+        ? queryDefinitionForWorkspaceBrowseState(request.browseState)
+        : currentQueryDefinition({ tagFilter: tag.name });
+      const includeIgnored =
+        request.browseState?.showIgnoredItems ?? showIgnoredItems;
       const result = await api.openBrowseSession({
         libraryId: targetLibraryId,
         query: definition.search ?? null,
@@ -5130,10 +5994,31 @@ function AppInner() {
         sort: definition.sort,
         // Serpent-87pd: first window only; scrollbar jumps fetch other offsets.
         limit: BROWSE_PAGE_SIZE,
-        showIgnored: showIgnoredItems,
+        showIgnored: includeIgnored,
       });
       if (!result.ok) throw new LibraryOperationError(result.error);
-      if (!isCurrentLibraryView(viewSession)) return;
+      if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
+      managedImportTargetFolderIdRef.current = undefined;
+      closeContextMenu();
+      resetBrowsePaginationPreservingVisibleLayout();
+      if (!request.browseState) {
+        skipDiscoveryReloadSignatureRef.current = JSON.stringify(definition);
+      }
+      applyWorkspaceTabBrowseStateForNavigation(request);
+      setShowTrash(false);
+      setShowTagManagement(false);
+      setActivePluginSidebarViewId(null);
+      setActiveTagId(tagId);
+      setActiveCollectionId(null);
+      setActiveSmartCollectionId(null);
+      setAssetScope("all");
+      clearAssetSelection();
+      if (!request.browseState) {
+        setTagFilter(tag.name);
+        setTagFilterMatch("any");
+      }
+      setSearchOffset(0);
+      api.setActiveContext(targetLibraryId);
       applySearchResult(result.value);
       registerBrowseSearchPage(beginBrowsePage, {
         libraryId: targetLibraryId,
@@ -5141,7 +6026,7 @@ function AppInner() {
         filters: definition.filters,
         sort: definition.sort,
         scope: null,
-        showIgnored: showIgnoredItems,
+        showIgnored: includeIgnored,
         target: "assets",
         items: result.value.items,
         total: result.value.total,
@@ -5149,13 +6034,15 @@ function AppInner() {
         sessionId: result.value.sessionId,
         snippets: result.value.snippets,
       });
-      recordNavigation({ kind: "tag", tagId });
+      setUiState("ready");
+      recordNavigation({ kind: "tag", tagId }, request);
+      if (!request.deferReveal) finishWorkspaceNavigation(request);
     } catch (caught) {
-      if (isCurrentLibraryView(viewSession)) {
+      if (request.isCurrent() && isCurrentLibraryView(viewSession)) {
         setError(toMessage(caught, t("toast.readTagAssetsFailed"), locale));
+        setWorkspaceNavigationPending(false);
+        setUiState("ready");
       }
-    } finally {
-      if (isCurrentLibraryView(viewSession)) setUiState("ready");
     }
   }
 
@@ -5604,52 +6491,68 @@ function AppInner() {
   async function chooseCollection(
     collectionId: string,
     recursive = collectionRecursive,
+    navigation?: WorkspaceNavigationRequest,
   ) {
     if (!api || !library) return;
+    const request = createWorkspaceNavigationRequest(navigation);
+    if (!request.isCurrent()) return;
+    if (request.historyMode === "push") saveCurrentWorkspaceHistoryViewport();
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
-    managedImportTargetFolderIdRef.current = undefined;
     await closeAssetPreview(false);
-    if (!isCurrentLibraryView(viewSession)) return;
-    closeContextMenu();
-    workspaceCanvasRef.current?.scrollTo({ top: 0, left: 0 });
-    setShowTrash(false);
-    setShowTagManagement(false);
-    setActivePluginSidebarViewId(null);
-    setActiveCollectionId(collectionId);
-    setActiveTagId(null);
-    setActiveSmartCollectionId(null);
-    setAssetScope("all");
-    clearAssetSelection();
-    clearDiscoveryControls();
-    api?.setActiveContext(targetLibraryId);
-    resetBrowsePagination();
-    setAssets([]);
-    setUiState("loading");
+    if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
+    if (request.browseState) {
+      recursive = request.browseState.collectionRecursive;
+    }
     try {
+      const definition = request.browseState
+        ? queryDefinitionForWorkspaceBrowseState(request.browseState)
+        : null;
+      const includeIgnored =
+        request.browseState?.showIgnoredItems ?? showIgnoredItems;
       const result = await api.openBrowseSession({
         libraryId: targetLibraryId,
-        query: null,
+        query: definition?.search ?? null,
+        ...(definition?.filters ? { filters: definition.filters } : {}),
         scope: {
           kind: "collection",
           collectionId,
           recursive,
         },
+        ...(definition?.sort ? { sort: definition.sort } : {}),
         // Serpent-87pd: first window only; scrollbar jumps fetch other offsets.
         limit: BROWSE_PAGE_SIZE,
-        showIgnored: showIgnoredItems,
+        showIgnored: includeIgnored,
       });
       if (!result.ok) throw new LibraryOperationError(result.error);
-      if (!isCurrentLibraryView(viewSession)) return;
+      if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
+      managedImportTargetFolderIdRef.current = undefined;
+      closeContextMenu();
+      resetBrowsePaginationPreservingVisibleLayout();
+      applyWorkspaceTabBrowseStateForNavigation(request);
+      setShowTrash(false);
+      setShowTagManagement(false);
+      setActivePluginSidebarViewId(null);
+      setActiveCollectionId(collectionId);
+      setActiveTagId(null);
+      setActiveSmartCollectionId(null);
+      setAssetScope("all");
+      if (request.browseState) {
+        collectionRecursiveRef.current = request.browseState.collectionRecursive;
+        setCollectionRecursive(request.browseState.collectionRecursive);
+      }
+      clearAssetSelection();
+      if (!request.browseState) clearDiscoveryControls();
+      api.setActiveContext(targetLibraryId);
       applySearchResult(result.value);
       registerBrowseSearchPage(beginBrowsePage, {
         libraryId: targetLibraryId,
-        query: null,
+        query: definition?.search ?? null,
         scope: { kind: "collection", collectionId, recursive },
-        sort: null,
-        filters: null,
-        showIgnored: showIgnoredItems,
+        sort: definition?.sort ?? null,
+        filters: definition?.filters ?? null,
+        showIgnored: includeIgnored,
         target: "assets",
         items: result.value.items,
         total: result.value.total,
@@ -5661,13 +6564,14 @@ function AppInner() {
         kind: "collection",
         collectionId,
         recursive,
-      });
+      }, request);
+      if (!request.deferReveal) finishWorkspaceNavigation(request);
     } catch (caught) {
-      if (isCurrentLibraryView(viewSession)) {
+      if (request.isCurrent() && isCurrentLibraryView(viewSession)) {
         setError(toMessage(caught, t("toast.readCollectionFailed"), locale));
+        setWorkspaceNavigationPending(false);
+        setUiState("ready");
       }
-    } finally {
-      if (isCurrentLibraryView(viewSession)) setUiState("ready");
     }
   }
 
@@ -5799,6 +6703,7 @@ function AppInner() {
       widthRange,
       heightRange,
       aspectRatioRange,
+      aspectRatioRanges,
       longEdgeRange,
       durationRange,
     };
@@ -5898,14 +6803,16 @@ function AppInner() {
     ];
     const aspectInputs =
       overrides.filtersSnapshot
-        ? (
-          filtersState.aspectRatioRange.min || filtersState.aspectRatioRange.max
-            ? [{
-              min: filtersState.aspectRatioRange.min,
-              max: filtersState.aspectRatioRange.max,
-            }]
-            : []
-        )
+        ? filtersState.aspectRatioRanges.length > 0
+          ? filtersState.aspectRatioRanges
+          : (
+            filtersState.aspectRatioRange.min || filtersState.aspectRatioRange.max
+              ? [{
+                min: filtersState.aspectRatioRange.min,
+                max: filtersState.aspectRatioRange.max,
+              }]
+              : []
+          )
         : aspectRatioRanges.length > 0
           ? aspectRatioRanges
           : aspectRatioRange.min || aspectRatioRange.max
@@ -5947,6 +6854,39 @@ function AppInner() {
         order: overrides.sortOrder ?? sortOrder,
       },
     };
+  }
+
+  function queryDefinitionForWorkspaceBrowseState(
+    state: WorkspaceTabBrowseState,
+  ): SearchDefinition {
+    return currentQueryDefinition({
+      searchValue: state.searchValue,
+      colorFilter: state.filters.colorFilter,
+      excludeColorFilter: state.filters.excludeColorFilter,
+      sortField: state.sortField,
+      sortOrder: state.sortOrder,
+      filtersSnapshot: {
+        formatFilter: state.filters.formatFilter,
+        excludeFormatFilter: state.filters.excludeFormatFilter,
+        tagFilter: state.filters.tagFilter,
+        excludeTagFilter: state.filters.excludeTagFilter,
+        includeAiTagFilter: state.filters.includeAiTagFilter,
+        tagFilterMatch: state.filters.tagFilterMatch,
+        ratingFilter: state.filters.ratingFilter,
+        excludeRatingFilter: state.filters.excludeRatingFilter,
+        includeAiRatingFilter: state.filters.includeAiRatingFilter,
+        favoriteFilter: state.filters.favoriteFilter,
+        sourceUrlFilter: state.filters.sourceUrlFilter,
+        availabilityFilter: state.filters.availabilityFilter,
+        excludeAvailabilityFilter: state.filters.excludeAvailabilityFilter,
+        widthRange: state.filters.widthRange,
+        heightRange: state.filters.heightRange,
+        aspectRatioRange: state.filters.aspectRatioRange,
+        aspectRatioRanges: state.filters.aspectRatioRanges,
+        longEdgeRange: state.filters.longEdgeRange,
+        durationRange: state.filters.durationRange,
+      },
+    });
   }
 
   function applySearchResult(
@@ -6191,7 +7131,7 @@ function AppInner() {
     if (!result.ok) {
       setImageSequenceDialog((current) =>
         current
-          ? { ...current, submitting: false, error: result.error.message }
+          ? { ...current, submitting: false, error: messageForPublicError(result.error, locale) }
           : current,
       );
       return;
@@ -6223,7 +7163,7 @@ function AppInner() {
     if (!result.ok) {
       setImageSequenceDialog((current) =>
         current
-          ? { ...current, submitting: false, error: result.error.message }
+          ? { ...current, submitting: false, error: messageForPublicError(result.error, locale) }
           : current,
       );
       return;
@@ -6239,7 +7179,7 @@ function AppInner() {
       sequenceId,
     });
     if (!result.ok) {
-      setError(result.error.message);
+      setError(messageForPublicError(result.error, locale));
       return;
     }
     clearAssetSelection();
@@ -6253,7 +7193,7 @@ function AppInner() {
       sequenceIds,
     });
     if (!result.ok) {
-      setError(result.error.message);
+      setError(messageForPublicError(result.error, locale));
       return;
     }
     clearAssetSelection();
@@ -6678,48 +7618,91 @@ function AppInner() {
     deleteCollection: requestDeleteCollection,
   });
 
-  async function executeSearchDefinition(definition: SearchDefinition) {
+  async function executeSearchDefinition(
+    definition: SearchDefinition,
+    navigation?: WorkspaceNavigationRequest,
+  ) {
     if (!api || !library) return;
+    const request = createWorkspaceNavigationRequest(navigation, "none");
+    if (!request.isCurrent()) return;
+    const targetLibraryId = library.libraryId;
+    const viewSession = ensureLibraryView(targetLibraryId);
+    if (!viewSession) return;
     const requestGeneration = ++searchRequestGenerationRef.current;
+    const includeIgnored =
+      request.browseState?.showIgnoredItems ?? showIgnoredItems;
     // Resolve once so the first page and every subsequent page use exactly
     // the same scope even if sidebar state changes while the request is live.
-    const searchScope = currentSearchScope(definition.search !== undefined);
+    const searchScope = activeSmartCollectionId
+      ? undefined
+      : currentSearchScope(definition.search !== undefined);
     const result = await api.openBrowseSession({
-      libraryId: library.libraryId,
+      libraryId: targetLibraryId,
       query: definition.search ?? null,
       filters: definition.filters,
       scope: searchScope,
+      ...(activeSmartCollectionId
+        ? { smartCollectionId: activeSmartCollectionId }
+        : {}),
       sort: definition.sort,
       // Serpent-87pd: first window only; scrollbar jumps fetch other offsets.
       limit: BROWSE_PAGE_SIZE,
-      showIgnored: showIgnoredItems,
+      showIgnored: includeIgnored,
     });
     if (!result.ok) throw new LibraryOperationError(result.error);
-    if (requestGeneration !== searchRequestGenerationRef.current) return;
+    if (
+      !request.isCurrent() ||
+      !isCurrentLibraryView(viewSession) ||
+      requestGeneration !== searchRequestGenerationRef.current
+    ) return;
+    resetBrowsePaginationPreservingVisibleLayout();
     setShowTrash(false);
     setShowTagManagement(false);
     setActivePluginSidebarViewId(null);
     if (!tagFilter.trim()) setActiveTagId(null);
     setActiveSmartCollectionId(null);
-    if (!pendingRevealRef.current) {
-      clearAssetSelection({ preserveFolders: true });
+    const pendingTabSelection = pendingWorkspaceTabSelectionRef.current;
+    if (pendingTabSelection?.isCurrent()) {
+      setSelectedAssetIds([...pendingTabSelection.selectedAssetIds]);
+      setSelectedAssetId(pendingTabSelection.selectedAssetId ?? undefined);
+      selectionAnchorRef.current = pendingTabSelection.selectedAssetId;
+      pendingWorkspaceTabSelectionRef.current = null;
+    } else {
+      if (pendingTabSelection) pendingWorkspaceTabSelectionRef.current = null;
+      if (!pendingRevealRef.current) {
+        clearAssetSelection({ preserveFolders: true });
+      }
     }
     applySearchResult(result.value);
     // Serpent-ws4k: subsequent pages must reuse the same query/scope/sort.
-    registerBrowseSearchPage(beginBrowsePage, {
-      libraryId: library.libraryId,
-      query: definition.search ?? null,
-      filters: definition.filters,
-      scope: searchScope,
-      sort: definition.sort,
-      showIgnored: showIgnoredItems,
-      sessionId: result.value.sessionId,
-      target: "assets",
-      items: result.value.items,
-      total: result.value.total,
-      offset: result.value.offset,
-      snippets: result.value.snippets,
-    });
+    if (activeSmartCollectionId) {
+      registerBrowseSmartCollectionPage(beginBrowsePage, {
+        libraryId: targetLibraryId,
+        collectionId: activeSmartCollectionId,
+        sessionId: result.value.sessionId,
+        items: result.value.items,
+        total: result.value.total,
+        offset: result.value.offset,
+        snippets: result.value.snippets,
+      });
+      setUiState("ready");
+    } else {
+      registerBrowseSearchPage(beginBrowsePage, {
+        libraryId: targetLibraryId,
+        query: definition.search ?? null,
+        filters: definition.filters,
+        scope: searchScope,
+        sort: definition.sort,
+        showIgnored: includeIgnored,
+        sessionId: result.value.sessionId,
+        target: "assets",
+        items: result.value.items,
+        total: result.value.total,
+        offset: result.value.offset,
+        snippets: result.value.snippets,
+      });
+    }
+    if (!request.deferReveal) finishWorkspaceNavigation(request);
     return result.value;
   }
 
@@ -6729,17 +7712,24 @@ function AppInner() {
   ) {
     event?.preventDefault();
     if (!api || !library) return;
-    await closeAssetPreview(false);
+    const request = beginWorkspaceNavigationRequest("none");
     try {
+      await closeAssetPreview(false);
+      if (!request.isCurrent()) return;
       const definition = currentQueryDefinition();
-      const result = await executeSearchDefinition(definition);
+      const result = await executeSearchDefinition(definition, request);
       // Serpent-huvw: discovery debounce / reload must not toast "搜索完成"
       // and wipe AI completion / error toasts.
       if (result && !opts?.silent) {
         setNotice(t("toast.searchDone", { total: result.total }));
       }
     } catch (caught) {
-      setError(toMessage(caught, t("toast.searchFailed"), locale));
+      if (request.isCurrent()) {
+        setError(toMessage(caught, t("toast.searchFailed"), locale));
+        setWorkspaceNavigationPending(false);
+      }
+    } finally {
+      if (request.isCurrent()) setUiState("ready");
     }
   }
 
@@ -6767,6 +7757,14 @@ function AppInner() {
       sortField !== "name" ||
       sortOrder !== "asc",
     );
+    const skippedSignature = skipDiscoveryReloadSignatureRef.current;
+    if (skippedSignature !== null) {
+      skipDiscoveryReloadSignatureRef.current = null;
+      if (skippedSignature === JSON.stringify(currentQueryDefinition())) {
+        hadDiscoveryInput.current = hasDiscoveryInput;
+        return;
+      }
+    }
     const shouldClearPreviousResults =
       hadDiscoveryInput.current && !hasDiscoveryInput;
     hadDiscoveryInput.current = hasDiscoveryInput;
@@ -6819,37 +7817,50 @@ function AppInner() {
     sortOrder,
   ]);
 
-  async function chooseSmartCollection(collectionId: string) {
+  async function chooseSmartCollection(
+    collectionId: string,
+    navigation?: WorkspaceNavigationRequest,
+  ) {
     if (!api || !library) return;
+    const request = createWorkspaceNavigationRequest(navigation);
+    if (!request.isCurrent()) return;
+    if (request.historyMode === "push") saveCurrentWorkspaceHistoryViewport();
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
-    managedImportTargetFolderIdRef.current = undefined;
     await closeAssetPreview(false);
-    if (!isCurrentLibraryView(viewSession)) return;
-    closeContextMenu();
-    workspaceCanvasRef.current?.scrollTo({ top: 0, left: 0 });
-    resetBrowsePagination();
-    setAssets([]);
+    if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
     try {
+      const definition = request.browseState
+        ? queryDefinitionForWorkspaceBrowseState(request.browseState)
+        : null;
+      const includeIgnored =
+        request.browseState?.showIgnoredItems ?? showIgnoredItems;
       const result = await api.openBrowseSession({
         libraryId: targetLibraryId,
-        query: null,
+        query: definition?.search ?? null,
+        ...(definition?.filters ? { filters: definition.filters } : {}),
         smartCollectionId: collectionId,
+        ...(definition?.sort ? { sort: definition.sort } : {}),
         limit: BROWSE_PAGE_SIZE,
+        showIgnored: includeIgnored,
       });
       if (!result.ok) throw new LibraryOperationError(result.error);
-      if (!isCurrentLibraryView(viewSession)) return;
+      if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
+      managedImportTargetFolderIdRef.current = undefined;
+      closeContextMenu();
+      resetBrowsePaginationPreservingVisibleLayout();
+      applyWorkspaceTabBrowseStateForNavigation(request);
       setShowTrash(false);
       setShowTagManagement(false);
-    setActivePluginSidebarViewId(null);
+      setActivePluginSidebarViewId(null);
       setActiveTagId(null);
       setActiveCollectionId(null);
       setActiveSmartCollectionId(collectionId);
       setAssetScope("all");
       clearAssetSelection();
-      clearDiscoveryControls();
-      recordNavigation({ kind: "smart-collection", collectionId });
+      if (!request.browseState) clearDiscoveryControls();
+      api.setActiveContext(targetLibraryId);
       setSmartCollections((current) =>
         current.map((collection) =>
           collection.collectionId === collectionId
@@ -6867,10 +7878,16 @@ function AppInner() {
         offset: result.value.offset,
         snippets: result.value.snippets,
       });
+      recordNavigation({ kind: "smart-collection", collectionId }, request);
+      if (!request.deferReveal) finishWorkspaceNavigation(request);
     } catch (caught) {
-      if (isCurrentLibraryView(viewSession)) {
+      if (request.isCurrent() && isCurrentLibraryView(viewSession)) {
         setError(toMessage(caught, t("toast.smartCollectionRunFailed"), locale));
+        setWorkspaceNavigationPending(false);
+        setUiState("ready");
       }
+    } finally {
+      if (request.isCurrent() && isCurrentLibraryView(viewSession)) setUiState("ready");
     }
   }
 
@@ -7187,11 +8204,16 @@ function AppInner() {
       if (!result.ok) throw new LibraryOperationError(result.error);
       completedImportIdRef.current = plan.importId;
       clearImportConflictsUi();
+      setImportProgress(null);
+      setLibraryTransferKind("import");
       setNotice(importSummaryMessage(result.value, locale));
       await revealAfterImport(result.value);
       playTaskCompletionSound(startedAt);
     } catch (caught) {
       playTaskCompletionSound(startedAt);
+      clearImportConflictsUi();
+      setImportProgress(null);
+      setLibraryTransferKind("import");
       const code =
         caught instanceof LibraryOperationError ? caught.code : "";
       if (
@@ -7246,11 +8268,17 @@ function AppInner() {
       if (!completion) return;
       completedImportIdRef.current = plan.importId;
       clearImportSourceFailureUi();
+      setImportProgress(null);
+      setLibraryTransferKind("import");
       setNotice(importSummaryMessage(completion, locale));
       await revealAfterImport(completion);
       playTaskCompletionSound(startedAt);
     } catch (caught) {
       playTaskCompletionSound(startedAt);
+      clearImportSourceFailureUi();
+      clearImportConflictsUi();
+      setImportProgress(null);
+      setLibraryTransferKind("import");
       const code =
         caught instanceof LibraryOperationError ? caught.code : "";
       if (
@@ -7338,6 +8366,8 @@ function AppInner() {
       const result = await api.refreshAssets({ libraryId: library.libraryId });
       if (!result.ok) throw new LibraryOperationError(result.error);
       await reloadCurrentContent();
+      const selected = selectedAssetIdRef.current;
+      if (selected) await refreshAfterAiRef.current(selected);
       setNotice(
         result.value.changedCount
           ? t("toast.diskSynced", { count: result.value.changedCount })
@@ -7352,7 +8382,7 @@ function AppInner() {
     }
   }
 
-  async function importFolderAsLinked() {
+  async function importFolderAsLinked(parentFolderId: string | null = null) {
     if (!api || !library) return;
     const startedAt = Date.now();
     setUiState("importing");
@@ -7362,6 +8392,9 @@ function AppInner() {
       const result = await api.importFolderAsLinked({
         libraryId: library.libraryId,
         displayName: undefined,
+        // Serpent-316493: null = library root (folder-section link button);
+        // a managed folder id hangs the link under that folder.
+        parentFolderId,
       });
       if (!result.ok) {
         if (result.error.code === "CANCELLED") return;
@@ -7566,6 +8599,9 @@ function AppInner() {
    */
   function clearLibraryScopedView() {
     cancelPendingLibraryReads();
+    cancelWorkspaceViewportRestoreRef.current?.();
+    cancelWorkspaceViewportRestoreRef.current = null;
+    setWorkspaceNavigationPending(false);
     localAssetRemovalGenerationRef.current += 1;
     if (deferredReconcileTimerRef.current !== undefined) {
       window.clearTimeout(deferredReconcileTimerRef.current);
@@ -7628,7 +8664,8 @@ function AppInner() {
     setImageSequenceImportError(null);
     setBatchRelinkPreview(null);
     resetBrowsePagination();
-    resetNavHistory({ kind: "all" });
+    workspaceHistoryReplayEpochRef.current += 1;
+    resetWorkspaceTabs();
   }
 
   function applyClosedLibraryUi() {
@@ -8513,13 +9550,27 @@ function AppInner() {
       setLibraryTransferName("");
       return;
     }
+    const importId = importProgress.importId;
     try {
       const result = await api.cancelLibraryImport({
-        importId: importProgress.importId,
+        importId,
       });
       if (!result.ok) throw new LibraryOperationError(result.error);
       setNotice(t("toast.cancellingImport"));
     } catch (caught) {
+      const code = caught instanceof LibraryOperationError ? caught.code : "";
+      if (
+        shouldSuppressImportContinueError({
+          code,
+          importId,
+          completedImportId: completedImportIdRef.current,
+          isInFlightRequest: true,
+        })
+      ) {
+        setImportProgress(null);
+        setLibraryTransferKind("import");
+        return;
+      }
       setError(toMessage(caught, t("toast.cancelImportFailed"), locale));
     }
   }
@@ -8839,7 +9890,8 @@ function AppInner() {
                 }),
               );
             }
-            // source === 'client' / 'content-replace' (or omitted): silent canvas refresh only.
+            // source === 'client' / 'content-replace' / 'sync' (or omitted): silent
+            // canvas + folder-tree refresh. `sync` is WebDAV replay; do not toast.
           } catch (caught) {
             if (isEffectLibraryCurrent()) {
               setError(toMessage(caught, t("toast.diskChangedRefreshFailed"), locale));
@@ -8937,19 +9989,23 @@ function AppInner() {
           setSyncProgress(null);
           const startedAt = syncRunStartedAtRef.current;
           syncRunStartedAtRef.current = null;
-          // 完成事件 filesDone=0（worker 不携带 report），只弹中性
-          // 「已同步」toast；仅当本次同步实际发生过传输（progress 曾
-          // 显示 filesTotal>0）才提示，空跑同步不打扰。
-          if (syncRunNotifiedRef.current) {
+          // 完成事件 filesDone=0（worker 不携带 report）。有实际传输时
+          // 播完成音并重拉 Inspector；卡片状态标识代替 toast。
+          const didNotify = syncRunNotifiedRef.current;
+          if (didNotify) {
             syncRunNotifiedRef.current = false;
             if (startedAt !== null) playTaskCompletionSound(startedAt);
-            setNotice(t("settings.sync.statusSynced"));
+          }
+          // 元数据回放可能不发 asset.changed，或选中项未变。F5 原先也不
+          // 重拉 Inspector；同步结束后补拉当前选中项标签/描述。
+          const selected = selectedAssetIdRef.current;
+          if (selected && didNotify) {
+            void refreshAfterAiRef.current(selected);
           }
         } else {
           setSyncProgress(event);
           if (event.filesTotal > 0 && !syncRunNotifiedRef.current) {
             syncRunNotifiedRef.current = true;
-            setNotice(t("settings.sync.statusSyncing"));
           }
         }
       } else if (event.type === "delete.progress") {
@@ -9536,9 +10592,9 @@ function AppInner() {
     const result = await api.getAiConfig();
     if (!result.ok) return;
     setAiApiFormat(
-      (result.value.apiFormat as AiApiFormat) ?? "dashscope_native",
+      (result.value.apiFormat as AiApiFormat) ?? DEFAULT_AI_API_FORMAT,
     );
-    setAiModel(result.value.model ?? "qwen3-vl-plus");
+    setAiModel(result.value.model ?? DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT]);
     setAiBaseUrl(result.value.baseUrl ?? "");
     setAiHasKey(result.value.hasKey);
     setAiDescriptionEnabled(result.value.enabledFields.description);
@@ -10381,8 +11437,14 @@ function AppInner() {
       }
       return undefined;
     };
-    return shellApi.onApplicationMenuCommand((command: ApplicationMenuCommand) => {
+    return shellApi.onApplicationMenuCommand(({ command, payload }) => {
       const currentMenuSections = mainMenuSectionsRef.current;
+      // Native 资源库 menu: open a recent library by path (same action the
+      // in-app library switcher performs).
+      if (command === "library.open-recent") {
+        if (payload) void openRecentLibrary(payload);
+        return;
+      }
       if (command === "settings") {
         currentMenuSections.find((section) => section.id === "settings")?.onSelect?.();
         return;
@@ -10395,7 +11457,7 @@ function AppInner() {
       // renders greyed out — a native macOS item stays clickable otherwise.
       if (item && !item.disabled) item.onSelect();
     });
-  }, [shellApi]);
+  }, [shellApi, openRecentLibrary]);
 
   useEffect(() => {
     if (!shellApi) return;
@@ -10507,6 +11569,8 @@ function AppInner() {
               entry.folderId,
               selectedFolderIds,
             );
+            // Serpent-374266: let the sidebar validate drop targets with it.
+            managedFolderDragIdsRef.current = [...folderIds];
             event.dataTransfer.setData(
               MANAGED_FOLDERS_DRAG_TYPE,
               JSON.stringify(folderIds),
@@ -10727,103 +11791,91 @@ function AppInner() {
             onClick={() => setLeftOpen((v) => !v)}
             pressed={leftOpen}
           />
+          <LibrarySwitcher
+            busy={busy}
+            disabled={!api}
+            portaled
+            syncStatus={syncBindingStatus}
+            importMenuCopy={importMenuCopy}
+            libraryName={library?.displayName ?? null}
+            libraryOpen={Boolean(library)}
+            onCloseLibrary={() => void closeLibrary()}
+            onRemoveLibrary={() => void removeLibrary()}
+            onDeleteLibraryFromDisk={() => requestDeleteLibraryFromDisk()}
+            onOpenLibrarySettings={() => {
+              setAppSettingsOpen(false);
+              setLibrarySettingsOpen(true);
+            }}
+            onCreateLibrary={() => {
+              setDialogValue(t("shell.myLibrary"));
+              setCreateLibraryPhase("form");
+              setDialog("library");
+            }}
+            onExportLibrary={() => setExportDialogOpen(true)}
+            onImportFolder={() => void importAssets("folder")}
+            onImportLibrary={() => {
+              setOpenLibraryChooserOpen(false);
+              setImportLibraryChooserOpen(true);
+            }}
+            onImportLinkedFolder={() => void importFolderAsLinked()}
+            onMenuOpen={() => void refreshRecentLibraries()}
+            onOpenLibrary={() => {
+              setImportLibraryChooserOpen(false);
+              setOpenLibraryChooserOpen(true);
+            }}
+            onOpenRecent={(path) => void openRecentLibrary(path)}
+            onForgetRecent={(path) => void forgetRecentLibrary(path)}
+            recentLibraries={recentLibraries}
+          />
         </div>
         <div className="toolbar-cluster toolbar-workspace-cluster">
           <div className="toolbar-workspace-main">
-            <ScopeHistoryButtons
-              // Serpent-b7e173：预览已是历史条目（打开查看器必压在某浏览 scope 上），
-              // 所以后退/前进由纯历史驱动即可，无需对预览做任何特判。
-              canBack={navHistoryUi.canBack}
-              canForward={navHistoryUi.canForward}
-              onBack={() => void goWorkspaceBack()}
-              onForward={() => void goWorkspaceForward()}
-            />
-            {IS_WINDOWS_PLATFORM ? (
-              <MainMenu disabled={busy} sections={mainMenuSections} />
-            ) : (
-              <AppSettingsEntry
-                disabled={busy}
-                onOpen={() => {
-                  setAppSettingsCategory("general");
-                  setAppSettingsOpen(true);
-                }}
+            <div className="toolbar-workspace-leading">
+              <ScopeHistoryButtons
+                // Serpent-b7e173：预览已是历史条目（打开查看器必压在某浏览 scope 上），
+                // 所以后退/前进由纯历史驱动即可，无需对预览做任何特判。
+                canBack={navHistoryUi.canBack}
+                canForward={navHistoryUi.canForward}
+                onBack={() => void goWorkspaceBack()}
+                onForward={() => void goWorkspaceForward()}
               />
-            )}
-            <LibrarySwitcher
-              busy={busy}
-              disabled={!api}
-              syncStatus={syncBindingStatus}
-              importMenuCopy={importMenuCopy}
-              libraryName={library?.displayName ?? null}
-              libraryOpen={Boolean(library)}
-              onCloseLibrary={() => void closeLibrary()}
-              onRemoveLibrary={() => void removeLibrary()}
-              onDeleteLibraryFromDisk={() => requestDeleteLibraryFromDisk()}
-              onOpenLibrarySettings={() => {
-                setAppSettingsOpen(false);
-                setLibrarySettingsOpen(true);
-              }}
-              onCreateLibrary={() => {
-                setDialogValue(t("shell.myLibrary"));
-                setCreateLibraryPhase("form");
-                setDialog("library");
-              }}
-              onExportLibrary={() => setExportDialogOpen(true)}
-              onImportFolder={() => void importAssets("folder")}
-              onImportLibrary={() => {
-                setOpenLibraryChooserOpen(false);
-                setImportLibraryChooserOpen(true);
-              }}
-              onImportLinkedFolder={() => void importFolderAsLinked()}
-              onMenuOpen={() => void refreshRecentLibraries()}
-              onOpenLibrary={() => {
-                setImportLibraryChooserOpen(false);
-                setOpenLibraryChooserOpen(true);
-              }}
-              onOpenRecent={(path) => void openRecentLibrary(path)}
-              onForgetRecent={(path) => void forgetRecentLibrary(path)}
-              recentLibraries={recentLibraries}
-            />
-            <ScopeBreadcrumbs
-              onNavigateFolder={(folderId) => void chooseFolder(folderId)}
-              onNavigateTrashTombstone={(tombstoneId) => {
-                void enterTrashAt(tombstoneId);
-              }}
-              segments={buildScopeBreadcrumbSegments(
-                {
-                  showTrash,
-                  trashBreadcrumbHops,
-                  activeTagLabel: activeTagId
-                    ? (tags.find((tag) => tag.tagId === activeTagId)?.name ??
-                      null)
-                    : null,
-                  activeCollectionLabel: activeCollectionId
-                    ? (collections.find(
-                        (collection) =>
-                          collection.collectionId === activeCollectionId,
-                      )?.name ?? null)
-                    : null,
-                  activeSmartCollectionLabel: activeSmartCollectionId
-                    ? (smartCollections.find(
-                        (collection) =>
-                          collection.collectionId === activeSmartCollectionId,
-                      )?.name ?? null)
-                    : null,
-                  assetScope,
-                  folderTrail:
-                    assetScope !== "all" && assetScope !== "root"
-                      ? buildManagedFolderBreadcrumbTrail(folders, assetScope)
-                          .length > 0
-                        ? buildManagedFolderBreadcrumbTrail(folders, assetScope)
-                        : buildLinkedFolderBreadcrumbTrail(
-                            linkedFolders,
-                            assetScope,
-                          )
-                      : [],
-                  linkedFolderLabel: null,
-                },
-                t,
+              {IS_WINDOWS_PLATFORM ? (
+                <MainMenu disabled={busy} sections={mainMenuSections} />
+              ) : (
+                <AppSettingsEntry
+                  disabled={busy}
+                  onOpen={() => {
+                    setAppSettingsCategory("general");
+                    setAppSettingsOpen(true);
+                  }}
+                />
               )}
+            </div>
+            <WorkspaceTabs
+              activeTabId={workspaceTabsState.activeTabId}
+              disabled={!library || busy}
+              tabs={workspaceTabPresentations}
+              onAdd={() => void addWorkspaceTab()}
+              onClose={(tabId) => void closeWorkspaceTab(tabId)}
+              onSelect={(tabId) => void selectWorkspaceTab(tabId)}
+              onReorder={(tabId, toIndex) => moveWorkspaceTab(tabId, toIndex)}
+              onContextMenu={(tabId, position) => {
+                const tab = workspaceTabPresentations.find(
+                  (candidate) => candidate.id === tabId,
+                );
+                if (!tab) return;
+                openContextMenu(
+                  {
+                    type: "workspace-tab",
+                    tabId,
+                    name: tab.title,
+                    entity: tab.entity,
+                    canClose: workspaceTabPresentations.length > 1,
+                    canCloseOthers: workspaceTabPresentations.length > 1,
+                  },
+                  position,
+                );
+              }}
             />
           </div>
           <form
@@ -10895,6 +11947,7 @@ function AppInner() {
         activeCollectionId={activeCollectionId}
         activeSmartCollectionId={activeSmartCollectionId}
         showIgnoredItems={showIgnoredItems}
+        revealTarget={workspaceTabRevealTarget}
         onToggleShowIgnoredItems={() => {
           const next = !showIgnoredItems;
           setShowIgnoredItems(next);
@@ -10942,6 +11995,22 @@ function AppInner() {
           handleTargetExternalDrop(event, targetFolderId, targetCollectionId)
         }
         getManagedAssetDragIds={getManagedAssetDragIds}
+        getManagedFolderDragIds={getManagedFolderDragIds}
+        onOpenRootFolderContextMenu={({ x, y }) =>
+          // Serpent-a6c516: the folder panel's blank area and the 「资源库根目录」
+          // row are both the library root, so they share this menu.
+          openContextMenu(
+            {
+              type: "folder",
+              folderId: LIBRARY_ROOT_FOLDER_ID,
+              // Shown in the menu's leading line and its accessible name.
+              name: t("menu.libraryRoot"),
+              locationKind: "managed",
+              isLibraryRoot: true,
+            },
+            { x, y },
+          )
+        }
         onResolveManagedAssetDrop={resolveManagedAssetDrop}
         onAssetsDroppedOnFolder={(folderId, assetIds, mode) =>
           handleAssetsDroppedOnFolder(folderId, assetIds, mode)
@@ -10994,7 +12063,10 @@ function AppInner() {
               setLinkedFolderHintActive(false);
             }, 8000);
           }
-          openInlineFolderCreate(selectedFolderId ?? null);
+          // Serpent-186547: the folder-section 「+」 always creates at the
+          // library root, independent of the folder currently in scope.
+          // Subfolders are created from the folder's context menu (新建子文件夹).
+          openInlineFolderCreate(null);
         }}
         onAddSmartCollection={() => {
           cancelInlineFolderEdit();
@@ -11138,7 +12210,17 @@ function AppInner() {
                   <Icon name="folders" size={14} />
                 </button>
               )}
-            <span>{workspaceTitle()}</span>
+            {showTagManagement || showPluginSidebarView ? (
+              <span>{workspaceTitle()}</span>
+            ) : (
+              <ScopeBreadcrumbs
+                onNavigateFolder={(folderId) => void chooseFolder(folderId)}
+                onNavigateTrashTombstone={(tombstoneId) => {
+                  void enterTrashAt(tombstoneId);
+                }}
+                segments={scopeBreadcrumbSegments}
+              />
+            )}
             <span className="item-count">
               {library
                 ? showTagManagement
@@ -11419,6 +12501,7 @@ function AppInner() {
           />
         )}
         <div
+          aria-busy={workspaceNavigationPending}
           className={`workspace-canvas-host${previewAsset ? " is-viewing" : previewRestoring ? " is-restoring" : ""}`}
         >
           {renderedToastStack.length > 0
@@ -11541,7 +12624,7 @@ function AppInner() {
                       shouldShowAssetCardBadges(assetCardSize);
                     const renderAssetCard = (
                       asset: AssetSummary,
-                      renderOptions?: { loadImmediately?: boolean },
+                      renderOptions?: { loadImmediately?: boolean; stableSlot?: boolean },
                     ) => {
                       const typeBadge = assetTypeBadgeLabel(
                         asset.mediaType,
@@ -11590,6 +12673,10 @@ function AppInner() {
                         searchSnippets.get(asset.assetId),
                         asset.displayName,
                       );
+                      const syncStatus =
+                        canvasPrefs.fields.badgeSync !== false
+                          ? syncCardStatuses.get(asset.assetId)
+                          : undefined;
                       const layoutThumbnailArtifactId =
                         layoutThumbnailArtifacts.libraryId === library?.libraryId
                           ? layoutThumbnailArtifacts.ids.get(asset.assetId)
@@ -11632,7 +12719,9 @@ function AppInner() {
                       data-media-type={asset.mediaType}
                       title={asset.displayName}
                       draggable={!showTrash && !renamingThisAsset}
-                      key={assetCardKey(library?.libraryId, asset.assetId)}
+                      key={renderOptions?.stableSlot
+                        ? undefined
+                        : assetCardKey(library?.libraryId, asset.assetId)}
                       {...(renamingThisAsset
                         ? { role: "group" as const }
                         : { type: "button" as const })}
@@ -12076,6 +13165,15 @@ function AppInner() {
                                       changeAssetRenameValue(event.target.value)
                                     }
                                     onClick={(event) => event.stopPropagation()}
+                                    onFocus={(event) => {
+                                      const { baseName } = splitAssetFileName(
+                                        event.currentTarget.value,
+                                      );
+                                      event.currentTarget.setSelectionRange(
+                                        baseName.length,
+                                        baseName.length,
+                                      );
+                                    }}
                                     onKeyDown={(event) => {
                                       event.stopPropagation();
                                       if (event.key === "Enter") {
@@ -12120,6 +13218,7 @@ function AppInner() {
                           ) : null}
                         </div>
                       )}
+                      {syncStatus ? <SyncCardStatusBadge status={syncStatus} /> : null}
                     </CardTag>
                     );
                     };
@@ -12151,6 +13250,11 @@ function AppInner() {
                                   previewArtifactId={
                                     layoutThumbnailArtifacts.libraryId === library.libraryId
                                       ? layoutThumbnailArtifacts.ids.get(entry.assetId)
+                                      : undefined
+                                  }
+                                  syncStatus={
+                                    canvasPrefs.fields.badgeSync !== false
+                                      ? syncCardStatuses.get(entry.assetId)
                                       : undefined
                                   }
                                   viewMode="masonry"
@@ -12190,6 +13294,11 @@ function AppInner() {
                                   previewArtifactId={
                                     layoutThumbnailArtifacts.libraryId === library.libraryId
                                       ? layoutThumbnailArtifacts.ids.get(entry.assetId)
+                                      : undefined
+                                  }
+                                  syncStatus={
+                                    canvasPrefs.fields.badgeSync !== false
+                                      ? syncCardStatuses.get(entry.assetId)
                                       : undefined
                                   }
                                   viewMode="grid"
@@ -12270,6 +13379,12 @@ function AppInner() {
             </div>
           </div>
         )}
+        {workspaceNavigationPending && (
+          <div
+            aria-hidden="true"
+            className="workspace-navigation-hold"
+          />
+        )}
         </div>
         {previewAsset && library && api && (
           <>
@@ -12333,7 +13448,6 @@ function AppInner() {
         onAssignTagToAsset={(tagId) => void handleInspectorAssignTag(tagId)}
         onCreateAndAssignTag={(tagName) => void handleInspectorCreateAndAssignTag(tagName)}
         onOpenSourceUrl={handleOpenSourceUrl}
-        onRelink={(assetId) => { void relinkMissingAsset(assetId); }}
         onPaletteColorCopy={(color, copied) => {
           if (copied) {
             setNotice(t("toast.colorCopiedAlt", { color }));
@@ -12614,6 +13728,13 @@ function AppInner() {
         libraryId={library?.libraryId}
         mcpApi={(window as RendererWindow).serpent?.mcp}
         open={appSettingsOpen}
+        showCardSyncStatus={canvasPrefs.fields.badgeSync}
+        onShowCardSyncStatusChange={(checked) => {
+          setCanvasPrefs((current) => ({
+            ...current,
+            fields: { ...current.fields, badgeSync: checked },
+          }));
+        }}
         syncServerCallbacks={{
           async syncListServers() {
             if (!api) return { ok: false, message: t("common.unavailable") };
@@ -12717,6 +13838,9 @@ function AppInner() {
             if (!api) return { ok: false, message: t("common.unavailable") };
             const result = await api.syncSaveBinding(input);
             if (!result.ok) return { ok: false, message: messageForPublicError(result.error, locale, t("toast.librarySettingsSaveFailed")) };
+            if (input.enabled !== undefined) {
+              setSyncBindingStatus(input.enabled ? "enabled" : "disabled");
+            }
             return { ok: true };
           },
           async syncGetBinding(input) {
@@ -13039,6 +14163,23 @@ function AppInner() {
         managedFolders={folders}
         activeCollectionId={activeCollectionId}
         assets={visibleAssets}
+        onCloseWorkspaceTab={(tabId) => void closeWorkspaceTab(tabId)}
+        onCloseOtherWorkspaceTabs={(tabId) =>
+          void closeOtherWorkspaceTabs(tabId)
+        }
+        onRevealWorkspaceTabEntity={(entity) => {
+          setLeftOpen(true);
+          setWorkspaceTabRevealTarget({
+            ...entity,
+            requestId: ++workspaceTabRevealRequestRef.current,
+          });
+        }}
+        onCopyWorkspaceTabName={(name) => {
+          void navigator.clipboard.writeText(name).then(
+            () => setNotice(t("tabs.copyNameDone")),
+            () => setError(t("tabs.copyNameFailed")),
+          );
+        }}
         onRenameSmartCollection={(id, name) => setRenameTarget({ kind: "smart", id, name })}
         onUpdateSmartCollection={(id) => { void updateSmartCollectionQuery(id); }}
         onDeleteSmartCollection={(id) => { void deleteSmartCollection(id); }}
@@ -13066,7 +14207,14 @@ function AppInner() {
         }}
         onCreateSubfolder={(folderId) => {
           cancelInlineSmartCollectionEdit();
-          openInlineFolderCreate(folderId);
+          openInlineFolderCreate(isLibraryRootFolderId(folderId) ? null : folderId);
+        }}
+        onImportLinkedFolderInto={(folderId) => {
+          // Serpent-316493: 导入链接文件夹 under the right-clicked folder (or at
+          // the library root when the folder panel's blank area was clicked).
+          void importFolderAsLinked(
+            isLibraryRootFolderId(folderId) ? null : folderId,
+          );
         }}
         onSetIgnore={({ locationKind, linkedFolderId, relativePath, pathKind, ignored, name }) => {
           void setIgnoreState({ locationKind, linkedFolderId, relativePath, pathKind, ignored, name });
@@ -13085,7 +14233,9 @@ function AppInner() {
           void handleCopyFolder(folderId);
         }}
         onPasteIntoFolder={(folderId) => {
-          dispatchClipboardPaste(folderId);
+          // Serpent-316493 follow-up: the root sentinel means "the library
+          // root", which paste/import APIs express as null.
+          dispatchClipboardPaste(isLibraryRootFolderId(folderId) ? null : folderId);
         }}
         onCloneFolder={(folderId) => {
           void cloneFolder(folderId);

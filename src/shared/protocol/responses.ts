@@ -1,9 +1,10 @@
 import { z } from 'zod';
 
-import { aiSearchPlanSchema, assetMetadataResultSchema, extractedMetadataResultSchema, assetSummarySchema, browseGeometryBlockSchema, browseLayoutEntrySchema, collectionSummarySchema, folderBrowseEntrySchema, ignoredPathSchema, linkedFolderDirectoryMutationSchema, linkedFolderRuleSchema, linkedFolderSummarySchema, managedFolderSummarySchema, portableRelativePathSchema, smartCollectionSummarySchema, tagCooccurrenceGraphSchema, tagSummarySchema, trashedFolderSummarySchema } from '../asset-types';
+import { aiSearchPlanSchema, assetMetadataResultSchema, extractedMetadataResultSchema, assetSummarySchema, browseLayoutEntrySchema, collectionSummarySchema, folderBrowseEntrySchema, ignoredPathSchema, linkedFolderDirectoryMutationSchema, linkedFolderRuleSchema, linkedFolderSummarySchema, managedFolderSummarySchema, portableRelativePathSchema, smartCollectionSummarySchema, tagCooccurrenceGraphSchema, tagSummarySchema, trashedFolderSummarySchema } from '../asset-types';
 import { libraryNavigationSummarySchema } from '../library-navigation';
 import { pluginJobRecordSchema } from '../../plugins/plugin-jobs';
 import { recentLibraryListSchema } from '../recent-libraries';
+import { mutationReceiptSchema } from '../performance-contract';
 import { publicErrorReasonSchema, publicErrorSchema } from './errors';
 import { fbxConvertErrorCodeSchema, fbxConversionStatsSchema } from '../fbx-conversion';
 import {
@@ -385,8 +386,10 @@ export const assetChangeEventSchema = z.strictObject({
    * `watcher` = external disk reconciliation (only this shows the disk-sync toast).
    * `text-save` / `client` / `content-replace` = in-app mutations; UI should use
    * operation-specific copy or silent canvas refresh.
+   * `sync` = WebDAV 回放写入的本地库（文件夹/资产/元数据）。Renderer 静默刷新
+   * 导航与画布；自动同步调度器必须忽略，避免回放后再 `sync.run`。
    */
-  source: z.enum(['watcher', 'text-save', 'client', 'content-replace']).optional(),
+  source: z.enum(['watcher', 'text-save', 'client', 'content-replace', 'sync']).optional(),
 });
 
 export type AssetChangeEvent = z.infer<typeof assetChangeEventSchema>;
@@ -698,6 +701,7 @@ const assetOperationSuccessSchemas = [
     type: z.literal('folder.created'),
     folder: managedFolderSummarySchema,
     historyEntryId: nonBlankString.optional(),
+    mutationReceipt: mutationReceiptSchema.optional(),
   }),
   z.strictObject({
     ok: z.literal(true),
@@ -1128,6 +1132,8 @@ const assetOperationSuccessSchemas = [
     sessionId: nonBlankString,
     libraryGeneration: z.number().int().nonnegative(),
     changeSequence: z.number().int().nonnegative(),
+    catalogSequence: z.number().int().nonnegative().optional(),
+    snapshotGeneration: z.number().int().nonnegative().nullable().optional(),
     queryFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
     items: z.array(assetSummarySchema),
     total: z.number().int().nonnegative(),
@@ -1142,6 +1148,8 @@ const assetOperationSuccessSchemas = [
     type: z.literal('browse.session.page'),
     sessionId: nonBlankString,
     changeSequence: z.number().int().nonnegative(),
+    catalogSequence: z.number().int().nonnegative().optional(),
+    snapshotGeneration: z.number().int().nonnegative().nullable().optional(),
     items: z.array(assetSummarySchema),
     total: z.number().int().nonnegative(),
     offset: z.number().int().nonnegative(),
@@ -1152,23 +1160,19 @@ const assetOperationSuccessSchemas = [
   }),
   z.strictObject({
     ok: z.literal(true),
-    type: z.literal('browse.session.geometry'),
-    libraryId: nonBlankString,
-    ...browseGeometryBlockSchema.shape,
-  }),
-  z.strictObject({
-    ok: z.literal(true),
     type: z.literal('browse.session.ids'),
     libraryId: nonBlankString,
     sessionId: nonBlankString,
     changeSequence: z.number().int().nonnegative(),
+    catalogSequence: z.number().int().nonnegative().optional(),
+    snapshotGeneration: z.number().int().nonnegative().nullable().optional(),
     assetIds: z.array(nonBlankString).max(100_000),
   }),
   z.strictObject({
     ok: z.literal(true),
     type: z.literal('browse.session.stale'),
     sessionId: nonBlankString,
-    reason: z.enum(['library-generation', 'change-sequence', 'missing']),
+    reason: z.enum(['library-generation', 'change-sequence', 'catalog-sequence', 'missing']),
   }),
   z.strictObject({
     ok: z.literal(true),
@@ -1967,6 +1971,14 @@ const workerSuccessResultSchema = z.discriminatedUnion('type', [
   }),
   z.strictObject({
     ok: z.literal(true),
+    type: z.literal('sync.asset-card-status'),
+    statuses: z.array(z.strictObject({
+      assetId: nonBlankString,
+      status: z.enum(['pending', 'conflict']),
+    })),
+  }),
+  z.strictObject({
+    ok: z.literal(true),
     type: z.literal('ai.jobs.enqueued'),
     libraryId: nonBlankString,
     enqueued: z.number().int().nonnegative(),
@@ -2113,6 +2125,12 @@ const rendererSuccessResultSchema = z.discriminatedUnion('type', [
   }),
   z.strictObject({
     ok: z.literal(true),
+    type: z.literal('library.choose-path'),
+    /** null when the user cancelled the native picker. */
+    path: nonBlankString.nullable(),
+  }),
+  z.strictObject({
+    ok: z.literal(true),
     type: z.literal('library.eagle-inspected'),
     displayName: nonBlankString,
   }),
@@ -2224,7 +2242,16 @@ const rendererSuccessResultSchema = z.discriminatedUnion('type', [
       lastSyncedAt: z.string().optional(),
       enabled: z.boolean().optional(),
       pollIntervalMs: z.number().int().min(1000).max(3_600_000).optional(),
+      showCardSyncStatus: z.boolean().optional(),
     }).nullable(),
+  }),
+  z.strictObject({
+    ok: z.literal(true),
+    type: z.literal('sync.asset-card-status'),
+    statuses: z.array(z.strictObject({
+      assetId: nonBlankString,
+      status: z.enum(['pending', 'conflict']),
+    })),
   }),
   z.strictObject({
     ok: z.literal(true),

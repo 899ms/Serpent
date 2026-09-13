@@ -9,6 +9,7 @@ import type {
   RemoteWriteResult,
 } from '../../src/worker/sync/remote-storage';
 import { SyncEngine, type SyncLibraryPort, type SyncRootConfig } from '../../src/worker/sync/sync-engine';
+import type { SyncAssetMetadata } from '../../src/worker/sync/sync-metadata';
 
 class MemoryDriver implements RemoteStorageDriver {
   readonly files = new Map<string, Buffer>();
@@ -78,6 +79,7 @@ interface FakeAsset {
   syncId: string;
   relativePath: string;
   body: Buffer;
+  metadata?: SyncAssetMetadata;
 }
 
 class FakeLibrary implements SyncLibraryPort {
@@ -96,6 +98,7 @@ class FakeLibrary implements SyncLibraryPort {
       contentHash: `hash-${Buffer.from(asset.body).toString('hex').slice(0, 8)}`,
       size: asset.body.length,
       modifiedAt: '2026-08-15T10:00:00Z',
+      ...(asset.metadata === undefined ? {} : { metadata: asset.metadata }),
     }));
     return { library: { libraryId, displayName: this.displayName }, assets };
   }
@@ -321,6 +324,41 @@ describe('SyncEngine end-to-end (Serpent-xffq)', () => {
     await expect(engine.pollRemoteChange('lib-1', pollRoot)).resolves.toBe(false);
   });
 
+  it('pollRemoteChange reports change when only metadataHash advanced', async () => {
+    const driver = new MemoryDriver();
+    driver.files.set('参考库/manifest.json', Buffer.from(JSON.stringify({
+      formatVersion: 1,
+      libraryId: 'lib-1',
+      displayName: '参考库',
+      directoryName: '参考库',
+      entries: {
+        s1: {
+          path: 'a.png', contentHash: 'hash-x', size: 1, version: 2,
+          deviceId: 'dev-b', modifiedAt: '2026-08-15T12:00:00Z', metadataVersion: 3,
+          metadataHash: 'hash-meta-new',
+        },
+      },
+    })));
+    const library = new FakeLibrary();
+    await library.writeSyncManifestCache('lib-1', JSON.stringify({
+      formatVersion: 1,
+      libraryId: 'lib-1',
+      displayName: '参考库',
+      directoryName: '参考库',
+      entries: {
+        s1: {
+          path: 'a.png', contentHash: 'hash-x', size: 1, version: 2,
+          deviceId: 'dev-b', modifiedAt: '2026-08-15T12:00:00Z', metadataVersion: 3,
+          metadataHash: 'hash-meta-old',
+        },
+      },
+    }));
+    const engine = new SyncEngine(library, { deviceId: 'dev-a' });
+    engine.buildDriver = () => driver;
+    const pollRoot: SyncRootConfig = { id: 'root-1', baseUrl: 'https://mock/', directoryName: '参考库' };
+    await expect(engine.pollRemoteChange('lib-1', pollRoot)).resolves.toBe(true);
+  });
+
   it('pollRemoteChange reports change when remote advanced or local cache is missing (auto-sync)', async () => {
     const driver = new MemoryDriver();
     driver.files.set('参考库/manifest.json', Buffer.from(JSON.stringify({
@@ -390,6 +428,33 @@ describe('SyncEngine end-to-end (Serpent-xffq)', () => {
     expect(last.bytesTotal).toBe(4);
   });
 
+  it('reports progress for metadata-only uploads so the UI can show a sync toast', async () => {
+    const driver = new MemoryDriver();
+    const library = new FakeLibrary();
+    library.assets.set('s1', { syncId: 's1', relativePath: 'a.png', body: Buffer.from('aaaa') });
+    const engine = new SyncEngine(library, { deviceId: 'dev-a' });
+    engine.buildDriver = () => driver;
+    await engine.syncOnce('lib-1', root);
+
+    library.assets.get('s1')!.metadata = {
+      tags: ['角色'],
+      description: '主角设定',
+      rating: 4,
+      favorite: false,
+    };
+    const progress: Array<{ done: number; total: number }> = [];
+    const metaEngine = new SyncEngine(library, {
+      deviceId: 'dev-a',
+      onProgress: (done, total) => progress.push({ done, total }),
+    });
+    metaEngine.buildDriver = () => driver;
+    const outcome = await metaEngine.syncOnce('lib-1', root);
+    expect(progress[0]).toEqual({ done: 0, total: 1 });
+    expect(progress.at(-1)).toEqual({ done: 1, total: 1 });
+    expect(outcome.report.uploads).toBe(1);
+    expect([...driver.files.keys()].some((key) => key.includes('metadata/entries/s1.json'))).toBe(true);
+  });
+
   it('moves a remote file when only the local folder path changed (Serpent-038ecf)', async () => {
     const driver = new MemoryDriver();
     const library = new FakeLibrary();
@@ -405,5 +470,33 @@ describe('SyncEngine end-to-end (Serpent-xffq)', () => {
     expect(outcome.report.uploads).toBe(1);
     expect(driver.files.get('参考库/assets/2D/cd.png')?.toString()).toBe('cover');
     expect(driver.files.has('参考库/assets/cd.png')).toBe(false);
+  });
+
+  it('keeps the remote library identity when a second device syncs', async () => {
+    const driver = new MemoryDriver();
+    driver.files.set('参考库/manifest.json', Buffer.from(JSON.stringify({
+      formatVersion: 1,
+      libraryId: 'lib-a',
+      displayName: 'A 库',
+      directoryName: 'A库',
+      entries: {
+        s1: {
+          path: 'a.png', contentHash: 'hash-aaa', size: 3, version: 1,
+          deviceId: 'dev-a', modifiedAt: '2026-08-15T10:00:00Z', metadataVersion: 1,
+        },
+      },
+    })));
+    driver.files.set('参考库/assets/a.png', Buffer.from('aaa'));
+    const library = new FakeLibrary();
+    const engine = new SyncEngine(library, { deviceId: 'dev-b' });
+    engine.buildDriver = () => driver;
+
+    await engine.syncOnce('lib-b', root);
+    const written = JSON.parse(driver.files.get('参考库/manifest.json')!.toString('utf-8')) as {
+      libraryId: string;
+      displayName: string;
+    };
+    expect(written.libraryId).toBe('lib-a');
+    expect(written.displayName).toBe('A 库');
   });
 });

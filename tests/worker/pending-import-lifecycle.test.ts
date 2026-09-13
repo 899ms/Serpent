@@ -67,7 +67,34 @@ afterEach(() => {
 });
 
 describe('pending import lifecycle', () => {
-  it('expires a pending token at its TTL and removes its staged operation', () => {
+  it('keeps a parked conflict decision past 24 hours until resolve or close', () => {
+    const root = temporaryRoot();
+    const source = path.join(root, 'default-ttl.png');
+    writeFileSync(source, 'incoming');
+    const clock = new ManualImportClock();
+    const service = new LibraryService({ importClock: clock });
+    const library = service.createLibrary({ displayName: 'Default TTL', selectedParentPath: root });
+    writeFileSync(path.join(library.libraryPath, 'Assets', 'default-ttl.png'), 'old');
+    const plan = service.prepareImport({
+      libraryId: library.libraryId,
+      sourceKind: 'files',
+      sourcePaths: [source],
+    });
+    const operationPath = path.join(library.libraryPath, '.serpent', 'operations', plan.importId);
+
+    clock.advance(15 * 60 * 1_000);
+    expect(existsSync(operationPath)).toBe(true);
+    clock.advance(24 * 60 * 60 * 1_000);
+    expect(existsSync(operationPath)).toBe(true);
+    expect(() => service.resolveImport({
+      importId: plan.importId,
+      suspectedDuplicate: 'skip',
+      nameConflict: 'keep-both',
+    })).not.toThrow();
+    service.closeAll();
+  });
+
+  it('does not expire a parked decision by TTL while the library stays open', () => {
     const root = temporaryRoot();
     const incoming = path.join(root, 'incoming');
     mkdirSync(incoming);
@@ -84,8 +111,12 @@ describe('pending import lifecycle', () => {
     clock.advance(999);
     expect(existsSync(operationPath)).toBe(true);
     clock.advance(1);
-    expect(existsSync(operationPath)).toBe(false);
-    expectCode(() => service.abandonImport(plan.importId), 'IMPORT_NOT_FOUND');
+    expect(existsSync(operationPath)).toBe(true);
+    expect(() => service.resolveImport({
+      importId: plan.importId,
+      suspectedDuplicate: 'skip',
+      nameConflict: 'keep-both',
+    })).not.toThrow();
     service.closeAll();
   });
 
@@ -110,6 +141,38 @@ describe('pending import lifecycle', () => {
     service.closeAll();
   });
 
+  it('emits completion and treats a late cancel as a no-op after commit post-processing fails', async () => {
+    const root = temporaryRoot();
+    const source = path.join(root, 'post-commit.png');
+    writeFileSync(source, 'incoming');
+    const events: string[] = [];
+    const service = new LibraryService({
+      failAt: 'committed-result-list',
+      onProgress: (event) => {
+        if (event.type === 'import.progress') events.push(event.phase);
+      },
+    });
+    const library = service.createLibrary({ displayName: 'Post Commit', selectedParentPath: root });
+    const existing = path.join(library.libraryPath, 'Assets', 'post-commit.png');
+    writeFileSync(existing, 'old');
+    const plan = service.prepareImport({
+      libraryId: library.libraryId,
+      sourceKind: 'files',
+      sourcePaths: [source],
+    });
+
+    const completion = await service.resolveImportCancellable({
+      importId: plan.importId,
+      suspectedDuplicate: 'skip',
+      nameConflict: 'keep-both',
+    });
+    expect(completion).toMatchObject({ importedCount: 1, assetCount: 1, assets: [] });
+    expect(events.at(-1)).toBe('complete');
+    expect(() => service.cancelImport(plan.importId)).not.toThrow();
+    expect(() => service.abandonImport(plan.importId)).not.toThrow();
+    service.closeAll();
+  });
+
   it('cancels the expiry timer during normal close cleanup', () => {
     const root = temporaryRoot();
     const source = path.join(root, 'same.png');
@@ -121,7 +184,7 @@ describe('pending import lifecycle', () => {
     const plan = service.prepareImport({ libraryId: library.libraryId, sourceKind: 'files', sourcePaths: [source] });
     service.closeAll();
 
-    expect(clock.cancelled).toHaveLength(1);
+    expect(clock.cancelled).toHaveLength(0);
     expect(existsSync(path.join(library.libraryPath, '.serpent', 'operations', plan.importId))).toBe(false);
   });
 

@@ -94,6 +94,9 @@
   --shadow-card:
     0 calc(2px * var(--elev-size)) calc(10px * var(--elev-size))
     rgb(0 0 0 / calc(0.24 * var(--elev-intensity)));
+  --shadow-workspace-tab:
+    0 0 calc(8px * var(--elev-size))
+    rgb(0 0 0 / calc(0.22 * var(--elev-intensity)));
   /* Floating overlays stay fixed (pre-elevation family; Serpent-4ojz). */
   --shadow-menu: 0 8px 24px rgb(0 0 0 / 28%);
   /* Shared menu family: context menus, the Windows main menu, and the library
@@ -195,6 +198,9 @@
     rgb(0 0 0 / calc(0.08 * var(--elev-intensity)));
   --shadow-card:
     0 calc(1px * var(--elev-size)) calc(8px * var(--elev-size))
+    rgb(0 0 0 / calc(0.1 * var(--elev-intensity)));
+  --shadow-workspace-tab:
+    0 0 calc(6px * var(--elev-size))
     rgb(0 0 0 / calc(0.1 * var(--elev-intensity)));
   --shadow-menu: 0 6px 18px rgb(0 0 0 / 12%), 0 1px 3px rgb(0 0 0 / 8%);
   --shadow-elevated: 0 18px 48px rgb(0 0 0 / 16%);
@@ -489,7 +495,17 @@ summary:focus-visible {
   align-items: center;
   min-width: 0;
   height: 100%;
+}
+
+.scope-trace {
   line-height: 1.35;
+}
+
+/* 28px chrome must sit on the geometric midline of the 44px bar. A cluster
+   line-height > 1 adds an inline strut that lifts icon buttons and the
+   library name above the search field. */
+.toolbar-cluster {
+  line-height: 1;
 }
 
 .toolbar-nav-cluster {
@@ -523,7 +539,9 @@ body.platform-darwin .toolbar-nav-cluster {
 .toolbar-workspace-search {
   display: flex;
   flex: 0 0 auto;
+  align-self: center;
   align-items: center;
+  height: var(--shell-control-height);
   margin-left: auto;
   -webkit-app-region: no-drag;
 }
@@ -545,15 +563,19 @@ body.platform-darwin .toolbar-nav-cluster {
   z-index: 1;
   top: 0;
   left: 10px;
-  width: var(--shell-control-height);
+  /* Wide enough for the pinned toggle *and* the library switcher beside it;
+     it overlays the browse track, which reserves the same width below. */
+  width: auto;
   min-width: 0;
   padding: 0;
-  gap: 0;
+  gap: 9px;
   overflow: visible;
 }
 
 .app-shell.left-collapsed .toolbar-workspace-cluster {
-  padding-left: calc(10px + var(--shell-control-height) + 6px);
+  padding-left: calc(
+    10px + var(--shell-control-height) + 9px + var(--shell-library-switcher-width, 150px) + 9px
+  );
 }
 
 /* macOS traffic lights occupy the title-bar's leading inset, so both the
@@ -563,7 +585,9 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-nav-cluster {
 }
 
 body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
-  padding-left: calc(78px + var(--shell-control-height) + 6px);
+  padding-left: calc(
+    78px + var(--shell-control-height) + 9px + var(--shell-library-switcher-width, 150px) + 9px
+  );
 }
 
 .app-shell.right-collapsed .toolbar-inspector-cluster {
@@ -1146,6 +1170,7 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
   display: inline-grid;
   width: var(--shell-control-height);
   height: var(--shell-control-height);
+  align-self: center;
   padding: 0;
   place-items: center;
   border: 1px solid transparent;
@@ -1153,6 +1178,7 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
   background: transparent;
   color: var(--secondary);
   cursor: pointer;
+  line-height: 1;
 }
 
 .tool-button:hover:not(:disabled) {
@@ -1202,14 +1228,29 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
 }
 
 /* Library switcher sits in the browse column beside history + breadcrumbs. */
+/* Toolbar placement (beside the panel toggle): a bounded width keeps the tabs
+   from being squeezed, and the whole row is clickable. */
+.toolbar-nav-cluster .library-switcher {
+  flex: 0 1 170px;
+  max-width: 170px;
+}
+
+.toolbar-nav-cluster .library-switcher-trigger {
+  cursor: pointer;
+}
+
 .library-switcher {
   /* Do not set overflow:hidden here — the dropdown menu is position:absolute
      inside this box (Serpent-7fy: clipping made the menu look “completely wrong”).
      Ellipsis belongs on .library-switcher-name only. */
   position: relative;
+  display: flex;
   flex: 0 1 auto;
+  align-self: center;
+  align-items: center;
   min-width: 0;
   max-width: 220px;
+  height: var(--shell-control-height);
   overflow: visible;
 }
 
@@ -1229,6 +1270,7 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
   font-size: calc(12.5px * var(--ui-font-scale));
   font-weight: 620;
   letter-spacing: 0.02em;
+  line-height: 1;
 }
 
 .library-switcher-trigger:hover:not(:disabled),
@@ -1272,7 +1314,9 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
 
 .library-switcher-trigger .icon {
   flex: 0 0 auto;
-  transform: rotate(90deg);
+  /* No rotation: the glyph is drawn in its final orientation (the old
+     right-chevron was rotated 90deg here, which turned the vertical
+     chevrons-up-down into a horizontal < >). */
   opacity: 0.7;
 }
 
@@ -1433,6 +1477,9 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
 .scope-history {
   display: inline-flex;
   flex: 0 0 auto;
+  align-self: center;
+  align-items: center;
+  height: var(--shell-control-height);
   gap: 2px;
 }
 
@@ -1449,6 +1496,7 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
   background: transparent;
   color: var(--secondary);
   cursor: pointer;
+  line-height: 1;
 }
 
 .scope-history-button:hover:not(:disabled) {
@@ -1525,11 +1573,13 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
   width: min(360px, 100%);
   min-width: 200px;
   height: var(--shell-control-height);
+  align-self: center;
   align-items: center;
   border: 1px solid var(--divider);
   border-radius: 6px;
   background: var(--canvas);
   color: var(--tertiary);
+  line-height: 1;
   transition:
     border-color 120ms ease,
     box-shadow 120ms ease;
@@ -1796,6 +1846,17 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
   min-height: 0;
   overflow: auto;
   padding: 10px 8px 12px;
+}
+
+/* Serpent-6e3b10 / Serpent-b29bc4: the folder section's blank area (indentation
+   gutter) returns to the library root on click and accepts managed-folder drops.
+   Same accent-tinted language as .nav-row.is-drop-target and the same corner
+   radius as the rows (--ui-radius-surface), with an inset ring so the list never
+   changes size mid-drag. */
+.nav-folder-list.is-root-drop-target {
+  border-radius: var(--ui-radius-surface);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
 }
 
 .nav-section {
@@ -2214,6 +2275,7 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
 .main-menu {
   position: relative;
   flex: 0 0 auto;
+  align-self: center;
   width: var(--shell-control-height);
   height: var(--shell-control-height);
   overflow: visible;
@@ -2230,6 +2292,7 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
   background: transparent;
   color: var(--secondary);
   cursor: pointer;
+  line-height: 1;
 }
 
 .main-menu-trigger:hover:not(:disabled),
@@ -3800,8 +3863,14 @@ body.serpent-modal-open .app-shell {
   box-shadow: var(--menu-surface-shadow);
   backdrop-filter: blur(14px) saturate(120%);
   min-width: 180px;
-  max-height: calc(100vh - 12px);
+  /* Keep tall menus inside the renderer viewport and let their content scroll. */
+  max-width: calc(100vw - (2 * var(--ui-space-3)));
+  max-height: calc(100vh - (2 * var(--ui-space-3)));
+  max-height: calc(100dvh - (2 * var(--ui-space-3)));
+  box-sizing: border-box;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding: 5px;
 }
 
@@ -3971,6 +4040,15 @@ body.serpent-modal-open .app-shell {
   font-size: calc(12px * var(--ui-font-scale));
   font-weight: 650;
   letter-spacing: 0.01em;
+}
+
+/* Serpent-a6c516: the library-root menu names its subject in the leading line.
+   It reuses the multi-select summary's geometry but is a quiet caption, not an
+   emphasized count — same reason it overrides the weight instead of the whole
+   block. Must stay after .context-menu-selection-summary (equal specificity). */
+.context-menu-subject {
+  color: var(--secondary);
+  font-weight: 400;
 }
 
 .context-menu-scope-note {
@@ -6684,6 +6762,7 @@ select.ai-config-input.ai-config-languages {
   width: var(--shell-control-height);
   height: var(--shell-control-height);
   flex: 0 0 auto;
+  align-self: center;
   place-items: center;
   padding: 0;
   border: 1px solid transparent;
@@ -6691,6 +6770,7 @@ select.ai-config-input.ai-config-languages {
   background: transparent;
   color: var(--secondary);
   cursor: pointer;
+  line-height: 1;
 }
 
 .app-settings-entry:hover:not(:disabled) {
@@ -8927,6 +9007,18 @@ select.ai-config-input.ai-config-languages {
   min-height: 0;
 }
 
+.workspace-navigation-hold {
+  position: absolute;
+  inset: 0;
+  z-index: var(--ui-layer-popover);
+  /* Intentionally transparent: it only captures pointer events (so the user
+     cannot act on content that is about to be replaced) and shows the progress
+     cursor. A tinted layer read as a brightness flash on every folder switch
+     (Serpent-565785 feedback); the switch must not change screen brightness. */
+  background: transparent;
+  cursor: progress;
+}
+
 .workspace-canvas-host > .activity-strip {
   position: absolute;
   z-index: 20;
@@ -10191,6 +10283,7 @@ select.ai-config-input.ai-config-languages {
 }
 
 .asset-card {
+  position: relative;
   min-width: 0;
   padding: 0;
   border: 1px solid transparent;
@@ -10628,6 +10721,89 @@ select.ai-config-input.ai-config-languages {
   letter-spacing: 0.04em;
   line-height: 1.45;
   pointer-events: none;
+}
+
+/* Serpent-871f34: ring at the card's bottom-right. Pending = blue, syncing =
+   green with a moving highlight, conflict = yellow + warning. */
+.asset-sync-status {
+  --asset-sync-status-color: var(--ui-action-accent);
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--pane) 78%, transparent);
+  color: var(--asset-sync-status-color);
+  pointer-events: auto;
+}
+.asset-sync-status[data-state="syncing"] {
+  --asset-sync-status-color: var(--success);
+}
+.asset-sync-status[data-state="conflict"] {
+  --asset-sync-status-color: var(--rating-star);
+  background: var(--rating-star);
+  color: var(--ui-content-on-accent);
+  box-shadow: 0 0 0 2px var(--pane);
+}
+.asset-sync-status .icon {
+  position: relative;
+  z-index: 1;
+  stroke-width: 2.2;
+}
+.asset-sync-status-ring {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  border: 2px solid var(--asset-sync-status-color);
+  border-radius: inherit;
+  pointer-events: none;
+}
+.asset-sync-status[data-state="syncing"] .asset-sync-status-ring {
+  border-color: color-mix(in srgb, var(--asset-sync-status-color) 32%, transparent);
+}
+.asset-sync-status[data-state="syncing"] .asset-sync-status-ring::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    transparent 210deg,
+    var(--asset-sync-status-color) 292deg,
+    color-mix(in srgb, var(--asset-sync-status-color) 35%, transparent) 328deg,
+    transparent 360deg
+  );
+  filter: drop-shadow(0 0 3px var(--asset-sync-status-color));
+  -webkit-mask: radial-gradient(
+    farthest-side,
+    transparent calc(100% - 2px),
+    var(--text) calc(100% - 1.5px)
+  );
+  mask: radial-gradient(
+    farthest-side,
+    transparent calc(100% - 2px),
+    var(--text) calc(100% - 1.5px)
+  );
+  animation: plugin-view-spin 1.15s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .asset-sync-status[data-state="syncing"] .asset-sync-status-ring::after {
+    animation: none;
+    background: conic-gradient(
+      from 90deg,
+      transparent 0deg,
+      var(--asset-sync-status-color) 80deg,
+      transparent 140deg
+    );
+  }
+}
+.asset-card:has(.asset-sync-status) .asset-caption {
+  padding-right: 28px;
 }
 
 /* CU-U1: containing-folder origin for recursive / mixed-folder grids.
@@ -12842,6 +13018,9 @@ select.ai-config-input.ai-config-languages {
   width: min(520px, calc(100vw - 48px));
   -webkit-app-region: no-drag;
 }
+.ui-dialog-shell.plugin-ui-dialog--widget {
+  max-height: calc(100dvh - var(--ui-space-6) - var(--ui-space-6));
+}
 .plugin-ui-dialog--widget input,
 .plugin-ui-dialog--widget button {
   -webkit-app-region: no-drag;
@@ -12851,6 +13030,27 @@ select.ai-config-input.ai-config-languages {
      Do not raise z-index: a full-window `--ui-layer-modal` overlay covered
      caption chrome and left Chromium without keyboard until Alt-Tab. */
   -webkit-app-region: no-drag;
+}
+.plugin-ui-dialog--widget .plugin-widget-form {
+  gap: var(--ui-space-2);
+  padding: 0;
+  pointer-events: auto;
+}
+.plugin-ui-dialog--widget .plugin-widget-heading {
+  margin-top: var(--ui-space-2);
+}
+.plugin-ui-dialog--widget .plugin-widget-separator {
+  margin: 0;
+}
+.plugin-ui-dialog--widget .plugin-widget-row:has(.plugin-widget-toggle) {
+  flex-wrap: nowrap;
+}
+.plugin-ui-dialog--widget .plugin-widget-row {
+  align-items: flex-start;
+}
+.plugin-ui-dialog--widget .plugin-widget-row > .plugin-widget-heading {
+  align-self: center;
+  margin: 0;
 }
 .plugin-widget-select-trigger {
   display: flex;
@@ -12878,6 +13078,53 @@ select.ai-config-input.ai-config-languages {
 .plugin-widget-row > * {
   flex: 1 1 10rem;
   min-width: 0;
+}
+.plugin-widget-group {
+  min-width: 0;
+  min-inline-size: 0;
+  margin: 0;
+  color: var(--text);
+}
+.plugin-widget-group__content {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ui-space-2);
+}
+.plugin-widget-tabs {
+  min-width: 0;
+}
+.plugin-widget-tabs__list {
+  display: flex;
+  min-width: 0;
+  gap: var(--ui-space-1);
+  border-bottom: 1px solid var(--border-subtle);
+  overflow-x: auto;
+}
+.plugin-widget-tabs__tab {
+  flex: 0 0 auto;
+  padding: var(--ui-space-2) var(--ui-space-3);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: calc(12px * var(--ui-font-scale));
+}
+.plugin-widget-tabs__tab:hover,
+.plugin-widget-tabs__tab:focus-visible {
+  background: var(--menu-item-hover-background);
+  color: var(--text);
+}
+.plugin-widget-tabs__tab.is-active {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+  font-weight: var(--ui-font-weight-medium);
+}
+.plugin-widget-tabs__panel {
+  min-width: 0;
+  padding-top: var(--ui-space-3);
 }
 .plugin-widget-note {
   margin: 0;
@@ -12909,6 +13156,10 @@ select.ai-config-input.ai-config-languages {
   color: var(--text);
   font-size: calc(12px * var(--ui-font-scale));
 }
+.plugin-widget-group:has(.plugin-widget-list) .plugin-widget-list {
+  border: 0;
+  border-radius: 0;
+}
 .plugin-widget-list__header,
 .plugin-widget-list__row {
   display: grid;
@@ -12922,6 +13173,7 @@ select.ai-config-input.ai-config-languages {
   font-weight: 600;
 }
 .plugin-widget-list__body {
+  min-height: 16rem;
   max-height: 20rem;
   overflow: auto;
 }
@@ -12981,4 +13233,11 @@ select.ai-config-input.ai-config-languages {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--border-subtle));
   background: var(--accent-soft);
   color: var(--accent);
+}
+.plugin-widget-switch-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ui-space-3);
 }

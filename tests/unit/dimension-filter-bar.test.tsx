@@ -201,6 +201,42 @@ describe("DimensionFilterBar hover opening", () => {
     expect(document.body.querySelector("[data-dimension-filter-popover]")).toBeNull();
   });
 
+  /**
+   * 用户 2026-09-13:「这几个过滤的按钮的 icon，除了标签和评分，都完全不符合他的内容」
+   * — 颜色 借用了 `activity`(心电折线)、形状 借用了 `grid`(四宫格)、仅喜欢 与 评分 共用
+   * 同一个星形。这条断言把「每个过滤按钮都有图标，且彼此图形不同」钉住：既防止按钮丢失
+   * 图标，也防止再次出现两个语义不同的过滤共用一个图形。
+   */
+  it("gives every dimension filter its own distinct icon", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root?.render(
+        createElement(
+          LocaleProvider,
+          { children: null, initialPreference: "en" },
+          createElement(DimensionFilterBar, props()),
+        ),
+      );
+    });
+
+    const labelled = ["Color", "Tags", "Shape", "Rating", "Favorites only"];
+    const glyphs = labelled.map((label) => {
+      const button = [...container!.querySelectorAll<HTMLButtonElement>("button")]
+        .find((candidate) => candidate.textContent?.includes(label));
+      expect(button, `missing ${label} filter button`).toBeDefined();
+      const icon = button!.querySelector("svg.icon");
+      expect(icon, `${label} filter has no icon`).not.toBeNull();
+      const markup = icon!.innerHTML;
+      expect(markup.length, `${label} filter icon is empty`).toBeGreaterThan(0);
+      return markup;
+    });
+
+    expect(new Set(glyphs).size).toBe(glyphs.length);
+  });
+
   it("keeps AI values included by default in rating and tag filters", async () => {
     container = document.createElement("div");
     document.body.append(container);

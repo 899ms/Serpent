@@ -157,6 +157,15 @@ export const rendererRequestSchema = z.discriminatedUnion('type', [
   }),
   z.strictObject({
     type: z.literal('library.open.request'),
+    /**
+     * When provided, the location dialog is skipped — the caller already ran
+     * `library.choose-path.request`. This keeps the open loading UI (and its
+     * timer) from covering the native picker (Serpent-565785 feedback).
+     */
+    libraryPath: selectedPathSchema.optional(),
+  }),
+  z.strictObject({
+    type: z.literal('library.choose-path.request'),
   }),
   z.strictObject({
     type: z.literal('library.open-cancel.request'),
@@ -496,6 +505,8 @@ export const rendererRequestSchema = z.discriminatedUnion('type', [
     type: z.literal('asset.import-linked.request'),
     libraryId: identifierSchema,
     displayName: optionalIdentifierSchema,
+    /** Serpent-316493: managed folder to hang the linked root under. */
+    parentFolderId: identifierSchema.nullable().optional(),
   }),
   z.strictObject({
     type: z.literal('linked-folder.list.request'),
@@ -742,17 +753,8 @@ export const rendererRequestSchema = z.discriminatedUnion('type', [
     offset: z.number().int().nonnegative().optional(),
   }),
   z.strictObject({
-    // Stage C.2: geometry is fetched in bounded blocks from the same
-    // BrowseSession; the Renderer never rebuilds a full layout-only query.
-    type: z.literal('browse.session.geometry.request'),
-    libraryId: identifierSchema,
-    sessionId: identifierSchema,
-    startIndex: z.number().int().nonnegative(),
-    limit: z.number().int().positive().max(500).optional(),
-  }),
-  z.strictObject({
-    // Stage C.3: select-all reuses the same ordered snapshot as pages and
-    // geometry instead of rebuilding a smart-collection/search scope.
+    // Stage C.3: select-all reuses the same ordered snapshot as pages instead
+    // of rebuilding a smart-collection/search scope.
     type: z.literal('browse.session.ids.request'),
     libraryId: identifierSchema,
     sessionId: identifierSchema,
@@ -1038,6 +1040,11 @@ export const rendererRequestSchema = z.discriminatedUnion('type', [
     assetIds: z.array(identifierSchema).min(1).max(300),
   }),
   z.strictObject({
+    type: z.literal('sync.asset-card-status.request'),
+    libraryId: identifierSchema,
+    assetIds: z.array(identifierSchema).min(1).max(300),
+  }),
+  z.strictObject({
     type: z.literal('sync.probe.request'),
     serverId: nonBlankString,
   }),
@@ -1077,6 +1084,8 @@ export const rendererRequestSchema = z.discriminatedUnion('type', [
     enabled: z.boolean().optional(),
     /** 云端变化轮询间隔（毫秒；缺省 5000）。 */
     pollIntervalMs: z.number().int().min(1000).max(3_600_000).optional(),
+    /** 卡片右下角同步状态；缺省 true。 */
+    showCardSyncStatus: z.boolean().optional(),
   }),
   z.strictObject({
     type: z.literal('sync.library.binding.get.request'),
@@ -1388,6 +1397,11 @@ export const workerCommandSchema = z.discriminatedUnion('type', [
     directoryName: z.string().optional(),
   }),
   z.strictObject({
+    type: z.literal('sync.asset-card-status'),
+    libraryId: identifierSchema,
+    assetIds: z.array(identifierSchema).min(1).max(300),
+  }),
+  z.strictObject({
     type: z.literal('history.status'),
     libraryId: identifierSchema,
   }),
@@ -1610,6 +1624,8 @@ export const workerCommandSchema = z.discriminatedUnion('type', [
     libraryId: identifierSchema,
     displayName: optionalIdentifierSchema,
     sourceRootPath: selectedPathSchema,
+    /** Serpent-316493: managed folder to hang the linked root under. */
+    parentFolderId: identifierSchema.nullable().optional(),
   }),
   z.strictObject({
     type: z.literal('linked-folder.list'),
@@ -1863,13 +1879,6 @@ export const workerCommandSchema = z.discriminatedUnion('type', [
     sessionId: identifierSchema,
     limit: z.number().int().positive().max(500).optional(),
     offset: z.number().int().nonnegative().optional(),
-  }),
-  z.strictObject({
-    type: z.literal('browse.session.geometry'),
-    libraryId: identifierSchema,
-    sessionId: identifierSchema,
-    startIndex: z.number().int().nonnegative(),
-    limit: z.number().int().positive().max(500).optional(),
   }),
   z.strictObject({
     type: z.literal('browse.session.ids'),

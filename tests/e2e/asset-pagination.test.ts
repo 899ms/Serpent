@@ -87,6 +87,35 @@ test("ordinary browsing continuously appends every asset without page controls",
     // Loading the tail is driven by the canvas scroll path, so wait for the
     // complete scope instead of assuming the first render contains every row.
     await expect(window.locator(".asset-card").first()).toBeVisible();
+    // CANVAS-038: the scrollbar belongs to COUNT, not to the loaded subset, and
+    // reaching mid-scope must not collapse or regrow the canvas. The reported
+    // failure was every card reloading around 15% while the geometry revision
+    // kept rewriting heights.
+    await expect.poll(
+      async () => workspaceCanvas.evaluate(
+        (element) => element.querySelectorAll("[data-layout-index]").length,
+      ),
+      { timeout: 15_000 },
+    ).toBeGreaterThan(0);
+    const settledScrollHeight = await workspaceCanvas.evaluate(
+      (element) => element.scrollHeight,
+    );
+    await workspaceCanvas.evaluate((element) => {
+      element.scrollTop = element.scrollHeight * 0.15;
+    });
+    await expect.poll(
+      async () => {
+        const mid = await workspaceCanvas.evaluate((element) => ({
+          height: element.scrollHeight,
+          cards: element.querySelectorAll(".asset-card").length,
+        }));
+        return mid.cards > 0
+          && mid.height >= settledScrollHeight * 0.85
+          && mid.height <= settledScrollHeight * 1.25;
+      },
+      { timeout: 10_000 },
+    ).toBe(true);
+    await workspaceCanvas.evaluate((element) => element.scrollTo(0, 0));
     await expect(window.getByRole("button", { name: "上一页" })).toHaveCount(0);
     await expect(window.getByRole("button", { name: "下一页" })).toHaveCount(0);
     await loadEveryAssetInCurrentScope();
@@ -350,7 +379,7 @@ test("ordinary browsing continuously appends every asset without page controls",
     // sidebar exposes the library-wide scope as "所有资产"; the managed root
     // is an internal destination used by move/restore flows, not a separate
     // navigation row.
-    const allAssetsRow = window.getByRole("button", { name: /所有资产/ });
+    const allAssetsRow = window.getByRole("button", { name: "所有资产", exact: true });
     await allAssetsRow.click();
     await loadEveryAssetInCurrentScope();
     await expect(allAssetsRow).toHaveClass(/is-active/);
@@ -488,7 +517,7 @@ test("ordinary browsing continuously appends every asset without page controls",
     // asserting the newly-created organization entries. 筛选面板现在是外部
     // 点击即关的浮层：刷新后填写前重新展开。
     await window.getByRole("button", { name: "刷新磁盘变化" }).click();
-    await window.getByRole("button", { name: /所有资产/ }).click();
+    await window.getByRole("button", { name: "所有资产", exact: true }).click();
     await window.getByRole("button", { name: "格式", exact: true }).click();
     await window.getByLabel("格式过滤").fill("png");
     await expect(window.locator(".asset-card")).toHaveCount(0);
@@ -553,7 +582,7 @@ test("ordinary browsing continuously appends every asset without page controls",
       return serpent.library.trashAssets({ libraryId, assetIds });
     }, setup);
     expect(trashed.ok).toBe(true);
-    await window.getByRole("button", { name: /所有资产/ }).click();
+    await window.getByRole("button", { name: "所有资产", exact: true }).click();
     await expect(window.locator(".asset-card")).toHaveCount(0);
     await window.getByRole("button", { name: "回收站", exact: true }).click();
     // Trash cards render a different DOM shape (tombstone chrome), so the
@@ -568,7 +597,7 @@ test("ordinary browsing continuously appends every asset without page controls",
       .locator(".workspace-canvas")
       .evaluate((element) => element.scrollTo(0, element.scrollHeight));
     await expect(window.locator(".asset-card").first()).toBeVisible();
-    await window.getByRole("button", { name: /所有资产/ }).click();
+    await window.getByRole("button", { name: "所有资产", exact: true }).click();
     await expect(window.locator(".asset-card")).toHaveCount(0);
   } finally {
     await application.close();

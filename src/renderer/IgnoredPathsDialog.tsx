@@ -18,9 +18,7 @@ export function IgnoredPathsDialog({
   const t = useT();
   if (!open) return null;
   return (
-    <div className="dialog-backdrop" onClick={(event) => {
-      if (event.target === event.currentTarget) onClose();
-    }} role="presentation">
+    <div className="dialog-backdrop" role="presentation">
       <DialogShell
         className="create-dialog ignored-paths-dialog"
         dialogId="ignored-paths-dialog"

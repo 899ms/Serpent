@@ -1,12 +1,14 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 
 import type { AiJobStatus, LibraryApiResult, LinkedAssetDeleteResult, MediaJobStatus, PluginJobStatus, PreviewResolution, RelinkAssetResult, SerpentLibraryApi, SyncCapabilities, SyncReport } from '../shared/library-api';
+import type { MutationReceipt } from '../shared/performance-contract';
 import { summarizePluginJobs } from '../shared/plugin-job-status';
 import type { RecentLibraryEntry } from '../shared/recent-libraries';
 import type { AiApiFormat } from '../shared/ai-endpoints';
 import type { AiReliabilitySettings } from '../shared/ai-reliability';
 import type { ViewerVideoShortcutAction } from '../shared/viewer-video-shortcuts';
 import type { BrowseKeyboardAction } from '../shared/browse-keyboard-shortcuts';
+import type { ApplicationMenuCommandEvent } from '../shared/application-menu';
 import type { ApplicationMenuCommand } from '../shared/application-menu';
 import {
   mcpSettingsResponseSchema,
@@ -214,6 +216,14 @@ const EMPTY_FBX_CONVERSION_STATS: FbxConversionStats = {
 };
 
 const e2eEnabled = process.env.SERPENT_E2E === '1';
+type E2eBrowseSessionDelayTarget = {
+  folderId?: string;
+  smartCollectionId?: string;
+};
+let e2eBrowseSessionDelay: {
+  target: E2eBrowseSessionDelayTarget;
+  delayMs: number;
+} | null = null;
 if (e2eEnabled) {
   const e2eLocale = process.env.SERPENT_E2E_LOCALE === 'en' ? 'en' : 'zh-CN';
   (globalThis as { __SERPENT_E2E_LOCALE__?: string }).__SERPENT_E2E_LOCALE__ =
@@ -249,11 +259,23 @@ const library: SerpentLibraryApi = Object.freeze({
     return { ok: true as const, value: result.library };
   },
 
-  async open(): Promise<LibraryApiResult<RendererLibrarySummary>> {
-    const result = await request({ type: 'library.open.request' });
+  async open(input?: { libraryPath?: string }): Promise<LibraryApiResult<RendererLibrarySummary>> {
+    const result = await request({
+      type: 'library.open.request',
+      ...(input?.libraryPath ? { libraryPath: input.libraryPath } : {}),
+    });
     if (!result.ok) return failure(result);
     if (result.type !== 'library.opened') throw new Error('Unexpected open-library response.');
     return { ok: true as const, value: result.library };
+  },
+
+  async chooseLibraryPath(): Promise<LibraryApiResult<string | null>> {
+    const result = await request({ type: 'library.choose-path.request' });
+    if (!result.ok) return failure(result);
+    if (result.type !== 'library.choose-path') {
+      throw new Error('Unexpected choose-library-path response.');
+    }
+    return { ok: true as const, value: result.path };
   },
 
   async cancelOpen(): Promise<LibraryApiResult<void>> {
@@ -460,7 +482,7 @@ const library: SerpentLibraryApi = Object.freeze({
     libraryId: string;
     parentFolderId?: string;
     name: string;
-  }): Promise<LibraryApiResult<ManagedFolderSummary & { historyEntryId?: string }>> {
+  }): Promise<LibraryApiResult<ManagedFolderSummary & { historyEntryId?: string; mutationReceipt?: MutationReceipt }>> {
     const result = await request({ type: 'folder.create.request', ...input });
     if (!result.ok) return failure(result);
     if (result.type !== 'folder.created') throw new Error('Unexpected create-folder response.');
@@ -469,6 +491,7 @@ const library: SerpentLibraryApi = Object.freeze({
       value: {
         ...result.folder,
         ...(result.historyEntryId ? { historyEntryId: result.historyEntryId } : {}),
+        ...(result.mutationReceipt ? { mutationReceipt: result.mutationReceipt } : {}),
       },
     };
   },
@@ -988,11 +1011,18 @@ const library: SerpentLibraryApi = Object.freeze({
   async importFolderAsLinked({
     libraryId,
     displayName,
+    parentFolderId,
   }: {
     libraryId: string;
     displayName?: string;
+    parentFolderId?: string | null;
   }): Promise<LibraryApiResult<LinkedFolderSummary>> {
-    const result = await request({ type: 'asset.import-linked.request', libraryId, displayName });
+    const result = await request({
+      type: 'asset.import-linked.request',
+      libraryId,
+      displayName,
+      parentFolderId,
+    });
     if (!result.ok) return failure(result);
     if (result.type !== 'asset.import-linked.completed') throw new Error('Unexpected import-linked-folder response.');
     return { ok: true, value: result.linkedFolder };
@@ -1320,6 +1350,17 @@ const library: SerpentLibraryApi = Object.freeze({
   },
 
   async openBrowseSession({ libraryId, query, filters, scope, sort, smartCollectionId, limit, showIgnored }: { libraryId: string; query: SearchQuery | null; filters?: FilterClause[]; scope?: SearchScope; sort?: { field: 'name' | 'modified_at' | 'created_at' | 'byte_size' | 'long_edge' | 'duration' | 'rating' | 'color' | 'author'; order: 'asc' | 'desc' }; smartCollectionId?: string; limit?: number; showIgnored?: boolean }) {
+    const delayedBrowse = e2eBrowseSessionDelay;
+    const shouldDelay = delayedBrowse && (
+      delayedBrowse.target.folderId !== undefined
+        ? scope?.kind === 'folder' && scope.folderId === delayedBrowse.target.folderId
+        : delayedBrowse.target.smartCollectionId !== undefined &&
+          smartCollectionId === delayedBrowse.target.smartCollectionId
+    );
+    if (shouldDelay && delayedBrowse) {
+      e2eBrowseSessionDelay = null;
+      await new Promise((resolve) => setTimeout(resolve, delayedBrowse.delayMs));
+    }
     const result = await request({ type: 'browse.session.open.request', libraryId, query, filters, scope, sort, smartCollectionId, limit, showIgnored });
     if (!result.ok) return failure(result);
     if (result.type !== 'browse.session.opened') throw new Error('Unexpected open-browse-session response.');
@@ -1329,6 +1370,8 @@ const library: SerpentLibraryApi = Object.freeze({
         sessionId: result.sessionId,
         libraryGeneration: result.libraryGeneration,
         changeSequence: result.changeSequence,
+        ...(result.catalogSequence === undefined ? {} : { catalogSequence: result.catalogSequence }),
+        ...(result.snapshotGeneration === undefined ? {} : { snapshotGeneration: result.snapshotGeneration }),
         queryFingerprint: result.queryFingerprint,
         items: result.items,
         total: result.total,
@@ -1357,35 +1400,12 @@ const library: SerpentLibraryApi = Object.freeze({
       value: {
         sessionId: result.sessionId,
         changeSequence: result.changeSequence,
+        ...(result.catalogSequence === undefined ? {} : { catalogSequence: result.catalogSequence }),
+        ...(result.snapshotGeneration === undefined ? {} : { snapshotGeneration: result.snapshotGeneration }),
         items: result.items,
         total: result.total,
         offset: result.offset,
         ...(result.snippets ? { snippets: result.snippets } : {}),
-      },
-    };
-  },
-
-  async fetchBrowseSessionGeometry({ libraryId, sessionId, startIndex, limit }: { libraryId: string; sessionId: string; startIndex: number; limit?: number }) {
-    const result = await request({ type: 'browse.session.geometry.request', libraryId, sessionId, startIndex, limit });
-    if (!result.ok) return failure(result);
-    if (result.type === 'browse.session.stale') {
-      return {
-        ok: true as const,
-        value: {
-          stale: true as const,
-          sessionId: result.sessionId,
-          reason: result.reason,
-        },
-      };
-    }
-    if (result.type !== 'browse.session.geometry') throw new Error('Unexpected browse-session-geometry response.');
-    return {
-      ok: true as const,
-      value: {
-        sessionId: result.sessionId,
-        startIndex: result.startIndex,
-        changeSequence: result.changeSequence,
-        entries: result.entries,
       },
     };
   },
@@ -2015,17 +2035,24 @@ const library: SerpentLibraryApi = Object.freeze({
     if (result.type !== 'sync.server.deleted') throw new Error('Unexpected sync server delete response.');
     return { ok: true, value: { id: result.id } };
   },
-  async syncSaveBinding({ libraryId, serverId, directoryName, enabled, pollIntervalMs }: { libraryId: string; serverId: string; directoryName?: string; enabled?: boolean; pollIntervalMs?: number }): Promise<LibraryApiResult<void>> {
-    const result = await request({ type: 'sync.library.binding.save.request', libraryId, serverId, directoryName, enabled, pollIntervalMs });
+  async syncSaveBinding({ libraryId, serverId, directoryName, enabled, pollIntervalMs, showCardSyncStatus }: { libraryId: string; serverId: string; directoryName?: string; enabled?: boolean; pollIntervalMs?: number; showCardSyncStatus?: boolean }): Promise<LibraryApiResult<void>> {
+    const result = await request({ type: 'sync.library.binding.save.request', libraryId, serverId, directoryName, enabled, pollIntervalMs, showCardSyncStatus });
     if (!result.ok) return failure(result);
     if (result.type !== 'sync.binding.saved') throw new Error('Unexpected sync binding response.');
     return { ok: true, value: undefined };
   },
-  async syncGetBinding({ libraryId }: { libraryId: string }): Promise<LibraryApiResult<{ serverId: string; directoryName?: string; lastSyncedAt?: string; enabled?: boolean; pollIntervalMs?: number } | null>> {
+  async syncGetBinding({ libraryId }: { libraryId: string }): Promise<LibraryApiResult<{ serverId: string; directoryName?: string; lastSyncedAt?: string; enabled?: boolean; pollIntervalMs?: number; showCardSyncStatus?: boolean } | null>> {
     const result = await request({ type: 'sync.library.binding.get.request', libraryId });
     if (!result.ok) return failure(result);
     if (result.type !== 'sync.binding.got') throw new Error('Unexpected sync binding get response.');
     return { ok: true, value: result.binding };
+  },
+  async syncListCardStatuses({ libraryId, assetIds }: { libraryId: string; assetIds: string[] }): Promise<LibraryApiResult<Array<{ assetId: string; status: 'pending' | 'conflict' }>>> {
+    if (assetIds.length === 0) return { ok: true, value: [] };
+    const result = await request({ type: 'sync.asset-card-status.request', libraryId, assetIds });
+    if (!result.ok) return failure(result);
+    if (result.type !== 'sync.asset-card-status') throw new Error('Unexpected sync card status response.');
+    return { ok: true, value: result.statuses };
   },
 
   // Serpent-xffq: 同步探测/预览/执行（Main 按 serverId 解析 URL 与凭据）。
@@ -2470,6 +2497,22 @@ const e2eDiagnostics = Object.freeze({
   getRequestCount(type: RendererRequest['type']): number {
     return requestCounts.get(type) ?? 0;
   },
+  delayNextBrowseSession(
+    target: E2eBrowseSessionDelayTarget,
+    delayMs: number,
+  ): void {
+    if (
+      !e2eEnabled ||
+      !Number.isInteger(delayMs) ||
+      delayMs < 0 ||
+      delayMs > 5_000 ||
+      (target.folderId === undefined) ===
+        (target.smartCollectionId === undefined)
+    ) {
+      throw new Error('Invalid E2E browse-session delay.');
+    }
+    e2eBrowseSessionDelay = { target: { ...target }, delayMs };
+  },
 });
 
 function parseRevealAppLogResult(input: unknown): RevealAppLogResult {
@@ -2646,21 +2689,32 @@ const shell: SerpentShellApi = Object.freeze({
       ipcRenderer.removeListener(COPY_SELECTION_CHANNEL, handler);
     };
   },
-  onApplicationMenuCommand(listener: (command: ApplicationMenuCommand) => void): () => void {
+  onApplicationMenuCommand(listener: (event: ApplicationMenuCommandEvent) => void): () => void {
+    const commands: readonly ApplicationMenuCommand[] = [
+      'invert-selection', 'copy-selection',
+      'file.import-files', 'file.import-folder', 'file.import-linked-folder',
+      'edit.undo', 'edit.redo', 'edit.paste', 'edit.select-all', 'edit.clear-selection',
+      'library.create', 'library.open', 'library.open-recent', 'library.close', 'library.remove',
+      'library.delete-from-disk', 'library.import', 'library.import-eagle', 'library.export', 'library.settings',
+      'window.background-jobs', 'window.diagnostics',
+      'about.serpent', 'about.github', 'about.open-source', 'about.diagnostics', 'settings',
+    ];
     const handler = (_event: Electron.IpcRendererEvent, input: unknown) => {
-      if (typeof input !== 'string') return;
-      const commands: readonly ApplicationMenuCommand[] = [
-        'invert-selection', 'copy-selection',
-        'file.import-files', 'file.import-folder', 'file.import-linked-folder',
-        'edit.undo', 'edit.redo', 'edit.paste', 'edit.select-all', 'edit.clear-selection',
-        'library.create', 'library.open', 'library.close', 'library.remove',
-        'library.delete-from-disk', 'library.import', 'library.import-eagle', 'library.export', 'library.settings',
-        'window.background-jobs', 'window.diagnostics',
-        'about.serpent', 'about.github', 'about.open-source', 'about.diagnostics', 'settings',
-      ];
-      if (commands.includes(input as ApplicationMenuCommand)) {
-        listener(input as ApplicationMenuCommand);
+      // Items with a payload arrive as { command, payload }.
+      if (typeof input === 'string') {
+        if (commands.includes(input as ApplicationMenuCommand)) {
+          listener({ command: input as ApplicationMenuCommand });
+        }
+        return;
       }
+      if (typeof input !== 'object' || input === null) return;
+      const { command, payload } = input as { command?: unknown; payload?: unknown };
+      if (typeof command !== 'string') return;
+      if (!commands.includes(command as ApplicationMenuCommand)) return;
+      listener({
+        command: command as ApplicationMenuCommand,
+        ...(typeof payload === 'string' ? { payload } : {}),
+      });
     };
     ipcRenderer.on(APPLICATION_MENU_COMMAND_CHANNEL, handler);
     return () => {

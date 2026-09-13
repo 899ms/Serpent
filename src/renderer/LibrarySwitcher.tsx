@@ -1,5 +1,4 @@
 import {
-  Fragment,
   useEffect,
   useId,
   useRef,
@@ -16,6 +15,7 @@ import {
 } from "./roving-list-keyboard";
 import { Icon } from "./Icons";
 import { Tooltip } from "./ui/primitives/Tooltip";
+import { PortaledPopover } from "./PortaledPopover";
 import { MenuSurface, resolveMenuNodes } from "./ui/patterns";
 
 const MENU_ITEM_SELECTOR = '[role="menuitem"], [role="menuitemradio"]';
@@ -62,6 +62,15 @@ export type LibrarySwitcherProps = {
   onMenuOpen?: () => void;
   /** True when a library is open (gates library-scoped transfer actions). */
   libraryOpen?: boolean;
+  /**
+   * Portal the menu to document.body. Required in the app toolbar: the toolbar
+   * is its own stacking context at `--ui-layer-shell`, so an in-place menu ties
+   * with the fixed pane resizers and hovering the menu where it crosses the
+   * pane divider starts a pane drag instead of clicking the item (the menu did
+   * paint above them — which is why it looked right — but the resizer still won
+   * the pointer). The sidebar placement keeps the in-place menu.
+   */
+  portaled?: boolean;
   /** 同步连接状态（Serpent-ae7257 后续）：link / link-off 图标提示。 */
   syncStatus?: "none" | "disabled" | "enabled";
   busy?: boolean;
@@ -92,6 +101,7 @@ export function LibrarySwitcher({
   onForgetRecent,
   onMenuOpen,
   libraryOpen = false,
+  portaled = false,
   syncStatus = "none",
   busy = false,
   onImportLibrary,
@@ -116,9 +126,18 @@ export function LibrarySwitcher({
   useEffect(() => {
     if (!open) return;
     function onPointerDown(event: PointerEvent) {
-      if (!rootRef.current?.contains(event.target as Node)) {
-        closeMenu(false);
+      const target = event.target;
+      if (rootRef.current?.contains(target as Node)) return;
+      // The portaled menu lives on document.body, outside rootRef; without
+      // this, clicking any menu item would read as an outside click and close
+      // the menu before the action runs.
+      if (
+        target instanceof Element &&
+        target.closest('[data-library-switcher-menu="portaled"]') !== null
+      ) {
+        return;
       }
+      closeMenu(false);
     }
     document.addEventListener("pointerdown", onPointerDown);
     const raf = requestAnimationFrame(() => {
@@ -156,6 +175,162 @@ export function LibrarySwitcher({
     setKeyboardNav(true);
   }
 
+  // One source of truth for the menu items. The in-place MenuSurface is
+
+  // used when the switcher sits in the sidebar; the portalled surface is
+
+  // required in the app toolbar, whose own stacking context would otherwise
+
+  // hand the pointer to the fixed pane resizers and start a pane drag.
+
+  const menuItems = (
+    <>
+        <button
+          className="library-switcher-item"
+          onClick={() => runMenuAction(onCreateLibrary)}
+          role="menuitem"
+          tabIndex={-1}
+          type="button"
+        >
+          {t("shell.createLibraryEllipsis")}
+        </button>
+        <button
+          className="library-switcher-item"
+          onClick={() => runMenuAction(onOpenLibrary)}
+          role="menuitem"
+          tabIndex={-1}
+          type="button"
+        >
+          {t("shell.openLibraryEllipsis")}
+        </button>
+        <button
+          className="library-switcher-item"
+          disabled={!libraryName}
+          onClick={() => runMenuAction(onCloseLibrary)}
+          role="menuitem"
+          tabIndex={-1}
+          type="button"
+        >
+          {t("shell.closeLibrary")}
+        </button>
+        <button
+          className="library-switcher-item"
+          data-hover-tip={t("toolbar.importLibraryHint")}
+          disabled={!onImportLibrary || !libraryOpen || busy}
+          onClick={() => {
+            if (onImportLibrary) runMenuAction(onImportLibrary);
+          }}
+          role="menuitem"
+          tabIndex={-1}
+          type="button"
+        >
+          {t("toolbar.importLibrary")}
+        </button>
+        <button
+          className="library-switcher-item"
+          disabled={!onExportLibrary || !libraryOpen || busy}
+          onClick={() => {
+            if (onExportLibrary) runMenuAction(onExportLibrary);
+          }}
+          role="menuitem"
+          tabIndex={-1}
+          type="button"
+        >
+          {t("toolbar.exportLibrary")}
+        </button>
+        <button
+          className="library-switcher-item"
+          disabled={!libraryName || !onRemoveLibrary}
+          onClick={() => {
+            if (onRemoveLibrary) runMenuAction(onRemoveLibrary);
+          }}
+          role="menuitem"
+          tabIndex={-1}
+          title={t("shell.removeLibraryHint")}
+          type="button"
+        >
+          {t("shell.removeLibrary")}
+        </button>
+        <button
+          className="library-switcher-item is-danger"
+          disabled={!libraryName || !onDeleteLibraryFromDisk}
+          onClick={() => {
+            if (onDeleteLibraryFromDisk) runMenuAction(onDeleteLibraryFromDisk);
+          }}
+          role="menuitem"
+          tabIndex={-1}
+          type="button"
+        >
+          {t("shell.deleteLibraryFromDisk")}
+        </button>
+        <button
+          className="library-switcher-item"
+          disabled={!libraryName || busy || !onOpenLibrarySettings}
+          onClick={() => {
+            if (onOpenLibrarySettings) runMenuAction(onOpenLibrarySettings);
+          }}
+          role="menuitem"
+          tabIndex={-1}
+          type="button"
+        >
+          {t("settings.librarySettings")}
+        </button>
+        {recentLibraries.length > 0 && (
+          <>
+            <div aria-hidden="true" className="library-switcher-divider" />
+            <div
+              aria-label={t("shell.otherLibraries")}
+              className="library-switcher-section"
+              role="group"
+            >
+              <div className="library-switcher-section-label">
+                {t("shell.otherLibraries")}
+              </div>
+              {recentLibraries.map((entry) => (
+                <div className="library-switcher-recent-row" key={entry.path}>
+                  {/* Serpent-s0oq: hovering a recent library reveals its full
+                      path via the standard document-level hover tip (420ms,
+                      themed) — no inline path line. */}
+                  <Tooltip label={entry.path}>
+                    <button
+                      className="library-switcher-item library-switcher-recent-open"
+                      onClick={() => {
+                        closeMenu(true);
+                        onOpenRecent?.(entry.path);
+                      }}
+                      role="menuitem"
+                      tabIndex={-1}
+                      type="button"
+                    >
+                      <span className="library-switcher-item-label">
+                        {entry.name}
+                      </span>
+                    </button>
+                  </Tooltip>
+                  {onForgetRecent != null && (
+                    <button
+                      className="library-switcher-recent-forget"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onForgetRecent(entry.path);
+                      }}
+                      tabIndex={-1}
+                      title={t("shell.forgetRecentLibrary")}
+                      type="button"
+                      {...iconActionAttrs(t("shell.forgetRecentLibrary"))}
+                    >
+                      <Icon name="close" size={12} />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+    </>
+
+  );
+
   return (
     <div className="library-switcher" ref={rootRef}>
       <button
@@ -186,6 +361,8 @@ export function LibrarySwitcher({
         type="button"
       >
         <span className="library-switcher-name">{label}</span>
+        {/* Selector affordance: the row opens the library menu. */}
+        <Icon name="chevrons-up-down" size={13} />
         {syncStatus !== "none" ? (
           <span
             className="library-switcher-sync-status"
@@ -199,163 +376,29 @@ export function LibrarySwitcher({
             <Icon name={syncStatus === "enabled" ? "link" : "link-off"} size={12} />
           </span>
         ) : null}
-        <Icon name="chevron" size={13} />
       </button>
-      {open && (
+      {open && (portaled ? (
+        <PortaledPopover
+          anchorRef={triggerRef}
+          data-library-switcher-menu="portaled"
+          className={`library-switcher-menu${keyboardNav ? " is-keyboard-navigation" : ""}`}
+          id={menuId}
+          onKeyDown={onMenuKeyDown}
+          onPointerMove={() => setKeyboardNav(false)}
+          role="menu"
+        >
+          {menuItems}
+        </PortaledPopover>
+      ) : (
         <MenuSurface
           className={`library-switcher-menu${keyboardNav ? " is-keyboard-navigation" : ""}`}
           id={menuId}
           nodes={LIBRARY_MENU_SURFACE_NODES}
           onKeyDown={onMenuKeyDown}
           onPointerMove={() => setKeyboardNav(false)}
-          renderNode={(node) => (
-            <Fragment key={node.id}>
-          <button
-            className="library-switcher-item"
-            onClick={() => runMenuAction(onCreateLibrary)}
-            role="menuitem"
-            tabIndex={-1}
-            type="button"
-          >
-            {t("shell.createLibraryEllipsis")}
-          </button>
-          <button
-            className="library-switcher-item"
-            onClick={() => runMenuAction(onOpenLibrary)}
-            role="menuitem"
-            tabIndex={-1}
-            type="button"
-          >
-            {t("shell.openLibraryEllipsis")}
-          </button>
-          <button
-            className="library-switcher-item"
-            disabled={!libraryName}
-            onClick={() => runMenuAction(onCloseLibrary)}
-            role="menuitem"
-            tabIndex={-1}
-            type="button"
-          >
-            {t("shell.closeLibrary")}
-          </button>
-          <button
-            className="library-switcher-item"
-            data-hover-tip={t("toolbar.importLibraryHint")}
-            disabled={!onImportLibrary || !libraryOpen || busy}
-            onClick={() => {
-              if (onImportLibrary) runMenuAction(onImportLibrary);
-            }}
-            role="menuitem"
-            tabIndex={-1}
-            type="button"
-          >
-            {t("toolbar.importLibrary")}
-          </button>
-          <button
-            className="library-switcher-item"
-            disabled={!onExportLibrary || !libraryOpen || busy}
-            onClick={() => {
-              if (onExportLibrary) runMenuAction(onExportLibrary);
-            }}
-            role="menuitem"
-            tabIndex={-1}
-            type="button"
-          >
-            {t("toolbar.exportLibrary")}
-          </button>
-          <button
-            className="library-switcher-item"
-            disabled={!libraryName || !onRemoveLibrary}
-            onClick={() => {
-              if (onRemoveLibrary) runMenuAction(onRemoveLibrary);
-            }}
-            role="menuitem"
-            tabIndex={-1}
-            title={t("shell.removeLibraryHint")}
-            type="button"
-          >
-            {t("shell.removeLibrary")}
-          </button>
-          <button
-            className="library-switcher-item is-danger"
-            disabled={!libraryName || !onDeleteLibraryFromDisk}
-            onClick={() => {
-              if (onDeleteLibraryFromDisk) runMenuAction(onDeleteLibraryFromDisk);
-            }}
-            role="menuitem"
-            tabIndex={-1}
-            type="button"
-          >
-            {t("shell.deleteLibraryFromDisk")}
-          </button>
-          <button
-            className="library-switcher-item"
-            disabled={!libraryName || busy || !onOpenLibrarySettings}
-            onClick={() => {
-              if (onOpenLibrarySettings) runMenuAction(onOpenLibrarySettings);
-            }}
-            role="menuitem"
-            tabIndex={-1}
-            type="button"
-          >
-            {t("settings.librarySettings")}
-          </button>
-          {recentLibraries.length > 0 && (
-            <>
-              <div aria-hidden="true" className="library-switcher-divider" />
-              <div
-                aria-label={t("shell.otherLibraries")}
-                className="library-switcher-section"
-                role="group"
-              >
-                <div className="library-switcher-section-label">
-                  {t("shell.otherLibraries")}
-                </div>
-                {recentLibraries.map((entry) => (
-                  <div className="library-switcher-recent-row" key={entry.path}>
-                    {/* Serpent-s0oq: hovering a recent library reveals its full
-                        path via the standard document-level hover tip (420ms,
-                        themed) — no inline path line. */}
-                    <Tooltip label={entry.path}>
-                      <button
-                        className="library-switcher-item library-switcher-recent-open"
-                        onClick={() => {
-                          closeMenu(true);
-                          onOpenRecent?.(entry.path);
-                        }}
-                        role="menuitem"
-                        tabIndex={-1}
-                        type="button"
-                      >
-                        <span className="library-switcher-item-label">
-                          {entry.name}
-                        </span>
-                      </button>
-                    </Tooltip>
-                    {onForgetRecent != null && (
-                      <button
-                        className="library-switcher-recent-forget"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          onForgetRecent(entry.path);
-                        }}
-                        tabIndex={-1}
-                        title={t("shell.forgetRecentLibrary")}
-                        type="button"
-                        {...iconActionAttrs(t("shell.forgetRecentLibrary"))}
-                      >
-                        <Icon name="close" size={12} />
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
-            </Fragment>
-          )}
+          renderNode={() => menuItems}
         />
-      )}
+      ))}
     </div>
   );
 }

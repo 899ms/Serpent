@@ -59,6 +59,11 @@ export type ContextMenuDescriptor =
        * means a linked root (or any managed folder).
        */
       linkedRelativePath?: string;
+      /**
+       * Serpent-316493: the subject is the library root (folder panel blank
+       * area). Only the root-appropriate entries are offered.
+       */
+      isLibraryRoot?: boolean;
     }
   | {
       type: "multi-asset";
@@ -72,6 +77,19 @@ export type ContextMenuDescriptor =
       type: "workspace";
       /** Current asset selection when the menu opens; omitted when empty. */
       assetIds?: string[];
+    }
+  | {
+      /** Browser-style workspace tab. Entity data enables contextual actions. */
+      type: "workspace-tab";
+      tabId: string;
+      name: string;
+      entity:
+        | { kind: "folder"; id: string }
+        | { kind: "collection"; id: string }
+        | null;
+      /** False for the last remaining tab: the strip never empties entirely. */
+      canClose: boolean;
+      canCloseOthers: boolean;
     }
   | {
       /** Sidebar trash row context menu (Serpent-gaoi). */
@@ -293,6 +311,10 @@ export function ContextMenu({
         position: "fixed",
         left: `max(${gap}px, min(${left}px, calc(100vw - ${rect.width + gap}px)))`,
         top: `max(${gap}px, min(${top}px, calc(100vh - ${rect.height + gap}px)))`,
+        // Keep the viewport constraint on the positioned surface as well as
+        // in CSS so the measured menu remains reachable after a resize.
+        maxWidth: `${Math.max(0, vw - gap * 2)}px`,
+        maxHeight: `${Math.max(0, vh - gap * 2)}px`,
         visibility: "visible",
       });
     };

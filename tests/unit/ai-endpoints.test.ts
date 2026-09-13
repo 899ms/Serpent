@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  AI_API_FORMATS,
+  DEFAULT_AI_API_FORMAT,
   DEFAULT_AI_BASE_URLS,
+  DEFAULT_AI_MODELS,
   effectiveAiBaseUrl,
   formatAiLanguagesForPrompt,
   listAiModels,
@@ -14,6 +17,27 @@ import {
   resolveOpenAiModelsUrl,
   resolveOpenAiResponsesUrl,
 } from '../../src/shared/ai-endpoints';
+
+describe('AI API format defaults (user decision 2026-09-13)', () => {
+  it('defaults to Anthropic Messages', () => {
+    expect(DEFAULT_AI_API_FORMAT).toBe('anthropic');
+    expect(AI_API_FORMATS).toContain(DEFAULT_AI_API_FORMAT);
+  });
+
+  /**
+   * Format and model are one pair. A fresh profile that defaulted the wire
+   * protocol to Anthropic while keeping the old DashScope model id would fail
+   * its first probe with a confusing provider error, so the pairing is asserted
+   * for every format rather than only for the default.
+   */
+  it('pairs every format with a non-empty default model', () => {
+    expect(DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT]).toBe('claude-sonnet-4-20250514');
+    for (const format of AI_API_FORMATS) {
+      expect(DEFAULT_AI_MODELS[format]?.trim().length ?? 0).toBeGreaterThan(0);
+      expect(DEFAULT_AI_BASE_URLS[format]?.trim().length ?? 0).toBeGreaterThan(0);
+    }
+  });
+});
 
 describe('ai-endpoints URL resolution', () => {
   it('uses official defaults when baseUrl is empty', () => {

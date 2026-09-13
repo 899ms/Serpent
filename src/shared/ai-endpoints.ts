@@ -43,6 +43,24 @@ export const DEFAULT_AI_BASE_URLS: Record<AiApiFormat, string> = {
   gemini_native: 'https://generativelanguage.googleapis.com/v1beta',
 };
 
+/**
+ * Format used when nothing is stored yet (user decision 2026-09-13).
+ *
+ * Format and model are one pair: a fresh profile must not end up with the
+ * Anthropic wire protocol and a DashScope model id, so both defaults live here
+ * and every storage/probe fallback reads them from one place.
+ */
+export const DEFAULT_AI_API_FORMAT: AiApiFormat = 'anthropic';
+
+/** Model placeholder / default per format, shown when the user has none. */
+export const DEFAULT_AI_MODELS: Record<AiApiFormat, string> = {
+  dashscope_native: 'qwen3-vl-plus',
+  openai_chat: 'gpt-4o-mini',
+  openai_responses: 'gpt-4o-mini',
+  anthropic: 'claude-sonnet-4-20250514',
+  gemini_native: 'gemini-2.0-flash',
+};
+
 export const AI_LANGUAGE_OPTIONS = [
   { id: 'zh-CN', labelZh: '中文', labelEn: 'Chinese' },
   { id: 'en', labelZh: 'English', labelEn: 'English' },
