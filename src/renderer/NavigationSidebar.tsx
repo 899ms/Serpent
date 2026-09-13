@@ -842,8 +842,6 @@ export interface NavigationSidebarProps {
 
   // --- Linked folder actions ---
   onImportFolderAsLinked: () => void;
-  /** Library identity + menu, rendered at the top of this pane (Serpent: toolbar space for tabs). */
-  libraryHeader?: ReactNode;
   /** Serpent-b8a853: pulse the sidebar "导入链接文件夹" entry as a feature hint. */
   linkedFolderHintActive?: boolean;
   onLinkedFolderHintHover?: () => void;
@@ -963,7 +961,6 @@ export function NavigationSidebar(props: NavigationSidebarProps) {
     onAssetsDroppedOnCollection,
     onManagedAssetCopyModeChange,
     onImportFolderAsLinked,
-    libraryHeader,
     linkedFolderHintActive,
     onLinkedFolderHintHover,
     onLinkedFolderHintHoverEnd,
@@ -1977,9 +1974,6 @@ export function NavigationSidebar(props: NavigationSidebarProps) {
       className="navigation-pane"
       data-ui-surface-variant="navigation"
     >
-      {libraryHeader ? (
-        <div className="navigation-pane-header">{libraryHeader}</div>
-      ) : null}
       <nav className="navigation-scroll">
         <NavRow
           active={library ? isAllAssetsNavActive(browseNavFlags) : true}

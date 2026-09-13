@@ -501,54 +501,6 @@ summary:focus-visible {
   line-height: 1.35;
 }
 
-/* Library identity + menu live at the top of the navigation pane (not the app
-   toolbar), so the toolbar row belongs to the workspace tabs. Styled like the
-   nav rows below it — same type scale, colour and hover — with no divider. */
-.navigation-pane-header {
-  display: flex;
-  align-items: center;
-  flex: 0 0 auto;
-  min-width: 0;
-  /* Centred in the pane: the title sits on the panel's midline rather than on
-     the nav rows' label column (user request). */
-  padding: 7px 8px;
-  justify-content: center;
-}
-
-.navigation-pane-header .library-switcher {
-  flex: 0 1 auto;
-  max-width: none;
-  justify-content: center;
-}
-
-.navigation-pane-header .library-switcher-trigger {
-  gap: 7px;
-  justify-content: center;
-  /* Clickable (opens the library menu) — show the pointer like the nav rows. */
-  cursor: pointer;
-  padding: 0 7px;
-  border-radius: 6px;
-  color: var(--secondary);
-  font-size: calc(12px * var(--ui-font-scale));
-  font-weight: 450;
-  letter-spacing: 0;
-}
-
-.navigation-pane-header .library-switcher-trigger:hover:not(:disabled),
-.navigation-pane-header .library-switcher-trigger[aria-expanded="true"]:not(:disabled) {
-  background: var(--hover);
-}
-
-.navigation-pane-header .library-switcher-trigger > .icon {
-  flex-shrink: 0;
-}
-
-/* The vault icon, the library name, the sync badge and the chevron all sit
-   together as one centred group. */
-.navigation-pane-header .library-switcher-name {
-  flex: 0 1 auto;
-}
-
 /* 28px chrome must sit on the geometric midline of the 44px bar. A cluster
    line-height > 1 adds an inline strut that lifts icon buttons and the
    library name above the search field. */
@@ -611,15 +563,19 @@ body.platform-darwin .toolbar-nav-cluster {
   z-index: 1;
   top: 0;
   left: 10px;
-  width: var(--shell-control-height);
+  /* Wide enough for the pinned toggle *and* the library switcher beside it;
+     it overlays the browse track, which reserves the same width below. */
+  width: auto;
   min-width: 0;
   padding: 0;
-  gap: 0;
+  gap: 9px;
   overflow: visible;
 }
 
 .app-shell.left-collapsed .toolbar-workspace-cluster {
-  padding-left: calc(10px + var(--shell-control-height) + 6px);
+  padding-left: calc(
+    10px + var(--shell-control-height) + 9px + var(--shell-library-switcher-width, 150px) + 9px
+  );
 }
 
 /* macOS traffic lights occupy the title-bar's leading inset, so both the
@@ -629,7 +585,9 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-nav-cluster {
 }
 
 body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
-  padding-left: calc(78px + var(--shell-control-height) + 6px);
+  padding-left: calc(
+    78px + var(--shell-control-height) + 9px + var(--shell-library-switcher-width, 150px) + 9px
+  );
 }
 
 .app-shell.right-collapsed .toolbar-inspector-cluster {
@@ -1270,6 +1228,17 @@ body.platform-darwin .app-shell.left-collapsed .toolbar-workspace-cluster {
 }
 
 /* Library switcher sits in the browse column beside history + breadcrumbs. */
+/* Toolbar placement (beside the panel toggle): a bounded width keeps the tabs
+   from being squeezed, and the whole row is clickable. */
+.toolbar-nav-cluster .library-switcher {
+  flex: 0 1 170px;
+  max-width: 170px;
+}
+
+.toolbar-nav-cluster .library-switcher-trigger {
+  cursor: pointer;
+}
+
 .library-switcher {
   /* Do not set overflow:hidden here — the dropdown menu is position:absolute
      inside this box (Serpent-7fy: clipping made the menu look “completely wrong”).

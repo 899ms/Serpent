@@ -11791,6 +11791,42 @@ function AppInner() {
             onClick={() => setLeftOpen((v) => !v)}
             pressed={leftOpen}
           />
+          <LibrarySwitcher
+            busy={busy}
+            disabled={!api}
+            portaled
+            syncStatus={syncBindingStatus}
+            importMenuCopy={importMenuCopy}
+            libraryName={library?.displayName ?? null}
+            libraryOpen={Boolean(library)}
+            onCloseLibrary={() => void closeLibrary()}
+            onRemoveLibrary={() => void removeLibrary()}
+            onDeleteLibraryFromDisk={() => requestDeleteLibraryFromDisk()}
+            onOpenLibrarySettings={() => {
+              setAppSettingsOpen(false);
+              setLibrarySettingsOpen(true);
+            }}
+            onCreateLibrary={() => {
+              setDialogValue(t("shell.myLibrary"));
+              setCreateLibraryPhase("form");
+              setDialog("library");
+            }}
+            onExportLibrary={() => setExportDialogOpen(true)}
+            onImportFolder={() => void importAssets("folder")}
+            onImportLibrary={() => {
+              setOpenLibraryChooserOpen(false);
+              setImportLibraryChooserOpen(true);
+            }}
+            onImportLinkedFolder={() => void importFolderAsLinked()}
+            onMenuOpen={() => void refreshRecentLibraries()}
+            onOpenLibrary={() => {
+              setImportLibraryChooserOpen(false);
+              setOpenLibraryChooserOpen(true);
+            }}
+            onOpenRecent={(path) => void openRecentLibrary(path)}
+            onForgetRecent={(path) => void forgetRecentLibrary(path)}
+            recentLibraries={recentLibraries}
+          />
         </div>
         <div className="toolbar-cluster toolbar-workspace-cluster">
           <div className="toolbar-workspace-main">
@@ -11814,43 +11850,6 @@ function AppInner() {
                   }}
                 />
               )}
-              {!leftOpen ? (
-                <LibrarySwitcher
-                  busy={busy}
-                  disabled={!api}
-                  syncStatus={syncBindingStatus}
-                  importMenuCopy={importMenuCopy}
-                  libraryName={library?.displayName ?? null}
-                  libraryOpen={Boolean(library)}
-                  onCloseLibrary={() => void closeLibrary()}
-                  onRemoveLibrary={() => void removeLibrary()}
-                  onDeleteLibraryFromDisk={() => requestDeleteLibraryFromDisk()}
-                  onOpenLibrarySettings={() => {
-                    setAppSettingsOpen(false);
-                    setLibrarySettingsOpen(true);
-                  }}
-                  onCreateLibrary={() => {
-                    setDialogValue(t("shell.myLibrary"));
-                    setCreateLibraryPhase("form");
-                    setDialog("library");
-                  }}
-                  onExportLibrary={() => setExportDialogOpen(true)}
-                  onImportFolder={() => void importAssets("folder")}
-                  onImportLibrary={() => {
-                    setOpenLibraryChooserOpen(false);
-                    setImportLibraryChooserOpen(true);
-                  }}
-                  onImportLinkedFolder={() => void importFolderAsLinked()}
-                  onMenuOpen={() => void refreshRecentLibraries()}
-                  onOpenLibrary={() => {
-                    setImportLibraryChooserOpen(false);
-                    setOpenLibraryChooserOpen(true);
-                  }}
-                  onOpenRecent={(path) => void openRecentLibrary(path)}
-                  onForgetRecent={(path) => void forgetRecentLibrary(path)}
-                  recentLibraries={recentLibraries}
-                />
-              ) : null}
             </div>
             <WorkspaceTabs
               activeTabId={workspaceTabsState.activeTabId}
@@ -12028,45 +12027,6 @@ function AppInner() {
         onManagedAssetCopyModeChange={(copyMode) => {
           setAssetDragPreviewCopyMode(dragPreviewRef.current, copyMode);
         }}
-        libraryHeader={
-          leftOpen ? (
-          <LibrarySwitcher
-            busy={busy}
-            disabled={!api}
-            syncStatus={syncBindingStatus}
-            importMenuCopy={importMenuCopy}
-            libraryName={library?.displayName ?? null}
-            libraryOpen={Boolean(library)}
-            onCloseLibrary={() => void closeLibrary()}
-            onRemoveLibrary={() => void removeLibrary()}
-            onDeleteLibraryFromDisk={() => requestDeleteLibraryFromDisk()}
-            onOpenLibrarySettings={() => {
-              setAppSettingsOpen(false);
-              setLibrarySettingsOpen(true);
-            }}
-            onCreateLibrary={() => {
-              setDialogValue(t("shell.myLibrary"));
-              setCreateLibraryPhase("form");
-              setDialog("library");
-            }}
-            onExportLibrary={() => setExportDialogOpen(true)}
-            onImportFolder={() => void importAssets("folder")}
-            onImportLibrary={() => {
-              setOpenLibraryChooserOpen(false);
-              setImportLibraryChooserOpen(true);
-            }}
-            onImportLinkedFolder={() => void importFolderAsLinked()}
-            onMenuOpen={() => void refreshRecentLibraries()}
-            onOpenLibrary={() => {
-              setImportLibraryChooserOpen(false);
-              setOpenLibraryChooserOpen(true);
-            }}
-            onOpenRecent={(path) => void openRecentLibrary(path)}
-            onForgetRecent={(path) => void forgetRecentLibrary(path)}
-            recentLibraries={recentLibraries}
-          />
-          ) : null
-        }
         onImportFolderAsLinked={() => void importFolderAsLinked()}
         linkedFolderHintActive={linkedFolderHintShow}
         onLinkedFolderHintHover={beginLinkedFolderHintHover}
