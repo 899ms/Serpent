@@ -43,10 +43,10 @@ test('cancels a batch relink preview and later applies a fresh preview', async (
     rmSync(managedPath);
     await window.getByRole('button', { name: '刷新磁盘变化' }).click();
     await assetCard(window, 'missing.txt').click();
-    const inspectorStatus = window.locator('.inspector-status-row');
-    await expect(inspectorStatus).toBeVisible();
-    await expect(inspectorStatus).toContainText('未在已知位置找到，请选择恢复位置');
-    await expect(inspectorStatus.getByRole('button', { name: '找回资产' })).toBeVisible();
+    // A missing source is deliberately not surfaced in the Inspector: the
+    // selection keeps its normal panel (2026-09-13 user decision), and the
+    // workspace-level batch relink entry remains the way to recover it.
+    await expect(window.locator('.inspector-status-row')).toHaveCount(0);
     await expect(window.getByRole('button', { name: '批量重新定位' })).toBeVisible();
 
     await window.getByRole('button', { name: '批量重新定位' }).click();

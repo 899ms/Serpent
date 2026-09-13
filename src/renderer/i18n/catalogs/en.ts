@@ -111,7 +111,7 @@ export const en = {
     syncConnected: "Connected to sync server, auto-sync on",
     syncDisconnected: "Bound to sync server, auto-sync off",
     networkStorageNotice:
-      "This library is on a network share (NAS/SMB). Serpent uses rollback journaling here; file locking and disconnect recovery depend on the NAS. Keep one Serpent instance writing at a time and maintain backups.",
+      "This library is on a network share (NAS). Loading may be slower.",
     readOnlyBanner:
       "This library is read-only because it was created by a newer version of Serpent. Upgrade Serpent to edit it.",
     readOnlyBannerMigrationStuck:

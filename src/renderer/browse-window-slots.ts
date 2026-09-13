@@ -1,6 +1,7 @@
 /** Serpent-sa65: page math and real-summary merging for virtualized browse. */
 
 import type { AssetSummary, BrowseLayoutEntry } from "../shared/asset-types";
+import { isGeometryPlaceholder } from "./browse/virtual-browse-layout";
 
 export function browsePageOffset(
   index: number,
@@ -87,11 +88,21 @@ export function mergeLoadedBrowsePage(input: {
   });
 }
 
-/** First-paint Inspector/card copy from the compact layout index (Serpent-l2at / Serpent-joz6). */
+/**
+ * First-paint card copy from the compact layout index (Serpent-l2at / Serpent-joz6).
+ *
+ * Returns undefined for a geometry placeholder: a slot whose identity the index
+ * has not resolved yet must not become a card at all. Rendering a shadow card
+ * for it and swapping in the real card later unmounts the media subtree and
+ * re-requests the cover (CANVAS-038), so the virtual path renders nothing until
+ * the identity is real and then mounts the card exactly once.
+ */
 export function assetSummaryFromLayoutEntry(
   entry: BrowseLayoutEntry,
 ): AssetSummary | undefined {
-  const displayName = entry.displayName?.trim();
+  if (isGeometryPlaceholder(entry)) return undefined;
+  const displayName = entry.displayName?.trim()
+    || entry.relativeFilePath?.trim();
   if (!displayName) return undefined;
   const relativeFilePath = entry.relativeFilePath?.trim() || displayName;
   return {
@@ -100,7 +111,7 @@ export function assetSummaryFromLayoutEntry(
     managedFolderId: null,
     relativeFilePath,
     displayName,
-    currentRevisionId: `layout:${entry.assetId}`,
+    currentRevisionId: entry.previewRevisionId ?? `layout:${entry.assetId}`,
     byteSize: entry.byteSize ?? 0,
     modifiedAt: entry.modifiedAt ?? new Date(0).toISOString(),
     availability: "available",
@@ -112,11 +123,28 @@ export function assetSummaryFromLayoutEntry(
     remainingDays: null,
     thumbnailStatus: entry.previewArtifactId ? "ready" : "pending",
     thumbnailArtifactId: entry.previewArtifactId ?? null,
-    mediaType: "other",
+    previewKind: entry.previewKind ?? null,
+    previewRevisionId: entry.previewRevisionId ?? null,
+    mediaType: entry.mediaType ?? "other",
     width: entry.width,
     height: entry.height,
     durationMs: null,
   };
+}
+
+/**
+ * Card identity for one virtual slot.
+ *
+ * The loaded AssetSummary always wins. Otherwise the slot is synthesized from
+ * the compact index, so the card can paint (caption + ready preview) without
+ * waiting for its summary page. Returns undefined only while the slot is still
+ * an unresolved geometry placeholder.
+ */
+export function virtualSlotAsset(
+  assetById: ReadonlyMap<string, AssetSummary>,
+  entry: BrowseLayoutEntry,
+): AssetSummary | undefined {
+  return assetById.get(entry.assetId) ?? assetSummaryFromLayoutEntry(entry);
 }
 
 function layoutEntryFromLoadedAsset(
@@ -131,6 +159,7 @@ function layoutEntryFromLoadedAsset(
     | "byteSize"
     | "modifiedAt"
     | "rating"
+    | "mediaType"
   >,
 ): BrowseLayoutEntry {
   return {
@@ -143,6 +172,9 @@ function layoutEntryFromLoadedAsset(
     byteSize: asset.byteSize,
     modifiedAt: asset.modifiedAt,
     rating: asset.rating,
+    // Keep the card type so a slot synthesized from this entry does not fall
+    // back to `other` (which adds an extension badge to every image).
+    mediaType: asset.mediaType,
   };
 }
 

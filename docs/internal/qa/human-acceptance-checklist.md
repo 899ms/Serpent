@@ -1,5 +1,7 @@
 # Serpent 人类功能验收清单
 
+> 2026-09-13 交互性能计划：见[第二阶段设计](../implementation/2026-09-13-interactive-performance-design.md)与[工单索引](../development/2026-09-13-interactive-performance-execution.md)，总工单 `Serpent-e9a66b`。PERF2-01 只交付读版本/回执协议与 Worker persist 基线入口，没有可独立操作的 UI 增量。`PERF2-NAV` / `PERF2-NAS` / `PERF2-MEDIA` / `PERF2-MUT` / `PERF2-REFRESH` 目前仅规划、均未实现/未验证，不进入「待人类验收」队列。后续由集成者按可操作增量和实际测试证据登记；历史验收状态不因本设计改变。
+
 > 状态：持续维护
 >
 > 首次建立：2026-07-14
@@ -41,6 +43,25 @@
 ## 当前待人类验收队列
 
 > 2026-08-27 P0：从硬盘删除后再导入同一份 Serpent ZIP，导入库 ID 不变；删除时的 `serpent://` 读取拦住若泄漏，全部卡片会变成裂开图标。见 LIB-ZIP-001（已通过）。
+
+### 2026-09-13 资源库切换与侧栏导航
+
+| ID | 功能 | 状态 | 人类操作 | 预期结果 | 证据 | 结果/反馈 |
+| --- | --- | --- | --- | --- | --- | --- |
+| SWITCH-001 | 从网络盘（SMB）资源库切换到另一个资源库 | 待人类验收 | ① 先打开网络盘上的资源库并停留一会儿。② 点左上角资源库切换器，选另一个资源库。③ 观察是否出现「正在加载」并长时间停住。 | 切换能完成并进入目标库：侧栏变成目标库的文件夹/合集，画布显示目标库资产。不再出现遮罩长时间不消失、切换永不完成。 | [开发日志](../development/2026-09-13-library-switch-hang-and-sidebar-development-log.md) / `tests/e2e/library-switch-benchmark.test.ts` | 2026-09-13 第一轮：修复前真机复现为**切换超时 ≥90 秒且永不完成**（侧栏仍是旧库）；根因是 `library.open` 未像 `library.close` 那样停掉离场库的自动媒体工作。2026-09-13 第二轮（用户要求做成抢占式、授权自行修复）：又定位到三个根因 —— ① `mutation` lane 优先级(80)低于所有交互 lane，排队的 `library.open` 每轮准入都输给可见波积压而被**饿死**；② mutation 要求调度器**完全空闲**，离场库的打开后台核对（28,972 项）把它按住（`schedulerWaitMs` 13.5 s 对应 154 ms 的处理器）；③ 离场库排队的可见窗口提示（最坏 11.4 s 深）排在切换后首屏之前。修复为「切换请求压过整条队列 + 入队即请他库后台 owner 到安全点 + 丢弃离场库排队的可见提示」。真机同一旅程两连测：**切换首帧 1103 ms / 1112 ms**（旧渲染包修复前 ≥90 s 超时；中间态 23.8–29.3 s），`library.open` roundtrip 204/196 ms、`schedulerWaitMs` 27/13 ms，切换后画布 100 卡、`所有资产 28972`、侧栏为目标库自身文件夹/合集。**尚未由用户本人复验**（本项必须由人类点验后才可改为通过）。 |
+| SIDEBAR-001 | 侧栏显示资源库的文件夹、合集与计数 | 待人类验收 | ① 打开任一含文件夹与合集的资源库。② 看左侧「文件夹 / 合集 / 智能合集」三段。 | 显示真实文件夹与合集（含各自计数），「所有资产 / 资源库根目录」计数非 0。不再出现「尚无托管或链接文件夹 / 尚无合集」而库内实际有数据。 | [开发日志](../development/2026-09-13-library-switch-hang-and-sidebar-development-log.md) / `src/renderer/App.tsx` | 2026-09-13：该缺陷为**既有缺陷**（干净 HEAD `570b3cfa` 上用真实库 A/B 对照同样复现），非本轮引入。根因是导航摘要被「加载代次」守卫丢弃（库持续写入 → 反复重载 → 每次加载被取代）。修复后真机侧栏显示 `新建文件夹` 与合集 `c4d`。 |
+
+### 2026-09-13 中等规模画布滚动条与卡片稳定
+
+| ID | 功能 | 状态 | 人类操作 | 预期结果 | 证据 | 结果/反馈 |
+| --- | --- | --- | --- | --- | --- | --- |
+| CANVAS-038 | 约 100–2000 项时滚动条长度稳定，卡片不随滚动忽隐忽现 | 待人类验收 | ① 打开约一千项资产的资源库（本机或网络盘均可）。② 进入「所有资产」或一个明显超过 100 项的文件夹。③ 用滚轮连续向下、再向上滑，观察右侧滚动条拇指长短。④ 停留在中部继续轻滑，看已出现的卡片是否会整张消失再出现。 | 滚动条拇指按全部资产范围变化，不会在滑动时明显变长又变短；已进入视口的卡片保持在原列位置，不会整张闪没。真实缩略图可以渐进补齐。 | [顶层分析与设计](../development/2026-09-13-canvas-038-browse-media-pipeline-redesign.md) / `src/renderer/browse/use-virtual-browse-session.ts` / `src/renderer/browse/virtual-browse-layout.ts` / `tests/unit/virtual-browse-session.test.ts` / `tests/unit/browse-window-slots.test.ts` / `tests/e2e/asset-pagination.test.ts` | 2026-09-13 上一轮：用户明确不通过（滑到约 15% 时全部卡片反复重新加载）；前一轮只跑定向单测，无实机验证、无代码审查。2026-09-13 本轮：按顶层分析重做（几何一次播种 + 槽位身份只由 index 决定）。真机同库同旅程对比：**滚动期间每阶段 `scrollHeight` 取值个数由 3–4 个降为 1 个**（回归态是随滚动位置在 61205/63009/64855/69021 之间漂移）；槽位真实创建 935–1015→795、媒体重复写入 250–262→200。**仍存在打开时索引到达的一次性高度变化**（估算前缀 69561px → 完整索引 57999px，约 20%），是索引就位的那一次、不属于滚动过程。自动化：`test:unit` 461 files/3418 passed、`test:library-availability` 211 passed、`asset-pagination` E2E 2 passed。尚无 Computer Use 与用户本人复验；packaged、macOS 未验证。 |
+
+### 2026-09-13 重命名默认光标位置
+
+| ID | 功能 | 状态 | 人类操作 | 预期结果 | 证据 | 结果/反馈 |
+| --- | --- | --- | --- | --- | --- | --- |
+| RENAME-CARET-001 | 资产、文件夹、合集与智能合集重命名的默认插入位置 | 人类验收通过 | ① 选中资产按 F2。② 分别从侧栏右键重命名文件夹、合集、智能合集。 | 资产文件名光标在扩展名前，如 `1234567|.jpg`；其余名称输入框保持聚焦、没有选中文本，光标位于名称末尾。 | `src/renderer/App.tsx`、`src/renderer/NavigationSidebar.tsx`、`src/renderer/RenameDialog.tsx` / `tests/e2e/asset-rename.test.ts`、`tests/e2e/folder-context-menu.test.ts`、`tests/e2e/collection-folder-hierarchy-regressions.test.ts`、`tests/e2e/organization-search-trash.test.ts` | 2026-09-13：用户确认人工验收通过。定向 Electron E2E 已尝试；资产导入用例在打开重命名之前报“资源库切换正在进行”，文件夹套件有既有缩进断言 `Expected 21, Received 7`，因此这些运行未作为光标行为的自动化通过证据。 |
 
 ### 2026-09-12 工作区标签页
 

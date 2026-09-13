@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 
 import type { AiJobStatus, LibraryApiResult, LinkedAssetDeleteResult, MediaJobStatus, PluginJobStatus, PreviewResolution, RelinkAssetResult, SerpentLibraryApi, SyncCapabilities, SyncReport } from '../shared/library-api';
+import type { MutationReceipt } from '../shared/performance-contract';
 import { summarizePluginJobs } from '../shared/plugin-job-status';
 import type { RecentLibraryEntry } from '../shared/recent-libraries';
 import type { AiApiFormat } from '../shared/ai-endpoints';
@@ -481,7 +482,7 @@ const library: SerpentLibraryApi = Object.freeze({
     libraryId: string;
     parentFolderId?: string;
     name: string;
-  }): Promise<LibraryApiResult<ManagedFolderSummary & { historyEntryId?: string }>> {
+  }): Promise<LibraryApiResult<ManagedFolderSummary & { historyEntryId?: string; mutationReceipt?: MutationReceipt }>> {
     const result = await request({ type: 'folder.create.request', ...input });
     if (!result.ok) return failure(result);
     if (result.type !== 'folder.created') throw new Error('Unexpected create-folder response.');
@@ -490,6 +491,7 @@ const library: SerpentLibraryApi = Object.freeze({
       value: {
         ...result.folder,
         ...(result.historyEntryId ? { historyEntryId: result.historyEntryId } : {}),
+        ...(result.mutationReceipt ? { mutationReceipt: result.mutationReceipt } : {}),
       },
     };
   },
@@ -1368,6 +1370,8 @@ const library: SerpentLibraryApi = Object.freeze({
         sessionId: result.sessionId,
         libraryGeneration: result.libraryGeneration,
         changeSequence: result.changeSequence,
+        ...(result.catalogSequence === undefined ? {} : { catalogSequence: result.catalogSequence }),
+        ...(result.snapshotGeneration === undefined ? {} : { snapshotGeneration: result.snapshotGeneration }),
         queryFingerprint: result.queryFingerprint,
         items: result.items,
         total: result.total,
@@ -1396,35 +1400,12 @@ const library: SerpentLibraryApi = Object.freeze({
       value: {
         sessionId: result.sessionId,
         changeSequence: result.changeSequence,
+        ...(result.catalogSequence === undefined ? {} : { catalogSequence: result.catalogSequence }),
+        ...(result.snapshotGeneration === undefined ? {} : { snapshotGeneration: result.snapshotGeneration }),
         items: result.items,
         total: result.total,
         offset: result.offset,
         ...(result.snippets ? { snippets: result.snippets } : {}),
-      },
-    };
-  },
-
-  async fetchBrowseSessionGeometry({ libraryId, sessionId, startIndex, limit }: { libraryId: string; sessionId: string; startIndex: number; limit?: number }) {
-    const result = await request({ type: 'browse.session.geometry.request', libraryId, sessionId, startIndex, limit });
-    if (!result.ok) return failure(result);
-    if (result.type === 'browse.session.stale') {
-      return {
-        ok: true as const,
-        value: {
-          stale: true as const,
-          sessionId: result.sessionId,
-          reason: result.reason,
-        },
-      };
-    }
-    if (result.type !== 'browse.session.geometry') throw new Error('Unexpected browse-session-geometry response.');
-    return {
-      ok: true as const,
-      value: {
-        sessionId: result.sessionId,
-        startIndex: result.startIndex,
-        changeSequence: result.changeSequence,
-        entries: result.entries,
       },
     };
   },

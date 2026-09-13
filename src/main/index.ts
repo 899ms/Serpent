@@ -281,6 +281,7 @@ import {
   parseAiContentClearedEvent,
 } from "../shared/protocol/responses";
 import { LibraryWorkerClient, WorkerRequestTimeoutError } from "./worker-client";
+import { performanceConsumerIdForWindow } from "../shared/performance-contract";
 import { SyncAutoScheduler, type SyncBindingLike } from "./sync-auto-scheduler";
 import { resolveImageSequenceImportPaths } from "./image-sequence-import";
 import { AppLogger } from "./app-logger";
@@ -3125,14 +3126,6 @@ async function commandFor(
         limit: request.limit,
         offset: request.offset,
       };
-    case "browse.session.geometry.request":
-      return {
-        type: "browse.session.geometry",
-        libraryId: request.libraryId,
-        sessionId: request.sessionId,
-        startIndex: request.startIndex,
-        limit: request.limit,
-      };
     case "browse.session.ids.request":
       return {
         type: "browse.session.ids",
@@ -3867,7 +3860,28 @@ function isRetryableProbeError(error: { code: string; reason?: string }): boolea
   );
 }
 
-async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
+/**
+ * Per-request Main-side trace for library lifecycle requests.
+ *
+ * A switch that stops printing Renderer stage markers, never reaches the
+ * Worker and logs no error is otherwise unattributable: Main's own dispatch
+ * point has to say whether the request was even handled. Opt-in per measurement
+ * (SERPENT_E2E_LIBRARY_TRACE=1) so ordinary E2E runs do not gain log volume.
+ */
+function libraryRequestTraceEnabled(): boolean {
+  return process.env.SERPENT_E2E === "1"
+    && process.env.SERPENT_E2E_LIBRARY_TRACE === "1";
+}
+
+async function handleLibraryRequest(
+  input: unknown,
+  options: { consumerId: string },
+): Promise<RendererResult> {
+  if (libraryRequestTraceEnabled()) {
+    logger?.info("diag.library-request.enter", "Library request entered Main.", {
+      requestType: (input as { type?: unknown } | null)?.type,
+    });
+  }
   let operation: "create" | "open" | "import" | "open-eagle" | "open-billfish" | undefined;
   let lifecyclePublished = false;
   let clipboardStageDirectory: string | undefined;
@@ -4978,7 +4992,25 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
       : 0;
     const workerResult = command.type === "sync.probe"
       ? await runSyncProbeWithRetry(command)
-      : await workerClient.request(command);
+      : await (async () => {
+        const traceLibraryRequest = libraryRequestTraceEnabled();
+        if (traceLibraryRequest) {
+          logger?.info(
+            "diag.library-request.dispatch",
+            "Dispatching the library command to the Worker.",
+            { workerCommand: command.type },
+          );
+        }
+        const result = await workerClient.request(command, { consumerId: options.consumerId });
+        if (traceLibraryRequest) {
+          logger?.info(
+            "diag.library-request.dispatched",
+            "The Worker answered the library command.",
+            { workerCommand: command.type, ok: result.ok, resultType: result.ok ? result.type : undefined },
+          );
+        }
+        return result;
+      })();
     if (viewerWorkerStartedAt > 0) {
       logger?.info("viewer.preview-worker-timing", "Preview request resolved.", {
         libraryId: viewerRequest?.libraryId,
@@ -4994,7 +5026,7 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
           await workerClient.request({
             type: "library.close",
             libraryId: workerResult.library.libraryId,
-          });
+          }, { consumerId: options.consumerId });
         } catch (error) {
           logger?.error("library.open.cancel-close", error, {
             libraryId: workerResult.library.libraryId,
@@ -7985,6 +8017,21 @@ async function startApplication(): Promise<void> {
     }
   });
 
+  // 主进程事件循环滞后监控（SERPENT_LAG_LOG=1）：Main 也是单线程。若 Main 被
+  // 同步工作堵住，Renderer 的 IPC 会迟迟不返回，表现就是「切换资源库卡住」，
+  // 而 Worker 日志里看不到任何异常。
+  if (process.env.SERPENT_LAG_LOG === "1") {
+    let lagWindowStart = Date.now();
+    const lagTimer = setInterval(() => {
+      const now = Date.now();
+      const driftMs = now - lagWindowStart - 1_000;
+      lagWindowStart = now;
+      if (driftMs >= 200) {
+        logger?.info("main.eventLoop.lag", "Main event loop was blocked.", { driftMs });
+      }
+    }, 1_000);
+    lagTimer.unref?.();
+  }
   ipcMain.handle(LIBRARY_REQUEST_CHANNEL, (event, input: unknown) => {
     if (!mainWindow || event.sender !== mainWindow.webContents) {
       return {
@@ -7992,7 +8039,9 @@ async function startApplication(): Promise<void> {
         error: createPublicError("INTERNAL_ERROR"),
       } satisfies RendererResult;
     }
-    return handleLibraryRequest(input);
+    return handleLibraryRequest(input, {
+      consumerId: performanceConsumerIdForWindow(event.sender.id),
+    });
   });
 
   ipcMain.on(ASSET_NATIVE_DRAG_CHANNEL, (event, input: unknown) => {

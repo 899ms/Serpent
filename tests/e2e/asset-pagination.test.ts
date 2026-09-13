@@ -87,6 +87,35 @@ test("ordinary browsing continuously appends every asset without page controls",
     // Loading the tail is driven by the canvas scroll path, so wait for the
     // complete scope instead of assuming the first render contains every row.
     await expect(window.locator(".asset-card").first()).toBeVisible();
+    // CANVAS-038: the scrollbar belongs to COUNT, not to the loaded subset, and
+    // reaching mid-scope must not collapse or regrow the canvas. The reported
+    // failure was every card reloading around 15% while the geometry revision
+    // kept rewriting heights.
+    await expect.poll(
+      async () => workspaceCanvas.evaluate(
+        (element) => element.querySelectorAll("[data-layout-index]").length,
+      ),
+      { timeout: 15_000 },
+    ).toBeGreaterThan(0);
+    const settledScrollHeight = await workspaceCanvas.evaluate(
+      (element) => element.scrollHeight,
+    );
+    await workspaceCanvas.evaluate((element) => {
+      element.scrollTop = element.scrollHeight * 0.15;
+    });
+    await expect.poll(
+      async () => {
+        const mid = await workspaceCanvas.evaluate((element) => ({
+          height: element.scrollHeight,
+          cards: element.querySelectorAll(".asset-card").length,
+        }));
+        return mid.cards > 0
+          && mid.height >= settledScrollHeight * 0.85
+          && mid.height <= settledScrollHeight * 1.25;
+      },
+      { timeout: 10_000 },
+    ).toBe(true);
+    await workspaceCanvas.evaluate((element) => element.scrollTo(0, 0));
     await expect(window.getByRole("button", { name: "上一页" })).toHaveCount(0);
     await expect(window.getByRole("button", { name: "下一页" })).toHaveCount(0);
     await loadEveryAssetInCurrentScope();

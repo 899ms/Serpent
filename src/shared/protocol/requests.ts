@@ -753,17 +753,8 @@ export const rendererRequestSchema = z.discriminatedUnion('type', [
     offset: z.number().int().nonnegative().optional(),
   }),
   z.strictObject({
-    // Stage C.2: geometry is fetched in bounded blocks from the same
-    // BrowseSession; the Renderer never rebuilds a full layout-only query.
-    type: z.literal('browse.session.geometry.request'),
-    libraryId: identifierSchema,
-    sessionId: identifierSchema,
-    startIndex: z.number().int().nonnegative(),
-    limit: z.number().int().positive().max(500).optional(),
-  }),
-  z.strictObject({
-    // Stage C.3: select-all reuses the same ordered snapshot as pages and
-    // geometry instead of rebuilding a smart-collection/search scope.
+    // Stage C.3: select-all reuses the same ordered snapshot as pages instead
+    // of rebuilding a smart-collection/search scope.
     type: z.literal('browse.session.ids.request'),
     libraryId: identifierSchema,
     sessionId: identifierSchema,
@@ -1888,13 +1879,6 @@ export const workerCommandSchema = z.discriminatedUnion('type', [
     sessionId: identifierSchema,
     limit: z.number().int().positive().max(500).optional(),
     offset: z.number().int().nonnegative().optional(),
-  }),
-  z.strictObject({
-    type: z.literal('browse.session.geometry'),
-    libraryId: identifierSchema,
-    sessionId: identifierSchema,
-    startIndex: z.number().int().nonnegative(),
-    limit: z.number().int().positive().max(500).optional(),
   }),
   z.strictObject({
     type: z.literal('browse.session.ids'),

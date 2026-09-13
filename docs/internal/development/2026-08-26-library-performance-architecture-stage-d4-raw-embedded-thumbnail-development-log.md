@@ -61,7 +61,7 @@ artifact 前仍同步等待 `exifr` 的 TIFF/EXIF/IPTC/XMP 解析；真实相机
   真实 RAW 环境变量未配置，矩阵未执行，不能把 fixture 结果写成相机格式覆盖。
 - `node scripts/run-e2e.mjs tests/e2e/raw-image-preview.test.ts`：1 skipped（未配置真实 RAW 文件）；
   `node scripts/run-e2e.mjs tests/e2e/media-preview.test.ts`：2 passed / 1 skipped。
-- `SERPENT_LARGE_LIBRARY_E2E_RESULT_PATH=/private/tmp/serpent-d4-benchmark-final/all-images.json SERPENT_LARGE_LIBRARY_E2E_CLONE_ROOT=/private/tmp/serpent-d4-benchmark-final npm run test:e2e:large-library-benchmark -- /Users/dolag/Development/perf-fixtures/library-20k`：真实 Electron、本地 APFS 隔离 clone、fixture v3、live 19,965、10 次随机跳转，`all-images` 严格指标 10/10；全部图片完成 p50 159.7ms、p95/max 228.1/228.1ms，首波视觉内容 p50 159.1ms、p95/max 199.6/199.6ms，最终完成 10/10。该次 clone 运行与 D.6 的冷 artifact 清理跑不具备完全可比性，作为补充证据，不替代跨次稳定性结论。
+- `SERPENT_LARGE_LIBRARY_E2E_RESULT_PATH=/private/tmp/serpent-d4-benchmark-final/all-images.json SERPENT_LARGE_LIBRARY_E2E_CLONE_ROOT=/private/tmp/serpent-d4-benchmark-final npm run test:e2e:large-library-benchmark -- 本机用户目录`：真实 Electron、本地 APFS 隔离 clone、fixture v3、live 19,965、10 次随机跳转，`all-images` 严格指标 10/10；全部图片完成 p50 159.7ms、p95/max 228.1/228.1ms，首波视觉内容 p50 159.1ms、p95/max 199.6/199.6ms，最终完成 10/10。该次 clone 运行与 D.6 的冷 artifact 清理跑不具备完全可比性，作为补充证据，不替代跨次稳定性结论。
 
 Luna High 双轴审查提出的 P1/P2 已落实：Inspector 会把 `header-only` 视为可继续补齐的中间态；
 背景入队和 secondary pump 会继续覆盖首批以外的 RAW；解析失败保留 queued/failed 状态并按 30 秒

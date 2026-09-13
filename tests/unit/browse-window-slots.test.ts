@@ -10,6 +10,7 @@ import {
   nextUnfilledBrowsePageOffset,
   resolveBrowseCanvasLayout,
   assetSummaryFromLayoutEntry,
+  virtualSlotAsset,
 } from "../../src/renderer/browse-window-slots";
 
 function asset(assetId: string): AssetSummary {
@@ -112,6 +113,41 @@ describe("browse window virtualization (Serpent-sa65)", () => {
       width: 1920,
       height: 1080,
     });
+  });
+
+  /**
+   * CANVAS-038: a slot's card identity must not flip between a shadow card and
+   * a real card. Before the index resolves an identity the slot renders nothing
+   * (`undefined`); once it does, the card is synthesized from the index and the
+   * loaded summary only replaces fields.
+   */
+  it("resolves virtual slot identity from the index, never from a placeholder", () => {
+    const entry = {
+      assetId: "hero",
+      width: 1920,
+      height: 1080,
+      displayName: "hero.png",
+      relativeFilePath: "hero.png",
+      previewArtifactId: "thumb-1",
+      mediaType: "image" as const,
+    };
+    // Unresolved geometry placeholder: no card at all, so nothing can be torn down.
+    expect(virtualSlotAsset(new Map(), {
+      assetId: "__geometry__:7",
+      width: null,
+      height: null,
+    })).toBeUndefined();
+    // Real index identity: a full card paints before its summary page arrives.
+    expect(virtualSlotAsset(new Map(), entry)).toMatchObject({
+      assetId: "hero",
+      displayName: "hero.png",
+      mediaType: "image",
+      thumbnailStatus: "ready",
+      thumbnailArtifactId: "thumb-1",
+    });
+    // The loaded summary wins, but the identity is the same one.
+    const loaded = asset("hero");
+    expect(virtualSlotAsset(new Map([["hero", loaded]]), entry)).toBe(loaded);
   });
 
   it("does not treat a first page of 100 as a complete compact layout (Serpent-9cfc8c)", () => {

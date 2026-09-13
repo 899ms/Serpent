@@ -357,7 +357,7 @@ import {
   resolveDialogEscapeAction,
   type DialogEscapeSnapshot,
 } from "./dialog-escape-stack";
-import { useAssetRename } from "./useAssetRename";
+import { splitAssetFileName, useAssetRename } from "./useAssetRename";
 import { useInlineFolderEdit } from "./use-inline-folder-edit";
 import { useInlineSmartCollectionEdit } from "./use-inline-smart-collection-edit";
 import { usePanelResize } from "./use-panel-resize";
@@ -541,6 +541,16 @@ const IS_WINDOWS_PLATFORM =
   resolveRendererPlatform(navigator.userAgent) === "windows";
 
 const SHORTCUT_PLATFORM: CommandPlatform = IS_MAC_PLATFORM ? "mac" : "windows";
+/**
+ * Minimum spacing between full browse reloads triggered by a remote library's
+ * change sequence.
+ *
+ * Serpent-yti0 established that `revision_artifacts` / `jobs` writes bump the
+ * shared change sequence, and that a full `searchAssets` per bump freezes the
+ * canvas. Non-network libraries were fixed by ignoring those bumps; network
+ * libraries still re-read, because another computer's asset changes genuinely
+ * only arrive that way. This interval is that cross-instance visibility delay.
+ */
 const NETWORK_LIBRARY_RELOAD_INTERVAL_MS = 750;
 
 type RendererWindow = Window & {
@@ -3804,12 +3814,44 @@ function AppInner() {
       // retain the old count-only fallback for mutation paths that explicitly
       // keep sidebar rows untouched. Both paths start after the primary browse
       // request, so sidebar work cannot win the Worker queue race.
+      /**
+       * The navigation summary is a library-scoped read model, not a load-scoped
+       * one: it describes the whole library's folders, collections and counts.
+       * Requiring the *load generation* to still match discarded summaries that
+       * had already arrived successfully. On a library whose writes keep firing
+       * browse-change reloads (a NAS library running thumbnail/palette jobs),
+       * every load was superseded before it could apply the sidebar, so the
+       * sidebar stayed permanently empty ("尚无托管或链接文件夹 / 尚无合集") behind
+       * a loading overlay that never cleared.
+       *
+       * Scope it to the library/view instead: a summary for the library still on
+       * screen is always safe to apply, and applying the newest one wins.
+       */
+      const isCurrentLibraryNavigation = () =>
+        isCurrentLibraryView(viewSession)
+        && (opts?.navigationIsCurrent?.() ?? true);
+      const applyNavigationSummary = (summary: LibraryNavigationSummary) => {
+        setAllAssetCount(summary.allAssetCount);
+        setRootAssetCount(summary.rootAssetCount);
+        setTrashedAssetCount(summary.trashedAssetCount);
+        setFolders(summary.folders);
+        setLinkedFolders(summary.linkedFolders);
+        setTags(summary.tags);
+        setCollections(summary.collections);
+        setSmartCollections(summary.smartCollections);
+        setTrashedFolders(summary.trashedFolders);
+      };
       const loadNavigationSummary = () => {
-        if (!isCurrentLoad()) return Promise.resolve(undefined);
+        if (!isCurrentLibraryView(viewSession)) return Promise.resolve(undefined);
         return api.fetchLibraryNavigationSummary({
           ...libId,
           showIgnored: includeIgnored,
           includeTrashedFolders: trashMode,
+        }).then((result) => {
+          if (result.ok && isCurrentLibraryNavigation()) {
+            applyNavigationSummary(result.value);
+          }
+          return result;
         });
       };
       const navigationPromise = refreshSidebar
@@ -3919,15 +3961,7 @@ function AppInner() {
       });
 
       if (blockingNavigation) {
-        setAllAssetCount(blockingNavigation.allAssetCount);
-        setRootAssetCount(blockingNavigation.rootAssetCount);
-        setTrashedAssetCount(blockingNavigation.trashedAssetCount);
-        setFolders(blockingNavigation.folders);
-        setLinkedFolders(blockingNavigation.linkedFolders);
-        setTags(blockingNavigation.tags);
-        setCollections(blockingNavigation.collections);
-        setSmartCollections(blockingNavigation.smartCollections);
-        setTrashedFolders(blockingNavigation.trashedFolders);
+        applyNavigationSummary(blockingNavigation);
         return assetResult.value.items;
       }
 
@@ -3939,15 +3973,7 @@ function AppInner() {
           if (!isCurrentLoad()) return;
           if (navigation) {
             if (!navigation.ok) throw new LibraryOperationError(navigation.error);
-            setAllAssetCount(navigation.value.allAssetCount);
-            setRootAssetCount(navigation.value.rootAssetCount);
-            setTrashedAssetCount(navigation.value.trashedAssetCount);
-            setFolders(navigation.value.folders);
-            setLinkedFolders(navigation.value.linkedFolders);
-            setTags(navigation.value.tags);
-            setCollections(navigation.value.collections);
-            setSmartCollections(navigation.value.smartCollections);
-            setTrashedFolders(navigation.value.trashedFolders);
+            applyNavigationSummary(navigation.value);
             return;
           }
           if (!counts) return;
@@ -12637,7 +12663,7 @@ function AppInner() {
                       shouldShowAssetCardBadges(assetCardSize);
                     const renderAssetCard = (
                       asset: AssetSummary,
-                      renderOptions?: { loadImmediately?: boolean },
+                      renderOptions?: { loadImmediately?: boolean; stableSlot?: boolean },
                     ) => {
                       const typeBadge = assetTypeBadgeLabel(
                         asset.mediaType,
@@ -12732,7 +12758,9 @@ function AppInner() {
                       data-media-type={asset.mediaType}
                       title={asset.displayName}
                       draggable={!showTrash && !renamingThisAsset}
-                      key={assetCardKey(library?.libraryId, asset.assetId)}
+                      key={renderOptions?.stableSlot
+                        ? undefined
+                        : assetCardKey(library?.libraryId, asset.assetId)}
                       {...(renamingThisAsset
                         ? { role: "group" as const }
                         : { type: "button" as const })}
@@ -13176,6 +13204,15 @@ function AppInner() {
                                       changeAssetRenameValue(event.target.value)
                                     }
                                     onClick={(event) => event.stopPropagation()}
+                                    onFocus={(event) => {
+                                      const { baseName } = splitAssetFileName(
+                                        event.currentTarget.value,
+                                      );
+                                      event.currentTarget.setSelectionRange(
+                                        baseName.length,
+                                        baseName.length,
+                                      );
+                                    }}
                                     onKeyDown={(event) => {
                                       event.stopPropagation();
                                       if (event.key === "Enter") {
@@ -13450,7 +13487,6 @@ function AppInner() {
         onAssignTagToAsset={(tagId) => void handleInspectorAssignTag(tagId)}
         onCreateAndAssignTag={(tagName) => void handleInspectorCreateAndAssignTag(tagName)}
         onOpenSourceUrl={handleOpenSourceUrl}
-        onRelink={(assetId) => { void relinkMissingAsset(assetId); }}
         onPaletteColorCopy={(color, copied) => {
           if (copied) {
             setNotice(t("toast.colorCopiedAlt", { color }));

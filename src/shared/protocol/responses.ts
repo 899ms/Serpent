@@ -1,9 +1,10 @@
 import { z } from 'zod';
 
-import { aiSearchPlanSchema, assetMetadataResultSchema, extractedMetadataResultSchema, assetSummarySchema, browseGeometryBlockSchema, browseLayoutEntrySchema, collectionSummarySchema, folderBrowseEntrySchema, ignoredPathSchema, linkedFolderDirectoryMutationSchema, linkedFolderRuleSchema, linkedFolderSummarySchema, managedFolderSummarySchema, portableRelativePathSchema, smartCollectionSummarySchema, tagCooccurrenceGraphSchema, tagSummarySchema, trashedFolderSummarySchema } from '../asset-types';
+import { aiSearchPlanSchema, assetMetadataResultSchema, extractedMetadataResultSchema, assetSummarySchema, browseLayoutEntrySchema, collectionSummarySchema, folderBrowseEntrySchema, ignoredPathSchema, linkedFolderDirectoryMutationSchema, linkedFolderRuleSchema, linkedFolderSummarySchema, managedFolderSummarySchema, portableRelativePathSchema, smartCollectionSummarySchema, tagCooccurrenceGraphSchema, tagSummarySchema, trashedFolderSummarySchema } from '../asset-types';
 import { libraryNavigationSummarySchema } from '../library-navigation';
 import { pluginJobRecordSchema } from '../../plugins/plugin-jobs';
 import { recentLibraryListSchema } from '../recent-libraries';
+import { mutationReceiptSchema } from '../performance-contract';
 import { publicErrorReasonSchema, publicErrorSchema } from './errors';
 import { fbxConvertErrorCodeSchema, fbxConversionStatsSchema } from '../fbx-conversion';
 import {
@@ -700,6 +701,7 @@ const assetOperationSuccessSchemas = [
     type: z.literal('folder.created'),
     folder: managedFolderSummarySchema,
     historyEntryId: nonBlankString.optional(),
+    mutationReceipt: mutationReceiptSchema.optional(),
   }),
   z.strictObject({
     ok: z.literal(true),
@@ -1130,6 +1132,8 @@ const assetOperationSuccessSchemas = [
     sessionId: nonBlankString,
     libraryGeneration: z.number().int().nonnegative(),
     changeSequence: z.number().int().nonnegative(),
+    catalogSequence: z.number().int().nonnegative().optional(),
+    snapshotGeneration: z.number().int().nonnegative().nullable().optional(),
     queryFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
     items: z.array(assetSummarySchema),
     total: z.number().int().nonnegative(),
@@ -1144,6 +1148,8 @@ const assetOperationSuccessSchemas = [
     type: z.literal('browse.session.page'),
     sessionId: nonBlankString,
     changeSequence: z.number().int().nonnegative(),
+    catalogSequence: z.number().int().nonnegative().optional(),
+    snapshotGeneration: z.number().int().nonnegative().nullable().optional(),
     items: z.array(assetSummarySchema),
     total: z.number().int().nonnegative(),
     offset: z.number().int().nonnegative(),
@@ -1154,23 +1160,19 @@ const assetOperationSuccessSchemas = [
   }),
   z.strictObject({
     ok: z.literal(true),
-    type: z.literal('browse.session.geometry'),
-    libraryId: nonBlankString,
-    ...browseGeometryBlockSchema.shape,
-  }),
-  z.strictObject({
-    ok: z.literal(true),
     type: z.literal('browse.session.ids'),
     libraryId: nonBlankString,
     sessionId: nonBlankString,
     changeSequence: z.number().int().nonnegative(),
+    catalogSequence: z.number().int().nonnegative().optional(),
+    snapshotGeneration: z.number().int().nonnegative().nullable().optional(),
     assetIds: z.array(nonBlankString).max(100_000),
   }),
   z.strictObject({
     ok: z.literal(true),
     type: z.literal('browse.session.stale'),
     sessionId: nonBlankString,
-    reason: z.enum(['library-generation', 'change-sequence', 'missing']),
+    reason: z.enum(['library-generation', 'change-sequence', 'catalog-sequence', 'missing']),
   }),
   z.strictObject({
     ok: z.literal(true),

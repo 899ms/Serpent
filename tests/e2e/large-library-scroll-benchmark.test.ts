@@ -201,10 +201,17 @@ test("fourth-stop random scrollbar jumps measure progressive visible decode", as
             && rect.right > canvasRect.left
             && rect.left < canvasRect.right;
         }).map((slot) => slot.dataset.layoutAssetId ?? "");
-        // Layout previews carry the compact index's ready thumbnail and are
-        // intentionally present before the summary page arrives. They are not
-        // evidence that the target page was fetched, so this gate only accepts
-        // real AssetSummary cards.
+        // CANVAS-038: the virtual path no longer renders a shadow card for a slot
+        // whose index identity is unresolved, and it keys slots by index rather
+        // than by assetId. Both the selector below and the placeholder counters
+        // further down therefore exclude *nothing* on this path. Require that
+        // fact in the gate rather than assume it: if a future change
+        // reintroduces shadow or placeholder cards here, the gate fails instead
+        // of silently mis-measuring `passed`.
+        const shadowCardCount = document.querySelectorAll(".asset-card.is-layout-preview").length;
+        const placeholderCardCount = document.querySelectorAll(
+          ".asset-card.is-browse-placeholder, .asset-card[data-asset-id^='__pending:']",
+        ).length;
         const cards = [...document.querySelectorAll<HTMLElement>(".asset-card:not(.is-layout-preview)")]
           .filter((card) => {
             const rect = card.getBoundingClientRect();
@@ -212,7 +219,9 @@ test("fourth-stop random scrollbar jumps measure progressive visible decode", as
           });
         const cardIds = new Set(cards.map((card) => card.dataset.assetId ?? ""));
         return visibleLayoutIds.length >= 4
-          && visibleLayoutIds.every((assetId) => cardIds.has(assetId));
+          && visibleLayoutIds.every((assetId) => cardIds.has(assetId))
+          && shadowCardCount === 0
+          && placeholderCardCount === 0;
       }),
       { timeout: 30_000 },
     ).toBe(true);

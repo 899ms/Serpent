@@ -95,7 +95,6 @@ export function JustifiedAssetRows(props: JustifiedAssetRowsProps) {
         cardSize={props.cardSize}
         captionBandPx={captionBandPx}
         renderCard={props.renderCard}
-        renderLayoutPreview={props.renderLayoutPreview}
       />
     );
   }

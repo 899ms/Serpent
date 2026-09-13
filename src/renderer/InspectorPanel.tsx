@@ -37,7 +37,6 @@ import type { PreviewResolution, SerpentLibraryApi } from "../shared/library-api
 import type { SerpentPluginManagerApi } from "../shared/plugin-manager-api";
 import type { PluginContributionContext } from "../plugins/plugin-context";
 import type {
-  MissingAssetRecoveryProbe,
   RendererLibrarySummary,
 } from "../shared/protocol/responses";
 import { formatAudioTechnicalLine, formatVideoTechnicalLine } from "./video-metadata-format";
@@ -169,8 +168,6 @@ export interface InspectorPanelProps {
   onPaletteColorCopy?: (color: string, copied: boolean) => void;
   /** 在系统浏览器中打开当前源链接（URL 有效性由主进程二次校验）。 */
   onOpenSourceUrl?: () => void;
-  /** One-click entry into the existing relink pipeline for missing sources. */
-  onRelink?: (assetId: string) => void;
   pluginApi?: SerpentPluginManagerApi;
   libraryId?: string;
   pluginContributionRefreshKey?: string | null;
@@ -582,7 +579,6 @@ export function InspectorPanel(props: InspectorPanelProps) {
     multiEdit = null,
     onPaletteColorCopy,
     onOpenSourceUrl,
-    onRelink,
     pluginApi,
     libraryId,
     pluginContributionRefreshKey = null,
@@ -591,10 +587,6 @@ export function InspectorPanel(props: InspectorPanelProps) {
 
   const { locale, t } = useLocale();
   const { enabled: inspectorCardFeelEnabled } = useInspectorCardFeel();
-  const [recoveryProbeState, setRecoveryProbeState] = useState<{
-    assetId: string;
-    probe: MissingAssetRecoveryProbe;
-  } | null>(null);
   const isMultiEdit = multiEdit !== null && multiEdit.selectionCount >= 2;
   const selectionCount = Math.max(
     multiEdit?.selectionCount ?? 0,
@@ -602,36 +594,6 @@ export function InspectorPanel(props: InspectorPanelProps) {
     selectedAsset ? 1 : 0,
   );
 
-  useEffect(() => {
-    const currentLibraryId = libraryId ?? library?.libraryId;
-    const assetId = selectedAsset?.assetId;
-    if (
-      !api ||
-      !currentLibraryId ||
-      !assetId ||
-      selectionCount >= 2 ||
-      selectedAsset?.deletedAt ||
-      selectedAsset?.availability === "available"
-    ) {
-      return;
-    }
-    let cancelled = false;
-    void api.probeMissingAssetRecovery({
-      libraryId: currentLibraryId,
-      assetId,
-    }).then((result) => {
-      if (!cancelled && result.ok) {
-        setRecoveryProbeState({ assetId, probe: result.value });
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [api, library?.libraryId, libraryId, selectedAsset, selectionCount]);
-  const recoveryProbe = recoveryProbeState !== null
-    && recoveryProbeState.assetId === selectedAsset?.assetId
-    ? recoveryProbeState.probe
-    : null;
   const pluginContributionContext = useMemo<PluginContributionContext>(() => {
     const contextAssets = selectedAssets.length > 0
       ? selectedAssets
@@ -1057,17 +1019,10 @@ export function InspectorPanel(props: InspectorPanelProps) {
           />
           {!isMultiEdit &&
             selectionCount < 2 &&
-            (selectedAsset.deletedAt ||
-              selectedAsset.availability !== "available") && (
+            (selectedAsset.deletedAt || isCorruptAsset(selectedAsset)) && (
             <div
               className="inspector-status-row"
-              data-tone={
-                selectedAsset.deletedAt
-                  ? "trash"
-                  : isCorruptAsset(selectedAsset)
-                    ? "corrupt"
-                    : "missing"
-              }
+              data-tone={selectedAsset.deletedAt ? "trash" : "corrupt"}
             >
               <span aria-hidden="true" className="inspector-status-dot" />
               <span className="inspector-status-label">
@@ -1075,32 +1030,8 @@ export function InspectorPanel(props: InspectorPanelProps) {
                   ? t("inspector.trashedAutoClean", {
                       days: selectedAsset.remainingDays ?? "?",
                     })
-                  : isCorruptAsset(selectedAsset)
-                    ? t("inspector.dataCorrupt")
-                    : t("inspector.missing")}
+                  : t("inspector.dataCorrupt")}
               </span>
-              {recoveryProbe?.status === "recoverable" ? (
-                <span className="inspector-recovery-probe">
-                  {t("inspector.recoveryCandidate")}
-                </span>
-              ) : recoveryProbe?.candidateKind ? (
-                <span className="inspector-recovery-probe">
-                  {t("inspector.recoveryCandidateNeedsConfirmation")}
-                </span>
-              ) : recoveryProbe?.status === "needs-location" ? (
-                <span className="inspector-recovery-probe">
-                  {t("inspector.recoveryChooseLocation")}
-                </span>
-              ) : null}
-              {!selectedAsset.deletedAt && onRelink ? (
-                <button
-                  className="secondary-button inspector-status-action"
-                  onClick={() => onRelink(selectedAsset.assetId)}
-                  type="button"
-                >
-                  {t("inspector.relink")}
-                </button>
-              ) : null}
             </div>
           )}
 

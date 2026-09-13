@@ -14,12 +14,49 @@ export type ScheduledRequest = {
   deadlineAtEpochMs?: number;
   libraryId?: string;
   libraryGeneration?: number;
+  consumerId?: string;
   interactionKey?: string;
   interactionGeneration?: number;
   /** Lifecycle cleanup owns one library and may coexist with other-library reads. */
   lifecycleBoundary?: boolean;
+  /**
+   * The user is waiting on a library transition (open/create/close/delete).
+   * Such a request outranks the entire queue instead of losing every admission
+   * pass to the outgoing library's interactive backlog.
+   */
+  lifecyclePriority?: boolean;
   /** Re-check lifecycle ownership immediately before the handler starts. */
   isCurrent?: () => boolean;
+  /** Command type, used only for stall diagnostics. */
+  label?: string;
+};
+
+/** Why a non-empty queue could not be admitted, and who was holding the lanes. */
+export type SchedulerStallInfo = {
+  waitedMs: number;
+  active: Array<{
+    label: string;
+    lane: PerformanceLane;
+    libraryId?: string;
+    runningMs: number;
+  }>;
+  queued: Array<{
+    label: string;
+    lane: PerformanceLane;
+    libraryId?: string;
+    queuedMs: number;
+  }>;
+};
+
+export type InteractiveSchedulerOptions = {
+  /**
+   * Called when queued work has waited past the stall threshold without being
+   * admitted. Purely diagnostic: it must not throw, and it never changes
+   * admission decisions. The callback repeats with a growing interval while
+   * the queue stays blocked.
+   */
+  onStall?: (info: SchedulerStallInfo) => void;
+  stallReportMs?: number;
 };
 
 export class SchedulerCancelledError extends Error {
@@ -39,7 +76,7 @@ export class SchedulerCancelledError extends Error {
   }
 }
 
-interface QueueEntry<T> {
+type QueueEntry<T> = {
   request: ScheduledRequest;
   run: () => Promise<T> | T;
   cancel?: () => void;
@@ -48,11 +85,13 @@ interface QueueEntry<T> {
   resolve: (value: T | PromiseLike<T>) => void;
   reject: (reason?: unknown) => void;
   sequence: number;
-}
+  enqueuedAt: number;
+};
 
 type ActiveEntry = {
   request: ScheduledRequest;
   cancel?: () => void;
+  startedAt: number;
 };
 
 export type ScheduleOptions = {
@@ -74,10 +113,29 @@ const LANE_PRIORITY: Record<PerformanceLane, number> = {
   maintenance: 20,
 };
 
+/**
+ * A library transition (open/create/close/delete-from-disk) is the one request
+ * that must not wait its turn.
+ *
+ * It is a mutation, so it still needs a fully idle scheduler and runs
+ * exclusively at the current owner's safe point — but a mutation's ordinary
+ * priority (80) is below every interactive lane (100/95/90). A switch issued
+ * while the renderer keeps feeding visible-window reports therefore loses the
+ * admission pass to that backlog on every single pass and never starts: the
+ * user sees "正在打开…" forever while the Worker is busy. Library transitions
+ * outrank the whole queue instead, which is what makes a switch preemptive
+ * rather than queued behind the outgoing library's media backlog.
+ */
+const LIFECYCLE_PRIORITY = 110;
+
 // Node clamps setTimeout delays above the signed 32-bit millisecond range to
 // roughly 1ms. Keep long-lived requests on a bounded timer and let the timer
 // callback re-arm itself with the remaining duration instead of busy-looping.
 const MAX_DEADLINE_TIMER_DELAY_MS = 2_147_483_647;
+
+/** First stall report after this long; later reports back off up to the cap. */
+const DEFAULT_STALL_REPORT_MS = 2_000;
+const MAX_STALL_REPORT_MS = 30_000;
 
 /**
  * Small admission controller for the single SQLite-owning Worker.
@@ -90,7 +148,16 @@ export class InteractiveScheduler {
   readonly #queue: QueueEntry<unknown>[] = [];
   readonly #active = new Set<ActiveEntry>();
   readonly #latestGenerationByKey = new Map<string, number>();
+  readonly #options: InteractiveSchedulerOptions;
   #sequence = 0;
+  #stallTimer: ReturnType<typeof setTimeout> | undefined;
+  #stallSince: number | undefined;
+  #stallReportDelayMs: number;
+
+  constructor(options: InteractiveSchedulerOptions = {}) {
+    this.#options = options;
+    this.#stallReportDelayMs = options.stallReportMs ?? DEFAULT_STALL_REPORT_MS;
+  }
 
   schedule<T>(
     request: ScheduledRequest,
@@ -109,6 +176,16 @@ export class InteractiveScheduler {
         // until its deadline. The active owner remains in the set until its
         // promise reaches a safe point; this never force-closes a write.
         this.cancelActiveBackgroundForLibrary(request.libraryId);
+      }
+      if (request.lane === 'mutation' && request.lifecyclePriority === true) {
+        // A library transition cannot wait for another library's background
+        // work to finish: a mutation needs a fully idle scheduler, so the
+        // outgoing library's open-reconciliation kept the incoming library's
+        // `library.open` queued for as long as that background pass ran
+        // (measured: 13.5 s of `schedulerWaitMs` for a 154 ms handler). The
+        // user is leaving that library — ask every cancellable background
+        // owner to stop, whatever library it belongs to.
+        this.cancelActiveBackgroundOwners();
       }
       if (options.cancelQueuedForLibrary !== undefined) {
         this.cancelQueuedForLibrary(options.cancelQueuedForLibrary);
@@ -137,6 +214,7 @@ export class InteractiveScheduler {
         resolve: (value) => resolve(value as T),
         reject,
         sequence: this.#sequence++,
+        enqueuedAt: Date.now(),
       };
       this.#queue.push(entry);
       this.armDeadlineTimer(entry);
@@ -150,6 +228,31 @@ export class InteractiveScheduler {
       const queued = this.#queue[index]!;
       if (queued.request.libraryId !== libraryId) continue;
       this.removeQueuedEntry(index)?.reject(new SchedulerCancelledError(queued.request.requestId, `library:${libraryId}`));
+      cancelled += 1;
+    }
+    return cancelled;
+  }
+
+  /**
+   * Drop queued viewport hints (`asset.thumbnail.visible-window`) for one
+   * library.
+   *
+   * A hint is an idempotent report of what is on screen, so it is safe to drop
+   * — the renderer re-reports it as soon as the incoming library mounts. It is
+   * also already allowed to fail: the latest-wins interaction key rejects
+   * superseded queued hints. Preserving a deep hint backlog while a switch is
+   * in flight makes the replacement's first page queue behind the library the
+   * user just left.
+   */
+  cancelQueuedViewportHintsForLibrary(libraryId: string): number {
+    let cancelled = 0;
+    for (let index = this.#queue.length - 1; index >= 0; index -= 1) {
+      const queued = this.#queue[index]!;
+      if (queued.request.interactionKey !== 'visible-window') continue;
+      if (queued.request.libraryId !== libraryId) continue;
+      this.removeQueuedEntry(index)?.reject(
+        new SchedulerCancelledError(queued.request.requestId, `library:${libraryId}`),
+      );
       cancelled += 1;
     }
     return cancelled;
@@ -171,6 +274,21 @@ export class InteractiveScheduler {
     return requested;
   }
 
+  /**
+   * Ask every active, cancellable background owner to reach its next safe
+   * point, whatever library it belongs to. Used by a library transition, which
+   * must not wait for the outgoing library's background pass to finish.
+   */
+  cancelActiveBackgroundOwners(): number {
+    let requested = 0;
+    for (const active of this.#active) {
+      if (!isBackgroundPerformanceLane(active.request.lane) || !active.cancel) continue;
+      active.cancel();
+      requested += 1;
+    }
+    return requested;
+  }
+
   cancelAllQueued(): number {
     const cancelled = this.#queue.length;
     while (this.#queue.length > 0) {
@@ -178,7 +296,33 @@ export class InteractiveScheduler {
       this.clearDeadlineTimer(queued);
       if (queued) queued.reject(new SchedulerCancelledError(queued.request.requestId));
     }
+    this.clearStallWatch();
     return cancelled;
+  }
+
+  /**
+   * True when a `mutation` is queued or running for this library.
+   *
+   * A long-running background command holds the single Worker thread, so a
+   * mutation that arrives mid-way cannot preempt it: the lane policy only
+   * decides *admission*, and a synchronous command never reaches a safe point.
+   * Cooperative background work (drag priming today) polls this between
+   * sub-batches and abandons what is left — it is a cache primer, so a partial
+   * result is safe and the next browse re-primes it. That is what makes a
+   * library/folder switch feel preemptive instead of queued behind seconds of
+   * background work.
+   */
+  mutationPendingFor(libraryId: string): boolean {
+    for (const active of this.#active) {
+      if (active.request.lane === 'mutation') return true;
+    }
+    for (const queued of this.#queue) {
+      if (queued.request.lane !== 'mutation') continue;
+      if (queued.request.libraryId === undefined || queued.request.libraryId === libraryId) {
+        return true;
+      }
+    }
+    return false;
   }
 
   get queuedCount(): number {
@@ -191,14 +335,21 @@ export class InteractiveScheduler {
 
   private latestKey(request: ScheduledRequest): string | undefined {
     if (request.interactionKey === undefined || request.interactionGeneration === undefined) return undefined;
-    return `${request.libraryId ?? ''}\u0000${request.interactionKey}`;
+    return `${request.libraryId ?? ''}\u0000${request.consumerId ?? ''}\u0000${request.interactionKey}`;
   }
 
   private drain(): void {
     while (true) {
       this.discardExpiredQueuedRequests();
       const index = this.nextRunnableIndex();
-      if (index < 0) return;
+      if (index < 0) {
+        // Nothing can be admitted right now. If work is still waiting, that is
+        // either a short burst or a genuine lane deadlock; the watchdog reports
+        // the holder instead of leaving a silent hang.
+        this.armStallWatch();
+        return;
+      }
+      this.clearStallWatch();
       const [entry] = this.#queue.splice(index, 1);
       if (!entry) return;
       this.clearDeadlineTimer(entry);
@@ -220,7 +371,7 @@ export class InteractiveScheduler {
         continue;
       }
 
-      const active: ActiveEntry = { request: entry.request, cancel: entry.cancel };
+      const active: ActiveEntry = { request: entry.request, cancel: entry.cancel, startedAt: Date.now() };
       let result: Promise<unknown>;
       try {
         // This check is intentionally immediately before onAdmitted: the
@@ -291,7 +442,61 @@ export class InteractiveScheduler {
   private removeQueuedEntry(index: number): QueueEntry<unknown> | undefined {
     const [entry] = this.#queue.splice(index, 1);
     this.clearDeadlineTimer(entry);
+    if (this.#queue.length === 0) this.clearStallWatch();
     return entry;
+  }
+
+  private armStallWatch(): void {
+    if (this.#stallTimer !== undefined) return;
+    if (this.#queue.length === 0) return;
+    const onStall = this.#options.onStall;
+    if (!onStall) return;
+    this.#stallSince ??= Date.now();
+    const since = this.#stallSince;
+    const timer = setTimeout(() => {
+      this.#stallTimer = undefined;
+      if (this.#queue.length === 0) {
+        this.#stallSince = undefined;
+        return;
+      }
+      try {
+        onStall(this.stallInfo(Date.now() - since));
+      } catch {
+        // Diagnostics must never influence admission.
+      }
+      this.#stallReportDelayMs = Math.min(MAX_STALL_REPORT_MS, this.#stallReportDelayMs * 2);
+      this.armStallWatch();
+    }, this.#stallReportDelayMs);
+    (timer as { unref?: () => void }).unref?.();
+    this.#stallTimer = timer;
+  }
+
+  private clearStallWatch(): void {
+    if (this.#stallTimer !== undefined) {
+      clearTimeout(this.#stallTimer);
+      this.#stallTimer = undefined;
+    }
+    this.#stallSince = undefined;
+    this.#stallReportDelayMs = this.#options.stallReportMs ?? DEFAULT_STALL_REPORT_MS;
+  }
+
+  private stallInfo(waitedMs: number): SchedulerStallInfo {
+    const now = Date.now();
+    return {
+      waitedMs,
+      active: [...this.#active].map((entry) => ({
+        label: entry.request.label ?? entry.request.requestId,
+        lane: entry.request.lane,
+        ...(entry.request.libraryId === undefined ? {} : { libraryId: entry.request.libraryId }),
+        runningMs: now - entry.startedAt,
+      })),
+      queued: this.#queue.map((entry) => ({
+        label: entry.request.label ?? entry.request.requestId,
+        lane: entry.request.lane,
+        ...(entry.request.libraryId === undefined ? {} : { libraryId: entry.request.libraryId }),
+        queuedMs: now - entry.enqueuedAt,
+      })),
+    };
   }
 
   private nextRunnableIndex(): number {
@@ -327,7 +532,9 @@ export class InteractiveScheduler {
             ? activeInteractive < 1
             : activeBackground < 1 && !hasQueuedMutation;
       if (!canStart) continue;
-      const priority = LANE_PRIORITY[lane];
+      const priority = this.#queue[index]!.request.lifecyclePriority === true
+        ? LIFECYCLE_PRIORITY
+        : LANE_PRIORITY[lane];
       const selected = bestIndex >= 0 ? this.#queue[bestIndex] : undefined;
       if (priority > bestPriority || (priority === bestPriority && selected !== undefined && this.#queue[index]!.sequence < selected.sequence)) {
         bestIndex = index;
