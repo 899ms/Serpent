@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   performanceInteractionKeyForCommand,
@@ -10,6 +10,7 @@ import { parseWorkerRequest } from '../../src/shared/protocol/requests';
 import {
   InteractiveScheduler,
   SchedulerCancelledError,
+  type SchedulerStallInfo,
 } from '../../src/worker/interactive-scheduler';
 
 describe('performance command classification', () => {
@@ -127,6 +128,32 @@ describe('performance command classification', () => {
       { type: 'media.get-asset-drag-infos', libraryId: 'library-1' },
       'interactive-control',
     )).toBe(false);
+  });
+
+  /**
+   * Native-drag priming is background hydration, but it used to fall through to
+   * the `interactive-control` default lane. `InteractiveScheduler` allows at most
+   * one interactive lane at a time and makes `mutation` wait for a fully idle
+   * Worker, while background lanes yield to a queued mutation — so priming held
+   * the single interactive slot for seconds. Measured on a real network library:
+   * one 500-id chunk ran 3383 ms while `library.open` and every interactive
+   * command queued behind it for ~3357 ms (the "switching libraries hangs"
+   * symptom). It must stay a lane that yields.
+   */
+  it('keeps native-drag priming out of the exclusive interactive lane', () => {
+    expect(performanceLaneForCommand({ type: 'media.get-asset-drag-infos' }))
+      .toBe('background-primary');
+    // It is read-only hydration: it must still not suspend automatic media.
+    expect(shouldPreemptAutomaticMedia(
+      { type: 'media.get-asset-drag-infos', libraryId: 'library-1' },
+      'background-primary',
+    )).toBe(false);
+    // Lifecycle/navigation commands stay mutation so they get exclusive SQLite
+    // ownership and preempt background work.
+    expect(performanceLaneForCommand({
+      type: 'library.open',
+      selectedLibraryPath: 'C:\\library',
+    })).toBe('mutation');
   });
 });
 
@@ -528,5 +555,147 @@ describe('InteractiveScheduler', () => {
       'mutation-end',
       'browse',
     ]);
+  });
+
+  it('does not starve a library transition behind the interactive backlog', async () => {
+    const scheduler = new InteractiveScheduler();
+    const events: string[] = [];
+    let releaseVisible!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      releaseVisible = resolve;
+    });
+
+    // One visible-media report is running while the renderer has already queued
+    // a deep interactive backlog — the shape of a switch issued mid-scroll.
+    const running = scheduler.schedule(
+      { requestId: 'visible', lane: 'visible-media', libraryId: 'library-a' },
+      async () => {
+        events.push('visible-start');
+        await hold;
+        events.push('visible-end');
+      },
+    );
+    await Promise.resolve();
+    for (let index = 0; index < 20; index += 1) {
+      void scheduler.schedule(
+        { requestId: `backlog-${index}`, lane: 'interactive-control', libraryId: 'library-a' },
+        () => {
+          events.push(`backlog-${index}`);
+        },
+      );
+    }
+    // The transition is a mutation: it needs exclusive ownership, but it must
+    // not lose every admission pass to the interactive queue in front of it.
+    const transition = scheduler.schedule(
+      {
+        requestId: 'open',
+        lane: 'mutation',
+        libraryId: 'library-b',
+        lifecyclePriority: true,
+      },
+      () => {
+        events.push('library-open');
+      },
+    );
+
+    releaseVisible();
+    await Promise.all([running, transition]);
+    // The transition runs at the first safe point, ahead of every queued
+    // interactive entry; the backlog only resumes after it settles.
+    expect(events.slice(0, 3)).toEqual(['visible-start', 'visible-end', 'library-open']);
+  });
+
+  it('keeps an ordinary mutation behind interactive work', async () => {
+    const scheduler = new InteractiveScheduler();
+    const events: string[] = [];
+
+    const interactive = scheduler.schedule(
+      { requestId: 'interactive', lane: 'interactive-control', libraryId: 'library-1' },
+      () => {
+        events.push('interactive');
+      },
+    );
+    const mutation = scheduler.schedule(
+      { requestId: 'write', lane: 'mutation', libraryId: 'library-1' },
+      () => {
+        events.push('write');
+      },
+    );
+
+    await Promise.all([interactive, mutation]);
+    expect(events).toEqual(['interactive', 'write']);
+  });
+
+  it('reports the lane holder when queued work cannot be admitted', async () => {
+    const stalls: SchedulerStallInfo[] = [];
+    const scheduler = new InteractiveScheduler({
+      onStall: (info) => stalls.push(info),
+      stallReportMs: 20,
+    });
+    let releaseHolder!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+
+    // A single interactive owner blocks every other lane: another interactive
+    // request needs `activeInteractive < 1`, and a mutation needs a completely
+    // idle scheduler. That is the shape of a switch waiting on a stuck open.
+    const holder = scheduler.schedule(
+      { requestId: 'holder', lane: 'interactive-control', label: 'browse.session.open', libraryId: 'library-1' },
+      () => hold,
+    );
+    await Promise.resolve();
+    const waiting = scheduler.schedule(
+      { requestId: 'waiting', lane: 'interactive-control', label: 'library.close', libraryId: 'library-1' },
+      () => 'closed',
+    );
+    let mutationStarted = false;
+    const mutation = scheduler.schedule(
+      { requestId: 'mutation', lane: 'mutation', label: 'library.open', libraryId: 'library-2' },
+      () => {
+        mutationStarted = true;
+      },
+    );
+
+    await vi.waitFor(() => expect(stalls.length).toBeGreaterThan(0));
+    expect(stalls[0]!.active).toEqual([
+      {
+        label: 'browse.session.open',
+        lane: 'interactive-control',
+        libraryId: 'library-1',
+        runningMs: expect.any(Number),
+      },
+    ]);
+    expect(stalls[0]!.queued.map((entry) => entry.label)).toEqual(['library.close', 'library.open']);
+    expect(stalls[0]!.queued.every((entry) => entry.queuedMs >= 0)).toBe(true);
+    expect(stalls[0]!.waitedMs).toBeGreaterThanOrEqual(20);
+    expect(mutationStarted).toBe(false);
+
+    releaseHolder();
+    await Promise.all([holder, waiting, mutation]);
+    const reportsAfterDrain = stalls.length;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(stalls.length).toBe(reportsAfterDrain);
+  });
+
+  it('does not report a stall for a queue that drains normally', async () => {
+    const stalls: SchedulerStallInfo[] = [];
+    const scheduler = new InteractiveScheduler({
+      onStall: (info) => stalls.push(info),
+      stallReportMs: 20,
+    });
+
+    await Promise.all([
+      scheduler.schedule(
+        { requestId: 'one', lane: 'interactive-control', label: 'browse.session.open', libraryId: 'library-1' },
+        () => 'ok',
+      ),
+      scheduler.schedule(
+        { requestId: 'two', lane: 'background-primary', label: 'media.backfill', libraryId: 'library-1' },
+        () => 'ok',
+      ),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(stalls).toEqual([]);
   });
 });

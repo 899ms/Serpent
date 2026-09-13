@@ -23,6 +23,15 @@
 export type LibraryWorkStopper = {
   /** Abort scheduled/running queue controllers, retries and dimension probes. */
   stopScheduling(libraryId: string): void;
+  /**
+   * Drop *queued viewport hints* (`asset.thumbnail.visible-window`) for the
+   * library. Preserving queued jobs must not preserve these: a hint is an
+   * idempotent report of what is on screen, the renderer re-reports it as soon
+   * as the replacement library mounts, and a backlog of stale hints for the
+   * library being left delays the replacement's first page instead. Measured:
+   * a 12 s deep hint backlog queued ahead of the incoming `browse.session.open`.
+   */
+  dropQueuedViewportHints(libraryId: string): void;
   /** Cancel queued (not yet started) jobs for the library. */
   cancelQueuedJobs(libraryId: string): void;
   /** Abort AI analysis work for the library. */
@@ -43,6 +52,7 @@ export function stopOutgoingLibrariesForOpen(input: {
   const stopped: string[] = [];
   for (const libraryId of input.openLibraryIds) {
     input.stopper.stopScheduling(libraryId);
+    input.stopper.dropQueuedViewportHints(libraryId);
     if (input.cancelQueuedJobs === true) input.stopper.cancelQueuedJobs(libraryId);
     input.stopper.abortAiJobs(libraryId);
     input.stopper.publishAiProgress(libraryId);

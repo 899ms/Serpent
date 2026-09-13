@@ -16,6 +16,7 @@ import { stopOutgoingLibrariesForOpen } from "../../src/worker/library-open-stop
 function stopperSpy() {
   return {
     stopScheduling: vi.fn(),
+    dropQueuedViewportHints: vi.fn(),
     cancelQueuedJobs: vi.fn(),
     abortAiJobs: vi.fn(),
     publishAiProgress: vi.fn(),
@@ -36,6 +37,23 @@ describe("opening a library stops the libraries it leaves behind", () => {
       expect(stopper.abortAiJobs).toHaveBeenCalledWith(libraryId);
       expect(stopper.publishAiProgress).toHaveBeenCalledWith(libraryId);
     }
+  });
+
+  /**
+   * Preserving the outgoing library's queued *jobs* must not preserve its
+   * queued viewport hints. A hint is an idempotent "what is on screen" report
+   * that the renderer re-sends as soon as the replacement mounts, and a deep
+   * backlog of them queues ahead of the replacement's first page. Measured: a
+   * 12 s deep hint backlog while the switch overlay was up.
+   */
+  it("drops the outgoing library's queued viewport hints", () => {
+    const stopper = stopperSpy();
+    stopOutgoingLibrariesForOpen({
+      openLibraryIds: ["library-a"],
+      stopper,
+    });
+
+    expect(stopper.dropQueuedViewportHints).toHaveBeenCalledWith("library-a");
   });
 
   /**
@@ -69,6 +87,7 @@ describe("opening a library stops the libraries it leaves behind", () => {
     const stopper = stopperSpy();
     expect(stopOutgoingLibrariesForOpen({ openLibraryIds: [], stopper })).toEqual([]);
     expect(stopper.stopScheduling).not.toHaveBeenCalled();
+    expect(stopper.dropQueuedViewportHints).not.toHaveBeenCalled();
     expect(stopper.cancelQueuedJobs).not.toHaveBeenCalled();
     expect(stopper.abortAiJobs).not.toHaveBeenCalled();
   });

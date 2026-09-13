@@ -264,6 +264,22 @@ const BACKGROUND_PRIMARY_COMMANDS = new Set([
   'media.retry-artifact',
   'asset.retry-artifact',
   'sync.preview',
+  /**
+   * Native-drag priming is background hydration, and it was misclassified as
+   * `interactive-control`.
+   *
+   * `InteractiveScheduler.nextRunnableIndex` lets at most ONE interactive lane
+   * run at a time and makes `mutation` wait for the Worker to be completely
+   * idle, while background lanes explicitly yield to a queued mutation. Priming
+   * therefore held the single interactive slot for seconds: measured on a real
+   * network library, one 500-id `media.get-asset-drag-infos` chunk ran 3383 ms
+   * while `library.open` and every interactive command queued behind it for
+   * ~3357 ms — the "switching libraries hangs" symptom.
+   *
+   * Priming only has to be ready before the *user* starts a drag, never before
+   * a library/folder switch, so it belongs in a lane that yields.
+   */
+  'media.get-asset-drag-infos',
 ]);
 
 const BACKGROUND_SECONDARY_COMMANDS = new Set([
@@ -350,6 +366,8 @@ const NON_PREEMPTIVE_MEDIA_COMMANDS = new Set([
   'media.resolve-asset-paths',
   'media.get-asset-path',
   'media.get-asset-paths',
+  // Read-only drag/path hydration must not suspend automatic media.
+  // (Its *lane* is background-primary; this set is about preemption, not lane.)
   'media.get-asset-drag-infos',
   'plugin.jobs.list',
 ]);

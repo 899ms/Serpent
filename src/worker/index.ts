@@ -201,7 +201,16 @@ const visibleDimensionProbeStates = new Map<string, VisibleDimensionProbeState>(
 // request arrived.
 const startupThumbnailVisibleWindows = new Set<string>();
 const latestAssetSearchRequests = new LatestSearchRequestCoordinator();
-const interactiveScheduler = new InteractiveScheduler();
+// Serpent: a queue that cannot be admitted is either a short burst or a lane
+// deadlock (a mutation needs a fully idle scheduler, an interactive lane needs
+// no other interactive owner). Report the holder instead of hanging silently.
+const interactiveScheduler = new InteractiveScheduler({
+  onStall: (info) => {
+    // console.error, not stdout: the worker.cmd diagnostics already land in the
+    // app log through this channel, so a stall report stays attributable.
+    console.error(JSON.stringify({ timestamp: new Date().toISOString(), scope: 'worker.scheduler.stall', ...info }));
+  },
+});
 const pendingPluginMediaProviderRequests = new Map<string, {
   resolve: (result: PluginMediaProviderResult) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -815,18 +824,20 @@ function scheduleThumbnailQueue(
           : options.skipStaleRepair && options.assetIds
             ? Math.min(100, Math.max(thumbnailWaveSize, options.assetIds.length))
             : thumbnailWaveSize;
-      const processed = await libraryService.processThumbnailQueue(libraryId, {
-        maxJobs: processWaveSize,
-        jobKinds: ['generate_thumbnail', 'generate_video_poster'],
-        interactive: viewportOnlyWave,
-        ...(visibleAssetIds === undefined ? {} : { assetIds: visibleAssetIds }),
-        signal: queueController.signal,
-        claimAssetIdsRef: assetScope,
-        onResult,
-        onAiInputReady: (event) => {
-          parentPort?.postMessage({
-            type: 'asset.ai-input.ready',
-            libraryId,
+      const processed = await traceActivity(
+        `thumbnail-wave:${libraryId}`,
+        () => libraryService.processThumbnailQueue(libraryId, {
+          maxJobs: processWaveSize,
+          jobKinds: ['generate_thumbnail', 'generate_video_poster'],
+          interactive: viewportOnlyWave,
+          ...(visibleAssetIds === undefined ? {} : { assetIds: visibleAssetIds }),
+          signal: queueController.signal,
+          claimAssetIdsRef: assetScope,
+          onResult,
+          onAiInputReady: (event) => {
+            parentPort?.postMessage({
+              type: 'asset.ai-input.ready',
+              libraryId,
             assetId: event.assetId,
             artifactId: event.artifactId,
           });
@@ -845,7 +856,8 @@ function scheduleThumbnailQueue(
         // most one render in flight process-wide.
         modelThumbnailRenderer: (input) => renderModelThumbnailViaMain(input),
         modelAiViewsRenderer: (input) => renderModelAiViewsViaMain(input),
-      });
+        }),
+      );
       pendingVisibleWaveCompleted = true;
       const queueWasAborted = queueController.signal.aborted;
       if (mediaResourceGuard.isCoolingDown()) scheduleMediaResourceRetry(libraryId);
@@ -867,16 +879,22 @@ function scheduleThumbnailQueue(
         visibleWavePending,
       });
       if (mayRunBackgroundRepair()) {
-        const filled = libraryService.enqueueThumbnailJobs(libraryId, {
-          limit: 500,
-          priority: 50,
-          skipStaleRepair: true,
-        });
+        const filled = await traceActivity(
+          `thumbnail-enqueue:${libraryId}`,
+          async () => libraryService.enqueueThumbnailJobs(libraryId, {
+            limit: 500,
+            priority: 50,
+            skipStaleRepair: true,
+          }),
+        );
         continueImmediately = filled > 0;
       }
       if (mayRunBackgroundRepair()) {
         try {
-          const dimensions = libraryService.backfillMissingImageDimensions(libraryId, 48);
+          const dimensions = await traceActivity(
+            `dimension-backfill:${libraryId}`,
+            async () => libraryService.backfillMissingImageDimensions(libraryId, 48),
+          );
           for (const item of dimensions) {
             parentPort?.postMessage({
               type: 'asset.dimensions.ready',
@@ -941,6 +959,54 @@ function scheduleThumbnailQueue(
 // Serpent-onch/9e1d8d: per-command timing log, off by default.
 const WORKER_CMD_LOG = process.env.SERPENT_WORKER_CMD_LOG === '1';
 
+/**
+ * Commands the user is actively waiting on across a library transition. They
+ * take the whole queue's priority so a switch cannot be starved by the
+ * outgoing library's visible-window/media backlog (see LIFECYCLE_PRIORITY).
+ */
+function isLibraryTransitionCommand(commandType: string): boolean {
+  return commandType === 'library.open'
+    || commandType === 'library.open-eagle'
+    || commandType === 'library.open-billfish'
+    || commandType === 'library.create'
+    || commandType === 'library.close'
+    || commandType === 'library.delete-from-disk';
+}
+
+// 事件循环滞后监控（SERPENT_LAG_LOG=1）：被同步工作堵住的 Worker 会推迟接收
+// 消息，此时 `queueMs` 与 `runMs` 都无法区分「在干活」和「根本没被调度」。
+// 每秒测量计时器漂移，只在真正卡顿时输出，并带上当时正在运行的活动名。
+let currentWorkerActivity = 'idle';
+
+/** Run `work` while naming it as the Worker's current activity for lag reports. */
+async function traceActivity<T>(label: string, work: () => Promise<T>): Promise<T> {
+  const previous = currentWorkerActivity;
+  currentWorkerActivity = label;
+  try {
+    return await work();
+  } finally {
+    currentWorkerActivity = previous;
+  }
+}
+
+if (process.env.SERPENT_LAG_LOG === '1') {
+  let lagWindowStart = Date.now();
+  const lagTimer = setInterval(() => {
+    const now = Date.now();
+    const driftMs = now - lagWindowStart - 1_000;
+    lagWindowStart = now;
+    if (driftMs >= 200) {
+      console.error(JSON.stringify({
+        timestamp: new Date().toISOString(),
+        scope: 'worker.eventLoop.lag',
+        driftMs,
+        activity: currentWorkerActivity,
+      }));
+    }
+  }, 1_000);
+  lagTimer.unref?.();
+}
+
 // Serpent-2cc492（真实 NAS 生产库事故，2026-08-23）：开库后台对账若与渲染端
 // startup 请求风暴同时运行，SMB 上 21,508 条目的 artifact 枚举实测 ~16.5s，
 // 加上各同步 SQL 步骤，startup 突发曾经撞上主进程的固定请求 deadline，late
@@ -969,7 +1035,10 @@ function scheduleOpenBackgroundReconciliation(
         libraryGeneration,
         isCurrent: () => libraryGenerationRegistry.isCurrent(libraryId, libraryGeneration),
       },
-      () => libraryService.runOpenBackgroundReconciliation(libraryId),
+      () => traceActivity(
+        `open-reconciliation:${libraryId}`,
+        async () => libraryService.runOpenBackgroundReconciliation(libraryId),
+      ),
       { cancel: () => libraryService.cancelOpenBackgroundReconciliation(libraryId) },
     );
   }).catch(() => {
@@ -1064,10 +1133,13 @@ async function drainVisibleWindowDimensionProbes(
         if (batch.length >= 16) break;
       }
       try {
-        const dimensions = await libraryService.persistVisibleWindowImageDimensionsAsync(
-          libraryId,
-          batch,
-          state.controller.signal,
+        const dimensions = await traceActivity(
+          `dimension-probes:${libraryId}`,
+          () => libraryService.persistVisibleWindowImageDimensionsAsync(
+            libraryId,
+            batch,
+            state.controller.signal,
+          ),
         );
         if (state.controller.signal.aborted) return;
         for (const item of dimensions) {
@@ -1322,9 +1394,12 @@ function scheduleSecondaryMediaQueue(
         // A startup scene only admits one bounded RAW batch. Keep admitting
         // the next batch here after the current secondary queue drains so a
         // 50k-camera library eventually reaches every Inspector record.
-        admittedRawMetadata = libraryService.enqueueRawImageMetadataBackfill(
-          libraryId,
-          RAW_METADATA_BACKFILL_BATCH_SIZE,
+        admittedRawMetadata = await traceActivity(
+          `raw-metadata-enqueue:${libraryId}`,
+          async () => libraryService.enqueueRawImageMetadataBackfill(
+            libraryId,
+            RAW_METADATA_BACKFILL_BATCH_SIZE,
+          ),
         );
       }
       const fairnessTurn = (secondaryMediaFairnessTurns.get(libraryId) ?? 0) + 1;
@@ -1337,32 +1412,35 @@ function scheduleSecondaryMediaQueue(
       const runSecondaryJobs = (
         jobKinds: typeof SECONDARY_MEDIA_JOB_KINDS | readonly ['extract_metadata'],
       ) =>
-        libraryService.processThumbnailQueue(libraryId, {
-          maxJobs: 1,
-          jobKinds,
-          ...(urgentAssetIds && urgentAssetIds.size > 0
-            ? { assetIds: [...urgentAssetIds] }
-            : {}),
-          signal: queueController.signal,
-          onDerivedReady: (event) => {
-            parentPort?.postMessage({
-              type: 'asset.derived.ready',
-              libraryId,
-              assetId: event.assetId,
-              kind: event.kind,
-            });
-            if (event.width && event.height) {
+        traceActivity(
+          `secondary-media:${libraryId}`,
+          () => libraryService.processThumbnailQueue(libraryId, {
+            maxJobs: 1,
+            jobKinds,
+            ...(urgentAssetIds && urgentAssetIds.size > 0
+              ? { assetIds: [...urgentAssetIds] }
+              : {}),
+            signal: queueController.signal,
+            onDerivedReady: (event) => {
               parentPort?.postMessage({
-                type: 'asset.dimensions.ready',
+                type: 'asset.derived.ready',
                 libraryId,
                 assetId: event.assetId,
-                width: event.width,
-                height: event.height,
-                ...(event.durationMs === undefined ? {} : { durationMs: event.durationMs }),
+                kind: event.kind,
               });
-            }
-          },
-        });
+              if (event.width && event.height) {
+                parentPort?.postMessage({
+                  type: 'asset.dimensions.ready',
+                  libraryId,
+                  assetId: event.assetId,
+                  width: event.width,
+                  height: event.height,
+                  ...(event.durationMs === undefined ? {} : { durationMs: event.durationMs }),
+                });
+              }
+            },
+          }),
+        );
       let processed = await runSecondaryJobs(
         preferRawMetadata ? ['extract_metadata'] : SECONDARY_MEDIA_JOB_KINDS,
       );
@@ -2117,6 +2195,9 @@ async function handleRequestWithoutWriteLease(request: WorkerRequest): Promise<W
           },
           cancelQueuedJobs: (outgoingLibraryId) => {
             libraryService.cancelJobs(outgoingLibraryId);
+          },
+          dropQueuedViewportHints: (outgoingLibraryId) => {
+            interactiveScheduler.cancelQueuedViewportHintsForLibrary(outgoingLibraryId);
           },
           abortAiJobs: (outgoingLibraryId) => {
             aiJobAbortRegistry.abort(outgoingLibraryId);
@@ -4034,11 +4115,32 @@ async function handleRequestWithoutWriteLease(request: WorkerRequest): Promise<W
       // stalled the Worker event loop; resolveAssetDragInfos batches in 500-id
       // chunks with identical per-entry semantics (missing skipped, hard
       // failures throw).
+      //
+      // CANVAS-038/switch-hang: `resolveAssetDragInfos` is synchronous, so one
+      // 500-id request still occupied the single Worker thread for seconds
+      // (measured 4793 ms) and every other command's message callback waited
+      // that long — lane priority cannot preempt a command that never yields.
+      // Sub-batch with an event-loop yield between batches, and abandon the
+      // remainder as soon as a mutation (library/folder switch, import) is
+      // waiting: this is a cache primer, so a partial result is safe and the
+      // next browse re-primes it.
       const { libraryId, assetIds } = request.command;
+      const entries: ReturnType<typeof libraryService.resolveAssetDragInfos> = [];
+      const subBatchSize = 32;
+      for (let offset = 0; offset < assetIds.length; offset += subBatchSize) {
+        if (offset > 0) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          if (interactiveScheduler.mutationPendingFor(libraryId)) break;
+        }
+        entries.push(...libraryService.resolveAssetDragInfos(
+          libraryId,
+          assetIds.slice(offset, offset + subBatchSize),
+        ));
+      }
       return {
         ok: true,
         type: 'media.asset-drag-infos',
-        entries: libraryService.resolveAssetDragInfos(libraryId, assetIds),
+        entries,
       };
     }
     case 'asset.thumbnail.visible-window': {
@@ -4855,6 +4957,7 @@ parentPort.on('message', async (event) => {
     const scheduledRequest = {
       requestId: request.requestId,
       lane: performanceEnvelope.lane,
+      label: request.command.type,
       ...(performanceEnvelope.deadlineAtEpochMs === undefined
         ? {}
         : { deadlineAtEpochMs: performanceEnvelope.deadlineAtEpochMs }),
@@ -4876,6 +4979,9 @@ parentPort.on('message', async (event) => {
       ...(request.command.type === 'library.close'
         || request.command.type === 'library.delete-from-disk'
         ? { lifecycleBoundary: true }
+        : {}),
+      ...(isLibraryTransitionCommand(request.command.type)
+        ? { lifecyclePriority: true }
         : {}),
       ...(generationBound === undefined ? {} : { isCurrent: generationBound }),
     } as const;
@@ -4931,6 +5037,8 @@ parentPort.on('message', async (event) => {
     };
     const runScheduled = async (): Promise<WorkerResult> => {
       const dispatchStartedAt = performance.now();
+      const previousActivity = currentWorkerActivity;
+      currentWorkerActivity = `command:${request.command.type}`;
       let outcome: 'ok' | 'failed' = 'ok';
       let reasonCode: string | undefined;
       try {
@@ -4965,6 +5073,7 @@ parentPort.on('message', async (event) => {
           closingLibraryIds.delete(lifecycleLibraryId!);
         }
         const executeMs = performance.now() - dispatchStartedAt;
+        currentWorkerActivity = previousActivity;
         logWorkerRequestSpan({
           request,
           performanceEnvelope,
@@ -4980,6 +5089,12 @@ parentPort.on('message', async (event) => {
             requestId: request.requestId,
             type: request.command.type,
             lane: performanceEnvelope.lane,
+            // Attribution across a library switch: a stalled switch is caused by
+            // work belonging to the *outgoing* library, which the request type
+            // and lane alone cannot show.
+            ...(performanceEnvelope.libraryId === undefined
+              ? {}
+              : { libraryId: performanceEnvelope.libraryId }),
             callbackAt,
             sentAt: performanceEnvelope.sentAtEpochMs,
             queueMs: Math.max(0, callbackAt - performanceEnvelope.sentAtEpochMs),

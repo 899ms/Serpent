@@ -31,12 +31,12 @@
 
 **复现**：新增 `tests/e2e/library-switch-benchmark.test.ts`——隔离 profile 内预置最近资源库列表，用 UI 菜单真正切换，并滚轮滑动。旧基准只做**随机跳转**且**从不切换库**，所以这个缺陷一直没被测到。
 
-对照（同一目标库 `本地大库` 28,972 项）：
+对照（同一目标库 本地大库 28,972 项）：
 
 | 场景 | 切换结果 |
 | --- | --- |
-| 本地库 → `本地大库` | **4460 ms 完成** |
-| **NAS 库（NAS 库）→ `本地大库`** | **超时 ≥90 s，永不完成**，侧栏仍是旧库 |
+| 本地库 → 本地大库 | **4460 ms 完成** |
+| **NAS 库 → 本地大库** | **超时 ≥90 s，永不完成**，侧栏仍是旧库 |
 
 **定位**：
 
@@ -63,7 +63,7 @@ case 'library.open':    // 打开：什么都不取消，直接 openLibrary(path
 | 指标 | 修复前 | 修复后 |
 | --- | --- | --- |
 | 切换 | 超时 ≥90 s，永不完成 | **14901 ms 完成** |
-| 切换后侧栏 | 6 行（旧库） | **120 行（`本地大库` 的 116 合集）** |
+| 切换后侧栏 | 6 行（旧库） | **120 行（本地大库的 116 合集）** |
 | Worker 关闭阶段 | 从未发生 | drain 0ms / backup 3ms / release 2ms / **合计 5ms** |
 
 关闭路径阶段计时保留但改为按需：`SERPENT_CLOSE_TRACE=1`（默认不输出，避免每次关闭都往错误日志写行）。
@@ -76,7 +76,7 @@ case 'library.open':    // 打开：什么都不取消，直接 openLibrary(path
 
 | 库 | 滚轮 3–6 秒 | `scrollHeight` 不同取值 | 波动 |
 | --- | --- | --- | --- |
-| NAS 库（NAS） | 299 槽位创建 / 129 卸载 | **1** | **0%** |
+| NAS 库 | 299 槽位创建 / 129 卸载 | **1** | **0%** |
 | 本地大库（本地 28,972） | — | **1** | **0%** |
 
 即 CANVAS-038 几何一次播种在**真实滚轮输入**下同样成立。
@@ -137,7 +137,7 @@ case 'library.open':    // 打开：什么都不取消，直接 openLibrary(path
 
 ### 2. 媒体任务「反复入队/取消」——先把责任分清
 
-只读查询用户的 `NAS 库` 库（`jobs` 表）后，结论与之前的口头判断**不同**，必须更正：
+只读查询用户的 NAS 库（`jobs` 表）后，结论与之前的口头判断**不同**，必须更正：
 
 ```
 generate_thumbnail  paused  1106     ← 本人（agent）在验证实验里调用 pauseMediaJobs 造成，未恢复
@@ -154,10 +154,127 @@ generate_thumbnail cancelled 106 / succeeded 26 / queued 6
 
 ## 未解决
 
-1. **切换仍是 14.3–14.9 秒**（本地→本地 4.5 s）。卡死已消除，但速度仍需收口；剩余时间在 `本地大库` 的打开与首帧（28,972 项），未逐段拆解。
+1. **切换仍是 14.3–14.9 秒** → 已在「第二轮」解决，见下（现在 1.10–1.11 s）。
 2. **10 秒间隔已撤回**（见上）。跨实例资产变化的可见延迟仍是原来的 750 ms 语义。
 3. `library.open-eagle` / `library.open-billfish` / `library.create` 未做同样的离场停机（尚未复现问题，未改）。
 4. **`library.open` 停机序列无 worker 集成测试**；同一库重开会被误停一次（`openLibraryPrimary` 幂等 early return，未实测）。
 5. 媒体任务队列仍在反复入队/取消（`queued 197→269`、`succeeded 19`）；本次修复只是让生命周期命令不再被它饿死，队列本身的抖动未处理。
 6. >5000 项的 scope 首帧只有首页 100 项有身份，与设计 §5 L2「无媒体外壳」措辞不一致。
 7. `loadNavigationSummary` 不校验 `showIgnored`/`trashMode` 快照。
+
+## 第二轮：切换从 14.3–14.9 s 收到 1.10–1.11 s（抢占式切换）
+
+用户要求：切换资源库/文件夹应当是**抢占式**的，不要等之前的后台任务跑完；并授权自行修复。
+
+### 先修测量本身（否则后面所有结论都不可信）
+
+1. **测的是一直没重新构建的旧包。** 直接用 `npx playwright test` 跑 E2E 会绕过
+   `scripts/run-e2e.mjs`，而该脚本才会 `rm -rf .vite` 后重建 main/preload/renderer/worker。
+   证据：连续两次运行的 renderer 产物哈希完全相同（`main_window-eRhVdv2n.js`），
+   新加的渲染层打点一次都没出现 —— 也就是说那一轮的「切换仍然卡死」是在旧渲染包上测的。
+   **规矩：任何 Electron E2E 一律 `node scripts/run-e2e.mjs <test>`。**
+2. **报告把最关键的一条藏掉了。** `worker.cmd` 的 `type/lane/queueMs/runMs` 都在
+   `context` 下，报告却在顶层读，于是排序键恒为 `undefined`；一个跑了 16 秒的命令
+   在「最慢命令」里根本不会出现。修正后新增按命令类型的**聚合**（数量/最坏排队/
+   最坏调度等待/最坏执行/出现的 libraryId），Top-N 截断再也藏不住东西。
+
+### 三个真实根因（都有数字）
+
+| # | 根因 | 证据 |
+| --- | --- | --- |
+| 1 | `LANE_PRIORITY.mutation = 80` **低于所有交互 lane**（100/95/90）。排队的 `library.open` 在每一轮准入里都输给可见波/轮询积压，永远轮不到 → 饿死 | `library.open` roundtrip 13861–27161 ms，而 `queueMs≈0`、`runMs≈155 ms` |
+| 2 | mutation 要求 `#active.size === 0`，于是**离场库**的打开后台核对（28,972 项，maintenance）把新库的 `library.open` 一直按住 | `schedulerWaitMs = 13.5 s` 对应 154 ms 的处理器 |
+| 3 | 离场库排队的可见窗口提示（7.3–12 s 深）被保留，排在切换后的首屏请求前面 | `asset.thumbnail.visible-window` `queueMs` 最高 11366 ms |
+
+### 修复（`src/worker/`）
+
+- `interactive-scheduler.ts`
+  - 新增 `LIFECYCLE_PRIORITY = 110`：带 `lifecyclePriority` 的 mutation（open/create/close/delete-from-disk）
+    **压过整条队列**；它仍然要求独占，只是在第一个安全点立刻进入。修 #1。
+  - 新增 `cancelActiveBackgroundOwners()`：切换请求一入队就请**所有**可取消的后台 owner
+    到安全点，不再等别的库的后台核对跑完。修 #2。
+  - 新增 `cancelQueuedViewportHintsForLibrary()`：丢弃离场库排队的可见窗口提示
+    （提示是可重复上报的幂等信息，渲染层会重新上报）。修 #3。
+  - 新增**卡住看门狗**：非空队列长时间无法准入时输出 `worker.scheduler.stall`，
+    直接点名占着 lane 的 holder 和排队的命令。
+- `library-open-stop.ts`：`LibraryWorkStopper` 增加 `dropQueuedViewportHints`，
+  `stopOutgoingLibrariesForOpen` 对每个离场库调用它（排队**任务**仍然保留，见上一轮）。
+- `index.ts`：`worker.cmd` 增加 `libraryId`（跨库归属）；`SERPENT_LAG_LOG=1` 时输出
+  `worker.eventLoop.lag`（含 `driftMs` 与当时的 activity）——正是它把这件事从
+  「Main 卡住」改成「Worker 事件循环被同步工作占住」。
+
+### 测量（真实 NAS → 真实本地大库 28,972 项）
+
+| 运行 | 切换首帧 | `library.open` roundtrip | `schedulerWaitMs` | 结果 |
+| --- | --- | --- | --- | --- |
+| 修复前（旧渲染包） | 超时 ≥90 s | 13861–27161 ms | ≈13.5 s | `switchTimedOut=true` |
+| 修复前（新渲染包） | 23837 ms | 21592 ms | 约 13 s | 完成但极慢 |
+| 生命周期优先级 + 丢提示 | 29253 ms | 27161 ms | 约 13 s | 完成但极慢 |
+| **+ 取消他库后台 owner** | **1103 ms** | **204 ms** | **27 ms** | 完成 |
+| 复测 | **1112 ms** | 196 ms | 13 ms | 完成 |
+
+两次复测首帧 1.10 / 1.11 s，`browse.session.open` roundtrip 105 ms，
+离场库 `library.close` 132 ms。切换后画布 100 张卡、`所有资产 28972`、侧栏为
+本地大库自己的文件夹/合集 —— 切换真正落地。
+
+### 测试
+
+- `tests/unit/interactive-scheduler.test.ts`：新增 2 例 ——
+  ① 20 条积压交互请求不会饿死带 `lifecyclePriority` 的切换；② 普通 mutation 仍然排在交互之后。
+- `tests/unit/library-open-stop.test.ts`：新增 1 例 —— 离场库排队的可见窗口提示会被丢弃。
+- `tests/e2e/library-switch-benchmark.test.ts`：报告新增 `schedulerWaitMs`、
+  `commandTypeTotals`/`roundtripTypeTotals`、`lagLog`、`lifecycleLog`、`errorLog`、
+  `slowestCommands`；暂停媒体的判别实验现在**一定**在收尾恢复媒体任务（`resumeMediaJobs`），
+  不再把用户的库留在暂停态。
+
+### 本轮明确不做
+
+- 未改 `media.get-asset-drag-infos` 的分批/让出语义（上一轮已做）。
+- 剩余 1.5–1.8 s 的 `worker.eventLoop.lag`（activity=`idle`）是画布自身的后台媒体/预览
+  工作，不属于切换路径；不为了数字好看去动它。
+
+
+## 第三轮：用户实测「开着 NAS 后台任务切换约 15 秒」的复现与归因
+
+用户反馈：**打开 NAS 资源库的后台任务后**再切到本地大库，约 15 秒完成，「还能接受」。这与第二轮基准的 1.10 s 差距很大，说明基准没有覆盖「离场库后台已积压」的状态。
+
+### 复现方式
+
+基准本就带 `SERPENT_E2E_SWITCH_SETTLE_MS`（切换前先让源库跑一段时间）。用它把「NAS 后台已积压」变成可控条件：
+
+```
+SERPENT_E2E_SWITCH_LIBRARIES=<NAS 库>|<本地大库>
+SERPENT_E2E_SWITCH_SETTLE_MS=15000
+SERPENT_LAG_LOG=1
+SERPENT_REFRESH_STAGE_LOG=1
+node scripts/run-e2e.mjs tests/e2e/library-switch-benchmark.test.ts
+```
+
+| 状态 | 切换首帧 |
+| --- | --- |
+| 基准（切换前只滑 3 s） | 1103 / 1112 ms |
+| **加载态（切换前先跑 15 s 后台）** | **2105 / 2653 ms** |
+
+即加载态确实更慢，但**没有复现到 15 秒**；本机加载态是 2.1–2.7 s。用户的 15 s 需要他那台机器上完整的任务积压（他刚把约 1596 个暂停任务恢复并让它们跑起来）才能复现，本基准未能等效复刻，只能记为**未完全复现**。
+
+### 一次误报：renderer crash 是我自己造成的
+
+第一次加载态运行报 `page.waitForTimeout: Page crashed`。原因不是产品缺陷，而是我**同时**跑了完整 vitest 套件（会 fork 大量 Electron）与 Electron E2E —— 机器被压垮。独占重跑即通过。**纪律：Electron E2E 与 vitest 套件不得并行**（AGENTS.md 第 12 条本来就要求串行）。顺带修了基准：renderer 崩溃/页面死亡时不再丢失诊断（`measurementError` + 用日志派生的字段照样写出报告）。
+
+### 归因（滞后监控 + 阶段计时，真实 NAS 库）
+
+```
+worker.eventLoop.lag  drift=1625 / 5699 ms   activity=open-reconciliation:<NAS 库>
+open.reconciliation.stage  stage=asset-reconciliation  dur=5760 ms  total=17638 ms
+refresh.managed-assets.stage  stage=precompute-fingerprints  dur≈35–38 ms   （每批）
+```
+
+- 加载态下最大的单个同步段仍然来自**离场库自己的打开后台对账**（`asset-reconciliation` 单段 5.8 s，整轮 17.6 s）。
+- `yieldReconciliation` 用的是 `setImmediate`（真让出宏任务），批次间确实让出；每批 ~35–40 ms 的 `precompute-fingerprints` 是主要成本。
+- **仍待确认**：`worker.eventLoop.lag` 的 `driftMs` 只说明间隔计时器被推迟，无法区分「JS 真的被同步代码占住 5.7 s」与「进程被系统调度饿死」。要区分必须在 Worker 内测**相邻 `setImmediate` 之间的最大间隔**（真正的 JS turn gap），而不是计时器漂移。这是下一步的第一件事，测量结果决定是「把对账再切细」还是「降低对账在 SMB 上的 I/O 放大」。
+- 已加的永久诊断（`SERPENT_REFRESH_STAGE_LOG=1`）：`open.refresh-managed-assets.stage` 的 `existing-snapshot` / `discovery-walk` / `prepare-fingerprints` / `stale-missing-batches` / `apply-discovered-batches`。
+
+### 结论
+
+第二轮的三处准入修复是有效的（加载态也从 ≥90 s 超时降到 2.1–2.7 s），**但「切换必须等离场库的后台对账让出」这一结构问题仍在**：切换请求只有在 Worker 读到它之后才能取消离场库的对账，而阻塞期间连消息都读不进去。彻底解决需要让对账的同步段足够短（或可被外部抢占），属独立的下一步，不在本轮用补丁绕过。
+

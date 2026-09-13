@@ -155,6 +155,70 @@ function countLogEvents(logText: string, needle: string): number {
   return logText.split(needle).length - 1;
 }
 
+/**
+ * Aggregate every `worker.cmd` / `worker.cmd.roundtrip` line by command type.
+ *
+ * A stalled switch is diagnosed from two facts that a top-N slice cannot
+ * answer: whether the incoming library's commands appear at all, and how long
+ * the worst one waited/ran. Command fields live under `context`.
+ */
+function aggregateLogCommands(
+  logText: string,
+  scope: string,
+): Array<{ commandType: string; count: number; maxQueueMs: number; maxSchedulerWaitMs: number; maxRunMs: number; maxRoundTripMs: number; libraryIds: string[] }> {
+  const totals = new Map<string, {
+    commandType: string;
+    count: number;
+    maxQueueMs: number;
+    maxSchedulerWaitMs: number;
+    maxRunMs: number;
+    maxRoundTripMs: number;
+    libraryIds: Set<string>;
+  }>();
+  for (const line of logText.split("\n")) {
+    if (!line.includes(`"${scope}"`)) continue;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (parsed.scope !== scope) continue;
+    const context = (parsed.context ?? {}) as Record<string, unknown>;
+    const commandType = String(context.type ?? context.commandType ?? "unknown");
+    const entry = totals.get(commandType) ?? {
+      commandType,
+      count: 0,
+      maxQueueMs: 0,
+      maxSchedulerWaitMs: 0,
+      maxRunMs: 0,
+      maxRoundTripMs: 0,
+      libraryIds: new Set<string>(),
+    };
+    entry.count += 1;
+    entry.maxQueueMs = Math.max(entry.maxQueueMs, Number(context.queueMs ?? 0));
+    // `queueMs` is time to *receipt*; `schedulerWaitMs` is time from receipt to
+    // admission. A mutation waits for an idle scheduler, so a transition's real
+    // wait lives here, and `queueMs` alone reports it as zero.
+    entry.maxSchedulerWaitMs = Math.max(
+      entry.maxSchedulerWaitMs,
+      Number(context.schedulerWaitMs ?? 0),
+    );
+    entry.maxRunMs = Math.max(entry.maxRunMs, Number(context.runMs ?? 0));
+    entry.maxRoundTripMs = Math.max(
+      entry.maxRoundTripMs,
+      Number(context.roundTripMs ?? context.totalMs ?? 0),
+    );
+    if (typeof context.libraryId === "string") entry.libraryIds.add(context.libraryId);
+    totals.set(commandType, entry);
+  }
+  return [...totals.values()]
+    .map((entry) => ({ ...entry, libraryIds: [...entry.libraryIds] }))
+    .sort((left, right) =>
+      Math.max(right.maxRoundTripMs, right.maxRunMs, right.maxSchedulerWaitMs)
+      - Math.max(left.maxRoundTripMs, left.maxRunMs, left.maxSchedulerWaitMs));
+}
+
 test("measures wheel scrolling and a real library switch", async () => {
   test.skip(libraryPaths.length < 2, "Set SERPENT_E2E_SWITCH_LIBRARIES=<pathA>|<pathB>.");
 
@@ -189,11 +253,27 @@ test("measures wheel scrolling and a real library switch", async () => {
       SERPENT_E2E: "1",
       SERPENT_E2E_RESTORE_RECENT: "1",
       SERPENT_E2E_USER_DATA_PATH: userDataPath,
+      // Main-side request trace: without it a switch that never reaches the
+      // Worker cannot be told apart from one Main never handled.
+      SERPENT_E2E_LIBRARY_TRACE: "1",
     }),
   });
 
+  // Hoisted so the teardown can always undo a paused media queue, even when the
+  // measurement fails before or inside the pause experiment.
+  let pausedMedia = false;
+  let benchmarkWindow: Page | null = null;
+  // A renderer that dies under a loaded library must still leave diagnostics:
+  // the log-derived fields can be collected after a crash, but everything that
+  // needs the live page cannot. Record the failure and keep going to the report.
+  let measurementError: string | null = null;
+
   try {
     const window = await application.firstWindow();
+    benchmarkWindow = window;
+    window.on("crash", () => {
+      measurementError = "renderer crashed";
+    });
     await window.waitForLoadState("domcontentloaded");
     // Switching away from a busy library raises a native `window.confirm`
     // warning (confirmLibrarySwitch). Playwright does not answer native modals,
@@ -220,12 +300,20 @@ test("measures wheel scrolling and a real library switch", async () => {
     // synchronous pass, a switch issued during it queues behind the pass and
     // looks like a hang. Configurable so that hypothesis can be measured.
     const settleMs = Number(process.env.SERPENT_E2E_SWITCH_SETTLE_MS ?? 0);
-    if (settleMs > 0) await window.waitForTimeout(settleMs);
+    if (settleMs > 0) {
+      try {
+        await window.waitForTimeout(settleMs);
+      } catch (error) {
+        // A crashed renderer under a loaded library is itself a finding, but it
+        // must not throw away the log-derived diagnostics below.
+        measurementError ??= error instanceof Error ? error.message : String(error);
+      }
+    }
 
     // Discriminating experiment: if the Worker is saturated by this library's own
     // media-job churn, a `library.open` queues behind it and the switch hangs.
     // Pausing media first should then make the same switch succeed.
-    const pausedMedia = process.env.SERPENT_E2E_SWITCH_PAUSE_MEDIA === "1";
+    pausedMedia = process.env.SERPENT_E2E_SWITCH_PAUSE_MEDIA === "1";
     if (pausedMedia) {
       const pauseResult = await window.evaluate(async () => {
         const bridge = (globalThis as unknown as {
@@ -247,35 +335,41 @@ test("measures wheel scrolling and a real library switch", async () => {
 
     // ---- real library switch through the UI ----
     const switcher = window.getByRole("button", { name: `当前资源库 ${nameOf(pathA)}` });
-    await expect(switcher).toBeVisible({ timeout: 30_000 });
-    const switchStartedAt = Date.now();
-    await switcher.click();
-    await window.getByRole("menuitem", { name: nameOf(pathB) }).click();
     let switchFirstCardMs: number | null = null;
     let switchToSidebarMs: number | null = null;
-    let switchTimedOut = false;
+    let switchTimedOut = true;
     try {
-      await expect(
-        window.getByRole("button", { name: `当前资源库 ${nameOf(pathB)}` }),
-      ).toBeVisible({ timeout: 90_000 });
-      await expect(window.locator(".asset-card").first()).toBeVisible({ timeout: 90_000 });
-      switchFirstCardMs = Date.now() - switchStartedAt;
-      await expect
-        .poll(async () => (await readScope(window)).folderOrCollectionRows, { timeout: 90_000 })
-        .toBeGreaterThan(4);
-      switchToSidebarMs = Date.now() - switchStartedAt;
-    } catch {
-      switchTimedOut = true;
+      await expect(switcher).toBeVisible({ timeout: 30_000 });
+      const switchStartedAt = Date.now();
+      await switcher.click();
+      await window.getByRole("menuitem", { name: nameOf(pathB) }).click();
+      switchTimedOut = false;
+      try {
+        await expect(
+          window.getByRole("button", { name: `当前资源库 ${nameOf(pathB)}` }),
+        ).toBeVisible({ timeout: 90_000 });
+        await expect(window.locator(".asset-card").first()).toBeVisible({ timeout: 90_000 });
+        switchFirstCardMs = Date.now() - switchStartedAt;
+        await expect
+          .poll(async () => (await readScope(window)).folderOrCollectionRows, { timeout: 90_000 })
+          .toBeGreaterThan(4);
+        switchToSidebarMs = Date.now() - switchStartedAt;
+      } catch {
+        switchTimedOut = true;
+      }
+    } catch (error) {
+      // The switch could not even be issued (dead renderer, missing menu).
+      measurementError ??= error instanceof Error ? error.message : String(error);
     }
-    const stateB = await readScope(window);
-    const wheelB = switchTimedOut
+    const stateB = await readScope(window).catch(() => null);
+    const wheelB = switchTimedOut || stateB === null
       ? null
-      : await wheelScroll(window, ".workspace-canvas", wheelMs);
+      : await wheelScroll(window, ".workspace-canvas", wheelMs).catch(() => null);
     const probeB = switchTimedOut
       ? null
       : await window.evaluate(
         () => (globalThis as unknown as { __scrollProbe: ScrollProbe }).__scrollProbe,
-      );
+      ).catch(() => null);
 
     const logText = (() => {
       try {
@@ -287,22 +381,34 @@ test("measures wheel scrolling and a real library switch", async () => {
 
     // Diagnostics for a switch that never completes: the switcher's own label,
     // any loading overlay, and what the app logged while it was asked to switch.
-    const switchDiagnostics = await window.evaluate(() => {
+    const switchDiagnostics = stateB === null ? null : await window.evaluate(() => {
       const switcherLabel = [...document.querySelectorAll<HTMLElement>("button")]
         .map((node) => node.textContent?.trim() ?? "")
         .find((text) => text.startsWith("当前资源库")) ?? null;
+      const buttons = [...document.querySelectorAll<HTMLElement>("button")]
+        .map((node) => (node.textContent ?? "").trim())
+        .filter((text) => text.length > 0 && text.length < 40);
       return {
         switcherLabel,
         loadingBackdrop: document.querySelectorAll(".library-loading-backdrop").length,
+        overlayText: (
+          document.querySelector<HTMLElement>(".library-loading-backdrop")?.innerText ?? ""
+        ).replace(/\s+/g, " ").slice(0, 160),
+        libraryButtons: buttons.filter((text) => text.includes("资源库")).slice(0, 8),
+        dialogCount: document.querySelectorAll("[role='dialog'], [role='alertdialog']").length,
+        dialogText: (
+          document.querySelector<HTMLElement>("[role='dialog'], [role='alertdialog']")?.innerText ?? ""
+        ).replace(/\s+/g, " ").slice(0, 200),
         cards: document.querySelectorAll(".asset-card").length,
         navText: (document.querySelector<HTMLElement>(".navigation-pane")?.innerText ?? "")
           .replace(/\s+/g, " ").slice(0, 200),
       };
-    });
+    }).catch(() => null);
 
     const report = {
       libraryA: nameOf(pathA),
       libraryB: nameOf(pathB),
+      measurementError,
       firstCardAMs,
       stateA,
       wheelA,
@@ -321,7 +427,126 @@ test("measures wheel scrolling and a real library switch", async () => {
         slotRemoved: probeB.slotRemoved - probeA.slotRemoved,
         mediaSrcWrites: probeB.mediaSrcWrites - probeA.mediaSrcWrites,
       },
-      logTail: logText.split("\n").filter((line) => line.length > 0).slice(-25),
+      logTail: logText.split("\n").filter((line) => line.length > 0).slice(-60),
+      loadDiag: logText.split("\n")
+        .map((line) => {
+          try {
+            return JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            return null;
+          }
+        })
+        .filter((entry): entry is Record<string, unknown> =>
+          typeof entry?.message === "string" && entry.message.includes("LOADDIAG"))
+        .slice(-12),
+      // SERPENT_WORKER_CMD_LOG=1 emits one `worker.cmd` line per command with
+      // `queueMs` (waiting to be dispatched) and `runMs` (execution). Every
+      // field lives under `context`; reading them from the top level silently
+      // compares `undefined`, which is how a 16-second holder stayed invisible.
+      // Sorting by queueMs attributes a stalled switch to the command that
+      // waited; `slowestCommands` below attributes it to the one that ran.
+      commandLog: logText.split("\n")
+        .map((line) => {
+          try {
+            return JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            return null;
+          }
+        })
+        .filter((entry): entry is Record<string, unknown> => entry?.scope === "worker.cmd")
+        .map((entry) => entry.context as Record<string, unknown>)
+        .sort((left, right) => Number(right?.queueMs ?? 0) - Number(left?.queueMs ?? 0))
+        .slice(0, 12),
+      // Main-side round trips: which commands Main sent and how long they took.
+      roundtripLog: logText.split("\n")
+        .map((line) => {
+          try {
+            return JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            return null;
+          }
+        })
+        .filter((entry): entry is Record<string, unknown> => entry?.scope === "worker.cmd.roundtrip")
+        .map((entry) => entry.context as Record<string, unknown>)
+        .sort((left, right) => Number(right.totalMs ?? right.roundTripMs ?? 0) - Number(left.totalMs ?? left.roundTripMs ?? 0))
+        .slice(0, 12),
+      // A switch that stalls does so while a command is *executing*, not while
+      // queued: the single Worker thread is busy, so `runMs` is the attribution
+      // key and `queueMs` alone cannot see the holder.
+      slowestCommands: logText.split("\n")
+        .map((line) => {
+          try {
+            return JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            return null;
+          }
+        })
+        .filter((entry): entry is Record<string, unknown> => entry?.scope === "worker.cmd")
+        .map((entry) => entry.context as Record<string, unknown>)
+        .sort((left, right) => Number(right?.runMs ?? 0) - Number(left?.runMs ?? 0))
+        .slice(0, 15)
+        .map((entry) => ({
+          type: entry?.type,
+          lane: entry?.lane,
+          libraryId: entry?.libraryId,
+          queueMs: entry?.queueMs,
+          schedulerWaitMs: entry?.schedulerWaitMs,
+          runMs: entry?.runMs,
+          outcome: entry?.outcome,
+        })),
+      // `worker.scheduler.stall` is emitted when a non-empty queue cannot be
+      // admitted at all; it names the lane holder that is blocking it.
+      stallLog: logText.split("\n")
+        .filter((line) => line.includes("worker.scheduler.stall"))
+        .slice(-10),
+      // The Worker-side log cannot answer "did Main even dispatch the switch?".
+      // Keep the Main-side lifecycle story, otherwise a missing `library.open`
+      // for the incoming library is indistinguishable from a Worker-side stall.
+      lifecycleLog: logText.split("\n")
+        .filter((line) =>
+          /library\.opening|library\.open|library\.closed|main\.library-request|open\.cancel|recent-library|library\.open-failed|diag\.library-request/
+            .test(line)
+          && !line.includes('"scope":"worker.cmd"')
+          && !line.includes('"scope":"performance.span"')
+          // The per-second viewport reports would otherwise flush the switch's
+          // own lifecycle lines out of this window.
+          && !line.includes("asset.thumbnail.visible-window")
+          && !line.includes("media.list-jobs")
+          && !line.includes("plugin.jobs.list")
+          && !line.includes("ai.status"))
+        .map((line) => line.slice(0, 400))
+        .slice(-60),
+      errorLog: logText.split("\n")
+        .filter((line) =>
+          line.includes('"level":"error"')
+          && !line.includes('"scope":"worker.cmd"')
+          && !line.includes('"scope":"performance.span"'))
+        .map((line) => line.slice(0, 400))
+        .slice(-40),
+      // Top-N slices can hide the one command that matters (a fast `library.open`
+      // for the incoming library never reaches either top-N list). Aggregate by
+      // command type so presence, worst queue and worst run are always visible.
+      commandTypeTotals: aggregateLogCommands(logText, "worker.cmd"),
+      roundtripTypeTotals: aggregateLogCommands(logText, "worker.cmd.roundtrip"),
+      // Event-loop lag from both processes: a stalled switch is caused by one of
+      // them being unable to run its callbacks, not by a missing request.
+      lagLog: logText.split("\n")
+        .filter((line) => line.includes("eventLoop.lag"))
+        .map((line) => line.slice(0, 300))
+        .slice(-40),
+      // Reconciliation stage timings (SERPENT_REFRESH_STAGE_LOG=1): inside the
+      // open path, a single stage is what holds the Worker event loop, and the
+      // lag line alone cannot say which.
+      stageLog: logText.split("\n")
+        .filter((line) =>
+          // Keep the open-path marks and the top-level reconciliation stages.
+          // The per-batch `refresh.managed-assets.stage` lines are one per batch
+          // (dozens per open) and would flush everything else out of the window.
+          (line.includes("open.refresh-managed-assets.stage")
+            || line.includes("open.reconciliation.stage"))
+          && !line.includes('"scope":"refresh.managed-assets.stage"'))
+        .map((line) => line.slice(0, 260))
+        .slice(-40),
       mainLog: {
         sourceRequests: countLogEvents(logText, "serpent-protocol.source-request"),
         mediaJobInterrupted: countLogEvents(logText, "worker.media-job.interrupted"),
@@ -331,6 +556,29 @@ test("measures wheel scrolling and a real library switch", async () => {
     if (reportPath) writeFileSync(reportPath, serialized, "utf8");
     console.log(`SWITCH_BENCH_BEGIN\n${serialized}\nSWITCH_BENCH_END`);
   } finally {
+    // A paused media queue is persistent state in the library's database. The
+    // pause experiment must not leave the operator's library with generation
+    // stopped, so always resume before leaving, whatever the measurement did.
+    if (pausedMedia) {
+      try {
+        await benchmarkWindow?.evaluate(async () => {
+          const bridge = (globalThis as unknown as {
+            serpent: {
+              library: {
+                listOpen(): Promise<{ ok: boolean; value?: Array<{ libraryId: string }> }>;
+                resumeMediaJobs(input: { libraryId: string }): Promise<{ ok: boolean }>;
+              };
+            };
+          }).serpent;
+          const opened = await bridge.library.listOpen();
+          for (const library of opened.value ?? []) {
+            await bridge.library.resumeMediaJobs({ libraryId: library.libraryId });
+          }
+        });
+      } catch {
+        // Best effort: a failed resume must not mask the measurement result.
+      }
+    }
     await application.close();
     try {
       rmSync(temporaryRoot, { force: true, recursive: true, maxRetries: 20, retryDelay: 250 });

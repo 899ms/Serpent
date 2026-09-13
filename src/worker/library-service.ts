@@ -6504,6 +6504,21 @@ export class LibraryService {
     task: OpenReconciliationTask,
     diagnosticScope = 'open.refresh-managed-assets',
   ): Promise<void> {
+    // 分阶段计时（SERPENT_REFRESH_STAGE_LOG=1）：打开路径里整段对账会堵住 Worker
+    // 事件循环数秒（SMB 库实测 7.3 s），必须能区分是「枚举」「指纹」还是「应用批次」。
+    const stageLog = process.env.SERPENT_REFRESH_STAGE_LOG === '1';
+    let stageMarkAt = performance.now();
+    const markRefreshStage = (stage: string): void => {
+      if (!stageLog) return;
+      const now = performance.now();
+      console.error(JSON.stringify({
+        scope: 'open.refresh-managed-assets.stage',
+        libraryId,
+        stage,
+        durationMs: Math.round((now - stageMarkAt) * 100) / 100,
+      }));
+      stageMarkAt = now;
+    };
     try {
       this.assertReconciliationActive(task);
       const openLibrary = this.openById.get(libraryId);
@@ -6533,8 +6548,10 @@ export class LibraryService {
       // on a 20k library that doubled NAS metadata traffic and forced hundreds
       // of synchronous DB batches.
       this.assertReconciliationActive(task);
+      markRefreshStage('existing-snapshot');
       const discovery = await this.collectManagedAssetDiscoveryAsync(task);
       this.assertReconciliationActive(task);
+      markRefreshStage('discovery-walk');
       if (task.reason === 'watcher' || task.reason === 'network') {
         await this.waitForStableWatcherDiscovery(task, discovery, existingAssets);
         this.assertReconciliationActive(task);
@@ -6556,6 +6573,7 @@ export class LibraryService {
       }
       await this.prepareOpenReconciliationFingerprints(task, discovery, existingAssets);
       this.assertReconciliationActive(task);
+      markRefreshStage('prepare-fingerprints');
       const discoveredManagedPaths = new Set(
         discovery.managedEntries.map((entry) => portablePathIdentity(entry.relativePath)),
       );
@@ -6606,9 +6624,11 @@ export class LibraryService {
       // it walked the tree; now commit its entries in short transactions while
       // reusing the same existing-identity maps for every batch.
       this.assertReconciliationActive(task);
+      markRefreshStage('stale-missing-batches');
       const discovered = await this.applyDiscoveredAssetsInBatches(task, discovery);
       changedCount += discovered.changedCount;
       missingCount += discovered.missingCount;
+      markRefreshStage('apply-discovered-batches');
       if (changedCount > 0 && this.shouldEmitWatcherAssetChange()) {
         this.options.onAssetsChanged?.({
           type: 'asset.changed',
