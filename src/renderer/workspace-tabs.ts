@@ -1,7 +1,6 @@
 import {
-  createWorkspaceNavHistory,
-  type WorkspaceNavHistory,
   type WorkspaceNavLocation,
+  type WorkspaceNavViewport,
 } from "./workspace-nav-history";
 
 export interface WorkspaceTabBrowseFilters {
@@ -39,9 +38,22 @@ export interface WorkspaceTabBrowseState {
   showIgnoredItems: boolean;
 }
 
+const EMPTY_VIEWPORT: WorkspaceNavViewport = {
+  scrollTop: 0,
+  scrollProgress: 0,
+  scrollExtent: 0,
+};
+
 export interface WorkspaceTabSession {
   readonly id: string;
-  readonly history: WorkspaceNavHistory;
+  /**
+   * This tab's current location (the view it shows when active). The shared
+   * Back/Forward timeline lives outside the tabs; this is only the tab's
+   * present state, restored when it is re-activated.
+   */
+  location: WorkspaceNavLocation;
+  /** Cached scroll position restored when the tab is re-activated. */
+  viewport: WorkspaceNavViewport;
   selectedAssetIds: string[];
   selectedAssetId: string | null;
   browseState: WorkspaceTabBrowseState | null;
@@ -71,7 +83,8 @@ export function createWorkspaceTabId(): string {
 function createTab(id: string, location: WorkspaceNavLocation = { kind: "all" }): WorkspaceTabSession {
   return {
     id,
-    history: createWorkspaceNavHistory(location),
+    location,
+    viewport: { ...EMPTY_VIEWPORT },
     selectedAssetIds: [],
     selectedAssetId: null,
     browseState: null,
@@ -251,6 +264,32 @@ export function updateWorkspaceTabBrowseState(
   return { ...state, tabs };
 }
 
+/** Sets a tab's current location (tab-switch replay / user navigation cache). */
+export function setWorkspaceTabLocation(
+  state: WorkspaceTabsState,
+  tabId: string,
+  location: WorkspaceNavLocation,
+): WorkspaceTabsState {
+  const index = state.tabs.findIndex((tab) => tab.id === tabId);
+  if (index < 0) return state;
+  const tabs = [...state.tabs];
+  tabs[index] = { ...tabs[index]!, location };
+  return { ...state, tabs };
+}
+
+/** Sets a tab's cached scroll viewport (cross-tab Back/Forward replay). */
+export function setWorkspaceTabViewport(
+  state: WorkspaceTabsState,
+  tabId: string,
+  viewport: WorkspaceNavViewport,
+): WorkspaceTabsState {
+  const index = state.tabs.findIndex((tab) => tab.id === tabId);
+  if (index < 0) return state;
+  const tabs = [...state.tabs];
+  tabs[index] = { ...tabs[index]!, viewport };
+  return { ...state, tabs };
+}
+
 export function closeWorkspaceTab(
   state: WorkspaceTabsState,
   tabId: string,
@@ -262,7 +301,8 @@ export function closeWorkspaceTab(
 
   if (state.tabs.length === 1) {
     const onlyTab = state.tabs[0]!;
-    onlyTab.history.clear({ kind: "all" });
+    onlyTab.location = { kind: "all" };
+    onlyTab.viewport = { ...EMPTY_VIEWPORT };
     onlyTab.selectedAssetIds = [];
     onlyTab.selectedAssetId = null;
     onlyTab.browseState = null;

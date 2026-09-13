@@ -1,15 +1,11 @@
 /**
  * Persist the open workspace tabs across app restarts (localStorage), keyed per
- * library. Only each tab's current location is stored — forward/back branches
- * are deliberately not restored, so a restored tab starts its own history from
- * the location it was left on.
+ * library. Only each tab's current location is stored — the shared Back/Forward
+ * timeline is deliberately not restored, so a reopened app starts its history
+ * from the active tab's location.
  */
 
-import {
-  createWorkspaceNavHistory,
-  seedRestoreLeafLocation,
-  type WorkspaceNavLocation,
-} from "./workspace-nav-history";
+import { type WorkspaceNavLocation } from "./workspace-nav-history";
 import { resolveSessionStorage, type SessionStorage } from "./session-storage";
 import type { WorkspaceTabsState } from "./workspace-tabs";
 
@@ -144,31 +140,28 @@ export function buildWorkspaceTabsSession(
     activeTabId: state.activeTabId,
     tabs: state.tabs.map((tab) => ({
       id: tab.id,
-      location: tab.history.current,
+      location: tab.location,
     })),
   };
 }
 
 /**
  * Rebuilds the tab strip from a stored session. Each tab keeps its identity and
- * its location over a synthetic "all assets" base, so Back is meaningful from
- * the first frame — the same seeding a restored browse scope gets.
+ * its last location; the shared Back/Forward timeline is seeded separately for
+ * the active tab (so Back is meaningful from the first frame).
  */
 export function createWorkspaceTabsFromSession(
   session: StoredWorkspaceTabsSession,
 ): WorkspaceTabsState {
-  const tabs = session.tabs.map((stored) => {
-    const history = createWorkspaceNavHistory({ kind: "all" });
-    seedRestoreLeafLocation(history, stored.location);
-    return {
-      id: stored.id,
-      history,
-      selectedAssetIds: [] as string[],
-      selectedAssetId: null,
-      browseState: null,
-      cachedTitle: null,
-    };
-  });
+  const tabs = session.tabs.map((stored) => ({
+    id: stored.id,
+    location: stored.location,
+    viewport: { scrollTop: 0, scrollProgress: 0, scrollExtent: 0 },
+    selectedAssetIds: [] as string[],
+    selectedAssetId: null,
+    browseState: null,
+    cachedTitle: null,
+  }));
   const activeTabId = tabs.some((tab) => tab.id === session.activeTabId)
     ? session.activeTabId
     : tabs[0]!.id;

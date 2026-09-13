@@ -12,6 +12,7 @@ import {
   addWorkspaceTab,
   createWorkspaceTabs,
   selectWorkspaceTab,
+  setWorkspaceTabLocation,
 } from "../../src/renderer/workspace-tabs";
 
 function fakeStorage(initial: Record<string, string> = {}): SessionStorage & {
@@ -30,9 +31,12 @@ function fakeStorage(initial: Record<string, string> = {}): SessionStorage & {
 describe("workspace tabs session", () => {
   it("round-trips tab order, identity, active tab and per-tab location", () => {
     let state = createWorkspaceTabs(() => "tab-a");
-    state.tabs[0]!.history.push({ kind: "folder", folderId: "folder-a" });
+    state = setWorkspaceTabLocation(state, "tab-a", {
+      kind: "folder",
+      folderId: "folder-a",
+    });
     state = addWorkspaceTab(state, () => "tab-b");
-    state.tabs[1]!.history.push({
+    state = setWorkspaceTabLocation(state, "tab-b", {
       kind: "collection",
       collectionId: "collection-a",
       recursive: true,
@@ -68,13 +72,12 @@ describe("workspace tabs session", () => {
     const rebuilt = createWorkspaceTabsFromSession(restored!);
     expect(rebuilt.tabs.map((tab) => tab.id)).toEqual(["tab-a", "tab-b", "tab-c"]);
     expect(rebuilt.activeTabId).toBe("tab-b");
-    expect(rebuilt.tabs[1]!.history.current).toEqual({
+    expect(rebuilt.tabs[1]!.location).toEqual({
       kind: "collection",
       collectionId: "collection-a",
       recursive: true,
     });
-    expect(rebuilt.tabs[1]!.history.canBack).toBe(true);
-    expect(rebuilt.tabs[2]!.history.canBack).toBe(false);
+    expect(rebuilt.tabs[2]!.location).toEqual({ kind: "all" });
   });
 
   it("keeps each library's strip separate", () => {

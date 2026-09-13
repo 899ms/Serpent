@@ -8,6 +8,8 @@ import {
   getWorkspaceTab,
   moveWorkspaceTab,
   selectWorkspaceTab,
+  setWorkspaceTabLocation,
+  setWorkspaceTabViewport,
   updateWorkspaceTabBrowseState,
   updateWorkspaceTabContext,
   type WorkspaceTabBrowseState,
@@ -18,7 +20,14 @@ import {
   createWorkspaceTabsFromSession,
   type StoredWorkspaceTabsSession,
 } from "./workspace-tabs-session";
-import type { WorkspaceNavHistory } from "./workspace-nav-history";
+import {
+  createWorkspaceNavHistory,
+  seedRestoreLeafLocation,
+  workspaceNavLocationsEqual,
+  type WorkspaceNavHistory,
+  type WorkspaceNavLocation,
+  type WorkspaceNavViewport,
+} from "./workspace-nav-history";
 import {
   createWorkspaceNavigationCoordinator,
   type WorkspaceNavigationHistoryMode,
@@ -30,7 +39,7 @@ import {
 } from "./workspace-render-snapshot-cache";
 
 export interface WorkspaceTabCapturedContext {
-  viewport: WorkspaceTabSession["history"]["currentViewport"];
+  viewport: WorkspaceTabSession["viewport"];
   selectedAssetIds: readonly string[];
   selectedAssetId: string | null;
   browseState: WorkspaceTabBrowseState;
@@ -50,17 +59,34 @@ export interface UseWorkspaceTabsControllerOptions {
   onHistoryChanged: (history: WorkspaceNavHistory) => void;
   /**
    * Persists the strip after a user tab action. Locations come straight off the
-   * live histories, so this stays accurate without a separate save step, and
-   * tearing the strip down for a library change never writes a session.
+   * live tabs, so this stays accurate without a separate save step, and tearing
+   * the strip down for a library change never writes a session.
    */
   persistTabs: (state: WorkspaceTabsState) => void;
 }
 
-/** Owns tab lifetimes and keeps each tab paired with its independent history. */
+export interface SelectWorkspaceTabOptions {
+  /**
+   * Replay a specific location on the target tab (shared Back/Forward crossing
+   * tab boundaries). When set, the switch is NOT recorded as a new history
+   * step; the tab's cached location is replaced with it instead.
+   */
+  location?: WorkspaceNavLocation;
+  /** Viewport to restore alongside a replayed location. */
+  viewport?: WorkspaceNavViewport;
+}
+
+/**
+ * Owns tab lifetimes. There is a single shared Back/Forward timeline
+ * (`historyRef`): every tab keeps only its current location, and switching tabs
+ * records a step so Back/Forward can cross tab switches (Serpent-b8a853).
+ */
 export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOptions) {
   const [state, setState] = useState(createWorkspaceTabs);
   const stateRef = useRef(state);
-  const historyRef = useRef(state.tabs[0]!.history);
+  const historyRef = useRef(
+    createWorkspaceNavHistory(state.tabs[0]!.location, state.tabs[0]!.id),
+  );
   const callbacksRef = useRef(options);
   const transitionQueueRef = useRef<Promise<void>>(Promise.resolve());
   const transitionEpochRef = useRef(0);
@@ -75,9 +101,9 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
   const commit = useCallback((next: WorkspaceTabsState, persist = true) => {
     stateRef.current = next;
     const activeTab = getWorkspaceTab(next, next.activeTabId);
-    if (activeTab) historyRef.current = activeTab.history;
+    if (activeTab) historyRef.current.setActiveTab(activeTab.id);
     setState(next);
-    if (activeTab) callbacksRef.current.onHistoryChanged(activeTab.history);
+    if (activeTab) callbacksRef.current.onHistoryChanged(historyRef.current);
     if (persist) callbacksRef.current.persistTabs(next);
   }, []);
 
@@ -85,16 +111,27 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
     const current = stateRef.current;
     const active = getWorkspaceTab(current, current.activeTabId);
     if (!active) return current;
+    // Keep the active tab's cached location at the shared cursor, so a later
+    // switch/replay restores where that tab really was (the per-tab location
+    // is no longer a history stack; the shared timeline owns the steps).
+    let next = setWorkspaceTabLocation(
+      current,
+      active.id,
+      historyRef.current.current,
+    );
     const captured = callbacksRef.current.captureContext();
-    if (!captured) return current;
-    active.history.saveCurrentViewport(captured.viewport);
-    if (captured.renderSnapshot) {
-      renderSnapshotCache.set(active.id, captured.renderSnapshot);
-    } else {
-      renderSnapshotCache.delete(active.id);
+    if (captured) {
+      // Persist the outgoing entry's scroll position so Back can restore it.
+      historyRef.current.saveCurrentViewport(captured.viewport);
+      next = setWorkspaceTabViewport(next, active.id, captured.viewport);
+      if (captured.renderSnapshot) {
+        renderSnapshotCache.set(active.id, captured.renderSnapshot);
+      } else {
+        renderSnapshotCache.delete(active.id);
+      }
+      next = updateWorkspaceTabContext(next, active.id, captured);
+      next = updateWorkspaceTabBrowseState(next, active.id, captured.browseState);
     }
-    let next = updateWorkspaceTabContext(current, active.id, captured);
-    next = updateWorkspaceTabBrowseState(next, active.id, captured.browseState);
     stateRef.current = next;
     return next;
   }, [renderSnapshotCache]);
@@ -126,8 +163,8 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
   ) => {
     const tab = getWorkspaceTab(next, next.activeTabId);
     if (!tab) return;
-    historyRef.current = tab.history;
-    callbacksRef.current.onHistoryChanged(tab.history);
+    historyRef.current.setActiveTab(tab.id);
+    callbacksRef.current.onHistoryChanged(historyRef.current);
     await callbacksRef.current.restoreTab(
       tab,
       () =>
@@ -140,16 +177,37 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
   }, [navigation]);
 
   const selectTab = useCallback(
-    (tabId: string) => enqueueTransition(async (epoch, isRequestCurrent) => {
-      const current = stateRef.current;
-      if (current.activeTabId === tabId || !getWorkspaceTab(current, tabId)) return;
-      const saved = saveActiveContext();
-      const next = selectWorkspaceTab(saved, tabId);
-      navigation.activateTab(tabId);
-      const navigationToken = navigation.begin(tabId, "none");
-      commit(next);
-      await restoreActive(next, epoch, isRequestCurrent, navigationToken);
-    }),
+    (tabId: string, options?: SelectWorkspaceTabOptions) =>
+      enqueueTransition(async (epoch, isRequestCurrent) => {
+        const current = stateRef.current;
+        if (!getWorkspaceTab(current, tabId)) return;
+        const replayLocation = options?.location;
+        if (current.activeTabId === tabId && replayLocation === undefined) return;
+        // On a replay switch the caller already synced the outgoing tab's
+        // location to the pre-replay cursor; capturing again here would read
+        // the already-moved cursor and corrupt it.
+        const saved = replayLocation !== undefined
+          ? stateRef.current
+          : saveActiveContext();
+        let next = selectWorkspaceTab(saved, tabId);
+        if (replayLocation !== undefined) {
+          next = setWorkspaceTabLocation(next, tabId, replayLocation);
+          if (options?.viewport) {
+            next = setWorkspaceTabViewport(next, tabId, options.viewport);
+          }
+        }
+        const targetTab = getWorkspaceTab(next, tabId)!;
+        navigation.activateTab(tabId);
+        const navigationToken = navigation.begin(tabId, "none");
+        historyRef.current.setActiveTab(tabId);
+        // A user tab switch is a history step (its view changed). Replaying a
+        // history entry across tabs must not record a new step.
+        if (replayLocation === undefined) {
+          historyRef.current.push(targetTab.location);
+        }
+        commit(next);
+        await restoreActive(next, epoch, isRequestCurrent, navigationToken);
+      }),
     [commit, enqueueTransition, navigation, restoreActive, saveActiveContext],
   );
 
@@ -162,8 +220,12 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
         next.activeTabId,
         callbacksRef.current.getDefaultBrowseState(),
       );
-      navigation.activateTab(next.activeTabId);
-      const navigationToken = navigation.begin(next.activeTabId, "none");
+      const tab = getWorkspaceTab(next, next.activeTabId)!;
+      navigation.activateTab(tab.id);
+      const navigationToken = navigation.begin(tab.id, "none");
+      // Activating the new tab shows its (root) view — a history step.
+      historyRef.current.setActiveTab(tab.id);
+      historyRef.current.push(tab.location);
       commit(next);
       await restoreActive(next, epoch, isRequestCurrent, navigationToken);
     }),
@@ -178,6 +240,7 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
         if (result.state === immediateState) return Promise.resolve();
         navigation.closeTab(tabId);
         for (const removedTabId of result.removedTabIds) {
+          historyRef.current.removeTab(removedTabId);
           renderSnapshotCache.delete(removedTabId);
         }
         commit(result.state);
@@ -190,6 +253,7 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
       if (result.state === saved) return;
       for (const removedTabId of result.removedTabIds) {
         navigation.closeTab(removedTabId);
+        historyRef.current.removeTab(removedTabId);
         renderSnapshotCache.delete(removedTabId);
       }
       let next = result.state;
@@ -198,6 +262,10 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
           next,
           next.activeTabId,
           callbacksRef.current.getDefaultBrowseState(),
+        );
+        historyRef.current.clear(
+          { kind: "all" },
+          next.activeTabId,
         );
       }
       let navigationToken: WorkspaceNavigationToken | undefined;
@@ -235,6 +303,7 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
         if (result.state === immediateState) return Promise.resolve();
         for (const removedTabId of result.removedTabIds) {
           navigation.closeTab(removedTabId);
+          historyRef.current.removeTab(removedTabId);
           renderSnapshotCache.delete(removedTabId);
         }
         commit(result.state);
@@ -246,6 +315,7 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
       if (result.state === saved) return;
       for (const removedTabId of result.removedTabIds) {
         navigation.closeTab(removedTabId);
+        historyRef.current.removeTab(removedTabId);
         renderSnapshotCache.delete(removedTabId);
       }
       navigation.activateTab(tabId);
@@ -266,6 +336,7 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
     navigation.invalidateLibrary();
     navigation.activateTab(next.activeTabId);
     renderSnapshotCache.clear();
+    historyRef.current.clear(next.tabs[0]!.location, next.tabs[0]!.id);
     // Closing or switching a library tears the strip down; the next library's
     // own session must survive, so this teardown is never written.
     commit(next, false);
@@ -274,7 +345,8 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
   /**
    * Rebuilds the strip for the library that just opened. Tab content itself is
    * restored lazily: the startup browse session owns the active tab, and any
-   * other tab is loaded the first time the user selects it.
+   * other tab is loaded the first time the user selects it. The shared
+   * Back/Forward timeline is reseeded for the active tab.
    *
    * Returns the rebuilt state and skips the persist hook: this runs during the
    * startup restore, before `library` has re-rendered, so the caller writes the
@@ -290,6 +362,9 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
       navigation.invalidateLibrary();
       navigation.activateTab(next.activeTabId);
       renderSnapshotCache.clear();
+      const active = getWorkspaceTab(next, next.activeTabId)!;
+      historyRef.current.clear({ kind: "all" }, active.id);
+      seedRestoreLeafLocation(historyRef.current, active.location, active.id);
       commit(next, false);
       return next;
     },
@@ -305,6 +380,29 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
     },
     [commit],
   );
+
+  /**
+   * Mirrors the shared cursor onto the active tab's cached location. Called
+   * after every navigation (the tab strip reads `tab.location`, so it must
+   * track the live view, not just the value captured when the tab was left).
+   * Skipped mid cross-tab replay, when the cursor points at another tab.
+   */
+  const syncActiveTabLocation = useCallback(() => {
+    const current = stateRef.current;
+    const tab = getWorkspaceTab(current, current.activeTabId);
+    if (!tab) return;
+    if (historyRef.current.currentTabId !== tab.id) return;
+    if (workspaceNavLocationsEqual(tab.location, historyRef.current.current)) {
+      return;
+    }
+    const next = setWorkspaceTabLocation(
+      current,
+      tab.id,
+      historyRef.current.current,
+    );
+    stateRef.current = next;
+    setState(next);
+  }, []);
 
   const beginNavigation = useCallback(
     (historyMode: WorkspaceNavigationHistoryMode = "push") => {
@@ -345,6 +443,7 @@ export function useWorkspaceTabsController(options: UseWorkspaceTabsControllerOp
     resetTabs,
     restoreTabs,
     saveActiveContext,
+    syncActiveTabLocation,
     beginNavigation,
     isNavigationCurrent,
     activateRenderSnapshotLibrary,

@@ -86,7 +86,7 @@ describe("useWorkspaceTabsController", () => {
     expect(restoreTab).toHaveBeenCalledTimes(1);
     expect(restoreStates).toEqual([false]);
     expect(controller?.state.tabs).toHaveLength(1);
-    expect(controller?.state.tabs[0]?.history.current).toEqual({ kind: "all" });
+    expect(controller?.state.tabs[0]?.location).toEqual({ kind: "all" });
     expect(captureContext).toHaveBeenCalledTimes(1);
   });
 
@@ -309,15 +309,67 @@ describe("useWorkspaceTabsController", () => {
       "tab-c",
     ]);
     expect(controller!.state.activeTabId).toBe("tab-b");
-    expect(controller!.state.tabs[0]?.history.current).toEqual({
+    expect(controller!.state.tabs[0]?.location).toEqual({
       kind: "folder",
       folderId: "folder-1",
     });
-    // A restored location sits on an "all assets" base so Back works at once.
-    expect(controller!.state.tabs[0]?.history.canBack).toBe(true);
-    expect(controller!.state.tabs[1]?.history.canBack).toBe(false);
+    // The shared timeline is seeded for the active tab (all → no Back yet).
+    expect(controller!.historyRef.current.currentTabId).toBe("tab-b");
+    expect(controller!.historyRef.current.current).toEqual({ kind: "all" });
+    expect(controller!.historyRef.current.canBack).toBe(false);
     // The startup restore writes the session itself, against the library id it
     // holds; the render-bound persist hook would still see the previous library.
     expect(persistTabs).not.toHaveBeenCalled();
+  });
+
+  it("records tab switches on the shared timeline so Back can cross tabs", async () => {
+    let controller: ReturnType<typeof useWorkspaceTabsController> | undefined;
+    function Host() {
+      controller = useWorkspaceTabsController({
+        captureContext: () => null,
+        restoreTab: async () => undefined,
+        restoreAll: async () => undefined,
+        beginTransition: () => () => true,
+        getDefaultBrowseState: createDefaultWorkspaceTabBrowseState,
+        onHistoryChanged: () => undefined,
+        persistTabs: () => undefined,
+      });
+      return null;
+    }
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root?.render(<Host />));
+
+    const firstTabId = controller!.state.activeTabId;
+    expect(controller!.historyRef.current.canBack).toBe(false);
+
+    // Opening a new tab shows its (root) view → a shared history step.
+    await act(async () => {
+      await controller!.addTab();
+    });
+    const secondTabId = controller!.state.activeTabId;
+    expect(secondTabId).not.toBe(firstTabId);
+    expect(controller!.historyRef.current.canBack).toBe(true);
+    expect(controller!.historyRef.current.currentTabId).toBe(secondTabId);
+
+    // Switching back to the first tab is another step.
+    await act(async () => {
+      await controller!.selectTab(firstTabId);
+    });
+    expect(controller!.historyRef.current.currentTabId).toBe(firstTabId);
+    expect(controller!.historyRef.current.canBack).toBe(true);
+
+    // Back crosses the tab switch: the entry now belongs to the second tab.
+    expect(controller!.historyRef.current.back()).toEqual({ kind: "all" });
+    expect(controller!.historyRef.current.currentTabId).toBe(secondTabId);
+
+    // Closing the second tab drops its steps from the timeline.
+    await act(async () => {
+      await controller!.closeTab(secondTabId);
+    });
+    expect(controller!.state.tabs.map((tab) => tab.id)).toEqual([firstTabId]);
+    expect(controller!.historyRef.current.currentTabId).toBe(firstTabId);
+    expect(controller!.historyRef.current.canBack).toBe(false);
   });
 });

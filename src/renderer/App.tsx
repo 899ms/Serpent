@@ -1580,9 +1580,11 @@ function AppInner() {
     isCurrent: () => boolean;
   } | null>(null);
   const cancelWorkspaceViewportRestoreRef = useRef<(() => void) | null>(null);
-  const pendingWorkspaceHistoryReplayRef = useRef<
-    WorkspaceTabSession["history"] | null
-  >(null);
+  // True while a Back/Forward replay is being applied. Suppresses viewport
+  // saving and tab-context capture so the replay neither records a new history
+  // step nor overwrites the target's saved viewport (Serpent-b8a853 shared
+  // timeline; previously this was a per-tab history identity comparison).
+  const workspaceHistoryReplayActiveRef = useRef(false);
   const {
     state: workspaceTabsState,
     historyRef: navHistoryRef,
@@ -1593,6 +1595,8 @@ function AppInner() {
     moveTab: moveWorkspaceTab,
     resetTabs: resetWorkspaceTabs,
     restoreTabs: restoreWorkspaceTabs,
+    saveActiveContext: saveWorkspaceTabContext,
+    syncActiveTabLocation: syncActiveWorkspaceTabLocation,
     beginNavigation: beginWorkspaceTabNavigation,
     isNavigationCurrent: isWorkspaceTabNavigationCurrent,
     activateRenderSnapshotLibrary,
@@ -3402,7 +3406,7 @@ function AppInner() {
   }, [assetCardSize, previewAsset, resizeAssetCards]);
 
   const saveCurrentWorkspaceHistoryViewport = useCallback(() => {
-    if (pendingWorkspaceHistoryReplayRef.current === navHistoryRef.current) {
+    if (workspaceHistoryReplayActiveRef.current) {
       return;
     }
     cancelWorkspaceViewportRestoreRef.current?.();
@@ -3480,16 +3484,15 @@ function AppInner() {
         navHistoryRef.current.replaceCurrent(previewLocation);
       } else {
         navHistoryRef.current.push(previewLocation);
-        if (pendingWorkspaceHistoryReplayRef.current === navHistoryRef.current) {
-          pendingWorkspaceHistoryReplayRef.current = null;
-        }
+        workspaceHistoryReplayActiveRef.current = false;
       }
+      syncActiveWorkspaceTabLocation();
       setNavHistoryUi({
         canBack: navHistoryRef.current.canBack,
         canForward: navHistoryRef.current.canForward,
       });
     }
-  }, [navHistoryRef, saveCurrentWorkspaceHistoryViewport, selectionAnchorRef, setNavHistoryUi, wakeViewerChrome]);
+  }, [navHistoryRef, saveCurrentWorkspaceHistoryViewport, selectionAnchorRef, setNavHistoryUi, syncActiveWorkspaceTabLocation, wakeViewerChrome]);
 
   const persistAssetColorSpace = useCallback(async (assetId: string, colorSpace: string | null) => {
     if (!api || !library) return;
@@ -3520,12 +3523,13 @@ function AppInner() {
         kind: "preview",
         assetId: asset.assetId,
       });
+      syncActiveWorkspaceTabLocation();
       setNavHistoryUi({
         canBack: navHistoryRef.current.canBack,
         canForward: navHistoryRef.current.canForward,
       });
     }
-  }, [navHistoryRef, selectionAnchorRef, setNavHistoryUi]);
+  }, [navHistoryRef, selectionAnchorRef, setNavHistoryUi, syncActiveWorkspaceTabLocation]);
 
   useEffect(() => {
     const pendingPreview = pendingWorkspacePreviewRef.current;
@@ -3571,6 +3575,7 @@ function AppInner() {
     // 或导航 push 会截断，不在此重复处理。
     if (updateHistory && navHistoryRef.current.current.kind === "preview") {
       navHistoryRef.current.dismissCurrent();
+      syncActiveWorkspaceTabLocation();
       setNavHistoryUi({
         canBack: navHistoryRef.current.canBack,
         canForward: navHistoryRef.current.canForward,
@@ -3701,7 +3706,7 @@ function AppInner() {
         closingPreviewRef.current = null;
       }
     }
-  }, [api, library, navHistoryRef, previewAsset, setNavHistoryUi]);
+  }, [api, library, navHistoryRef, previewAsset, setNavHistoryUi, syncActiveWorkspaceTabLocation]);
 
   // Collection tree helper
   const collectionTree = useMemo(() => {
@@ -4514,6 +4519,9 @@ function AppInner() {
   }, [api, library, locale, setError, setFatal, setNotice, t]);
 
   function syncNavHistoryUi() {
+    // Keep the active tab's cached location at the shared cursor so the tab
+    // strip reflects the live view (the tabs no longer own their histories).
+    syncActiveWorkspaceTabLocation();
     setNavHistoryUi({
       canBack: navHistoryRef.current.canBack,
       canForward: navHistoryRef.current.canForward,
@@ -4688,7 +4696,7 @@ function AppInner() {
 
   function captureWorkspaceTabContext() {
     workspaceHistoryReplayEpochRef.current += 1;
-    if (pendingWorkspaceHistoryReplayRef.current === navHistoryRef.current) {
+    if (workspaceHistoryReplayActiveRef.current) {
       return null;
     }
     return {
@@ -4843,15 +4851,15 @@ function AppInner() {
     tab: WorkspaceTabSession,
     isCurrent: () => boolean,
   ) {
-    const current = tab.history.current;
+    const current = tab.location;
     const firstLocation =
       current.kind === "preview"
-        ? (tab.history.peek(-1) ?? { kind: "all" as const })
+        ? (navHistoryRef.current.peek(-1) ?? { kind: "all" as const })
         : current;
     const targetViewport =
       current.kind === "preview"
-        ? (tab.history.peekViewport(-1) ?? tab.history.currentViewport)
-        : tab.history.currentViewport;
+        ? (navHistoryRef.current.peekViewport(-1) ?? tab.viewport)
+        : tab.viewport;
     const pendingSelection = tab.browseState &&
       workspaceTabBrowseStateHasDiscoveryInput(tab.browseState)
       ? {
@@ -4926,9 +4934,7 @@ function AppInner() {
   ) {
     if (!request.isCurrent() || request.historyMode !== "push") return;
     navHistoryRef.current.push(location);
-    if (pendingWorkspaceHistoryReplayRef.current === navHistoryRef.current) {
-      pendingWorkspaceHistoryReplayRef.current = null;
-    }
+    workspaceHistoryReplayActiveRef.current = false;
     syncNavHistoryUi();
   }
 
@@ -4995,76 +5001,63 @@ function AppInner() {
     return pending;
   }
 
-  function goWorkspaceBack() {
-    return enqueueWorkspaceHistoryReplay(async () => {
-      cancelWorkspaceViewportRestoreRef.current?.();
-      cancelWorkspaceViewportRestoreRef.current = null;
-      navHistoryRef.current.saveCurrentViewport(
-        captureWorkspaceNavViewport(workspaceCanvasRef.current),
-      );
-      const location = navHistoryRef.current.back();
-      if (!location) return;
-      const targetHistory = navHistoryRef.current;
-      pendingWorkspaceHistoryReplayRef.current = targetHistory;
-      syncNavHistoryUi();
-      const baseRequest = beginWorkspaceNavigationRequest("replay");
-      const request: WorkspaceNavigationRequest = {
-        ...baseRequest,
-        deferReveal: true,
-      };
-      try {
-        await applyWorkspaceLocation(location, request);
-        if (
-          request.isCurrent() &&
-          navHistoryRef.current === targetHistory
-        ) finishWorkspaceNavigation(request, targetHistory.currentViewport);
-      } catch (caught) {
-        if (request.isCurrent()) {
-          setWorkspaceNavigationPending(false);
-          setError(toMessage(caught, t("toast.readAssetsFailed"), locale));
-        }
-      } finally {
-        if (pendingWorkspaceHistoryReplayRef.current === targetHistory) {
-          pendingWorkspaceHistoryReplayRef.current = null;
+  async function replayWorkspaceHistoryStep(direction: "back" | "forward") {
+    cancelWorkspaceViewportRestoreRef.current?.();
+    cancelWorkspaceViewportRestoreRef.current = null;
+    navHistoryRef.current.saveCurrentViewport(
+      captureWorkspaceNavViewport(workspaceCanvasRef.current),
+    );
+    // Sync the outgoing tab's cached location to the pre-replay cursor before
+    // moving it, so a later switch/replay back to that tab lands where it was.
+    saveWorkspaceTabContext();
+    const location =
+      direction === "back"
+        ? navHistoryRef.current.back()
+        : navHistoryRef.current.forward();
+    if (!location) return;
+    workspaceHistoryReplayActiveRef.current = true;
+    syncNavHistoryUi();
+    const targetTabId = navHistoryRef.current.currentTabId;
+    const targetViewport = navHistoryRef.current.currentViewport;
+    let replayRequest: WorkspaceNavigationRequest | null = null;
+    try {
+      if (targetTabId !== workspaceTabsState.activeTabId) {
+        // The step belongs to another tab: activate it and restore the entry's
+        // recorded location. Replaying must not record a new history step.
+        await selectWorkspaceTab(targetTabId, {
+          location,
+          viewport: targetViewport,
+        });
+      } else {
+        replayRequest = {
+          ...beginWorkspaceNavigationRequest("replay"),
+          deferReveal: true,
+        };
+        await applyWorkspaceLocation(location, replayRequest);
+        if (replayRequest.isCurrent()) {
+          finishWorkspaceNavigation(replayRequest, targetViewport);
         }
       }
-    });
+    } catch (caught) {
+      if (replayRequest === null || replayRequest.isCurrent()) {
+        setWorkspaceNavigationPending(false);
+        setError(toMessage(caught, t("toast.readAssetsFailed"), locale));
+      }
+    } finally {
+      workspaceHistoryReplayActiveRef.current = false;
+    }
+  }
+
+  function goWorkspaceBack() {
+    return enqueueWorkspaceHistoryReplay(() =>
+      replayWorkspaceHistoryStep("back"),
+    );
   }
 
   function goWorkspaceForward() {
-    return enqueueWorkspaceHistoryReplay(async () => {
-      cancelWorkspaceViewportRestoreRef.current?.();
-      cancelWorkspaceViewportRestoreRef.current = null;
-      navHistoryRef.current.saveCurrentViewport(
-        captureWorkspaceNavViewport(workspaceCanvasRef.current),
-      );
-      const location = navHistoryRef.current.forward();
-      if (!location) return;
-      const targetHistory = navHistoryRef.current;
-      pendingWorkspaceHistoryReplayRef.current = targetHistory;
-      syncNavHistoryUi();
-      const baseRequest = beginWorkspaceNavigationRequest("replay");
-      const request: WorkspaceNavigationRequest = {
-        ...baseRequest,
-        deferReveal: true,
-      };
-      try {
-        await applyWorkspaceLocation(location, request);
-        if (
-          request.isCurrent() &&
-          navHistoryRef.current === targetHistory
-        ) finishWorkspaceNavigation(request, targetHistory.currentViewport);
-      } catch (caught) {
-        if (request.isCurrent()) {
-          setWorkspaceNavigationPending(false);
-          setError(toMessage(caught, t("toast.readAssetsFailed"), locale));
-        }
-      } finally {
-        if (pendingWorkspaceHistoryReplayRef.current === targetHistory) {
-          pendingWorkspaceHistoryReplayRef.current = null;
-        }
-      }
-    });
+    return enqueueWorkspaceHistoryReplay(() =>
+      replayWorkspaceHistoryStep("forward"),
+    );
   }
 
   async function refreshRecentLibraries(currentLibraryPath?: string | null) {

@@ -9,6 +9,8 @@ import {
   getWorkspaceTab,
   moveWorkspaceTab,
   selectWorkspaceTab,
+  setWorkspaceTabLocation,
+  setWorkspaceTabViewport,
   updateWorkspaceTabContext,
   updateWorkspaceTabBrowseState,
   workspaceTabBrowseStateHasDiscoveryInput,
@@ -45,22 +47,25 @@ describe("workspace tabs", () => {
     let state = createWorkspaceTabs(ids("one"));
     expect(state.tabs).toHaveLength(1);
     expect(state.activeTabId).toBe("one");
-    expect(state.tabs[0]?.history.current).toEqual({ kind: "all" });
+    expect(state.tabs[0]?.location).toEqual({ kind: "all" });
 
-    state.tabs[0]!.history.push({ kind: "folder", folderId: "folder-a" });
+    state = setWorkspaceTabLocation(state, "one", {
+      kind: "folder",
+      folderId: "folder-a",
+    });
     state = addWorkspaceTab(state, ids("two"));
     expect(state.tabs).toHaveLength(2);
     expect(state.activeTabId).toBe("two");
-    expect(getWorkspaceTab(state, "two")?.history.current).toEqual({ kind: "all" });
-    expect(getWorkspaceTab(state, "one")?.history.current).toEqual({
+    expect(getWorkspaceTab(state, "two")?.location).toEqual({ kind: "all" });
+    expect(getWorkspaceTab(state, "one")?.location).toEqual({
       kind: "folder",
       folderId: "folder-a",
     });
   });
 
-  it("keeps navigation history and browse context isolated per tab", () => {
+  it("keeps each tab's location, viewport and browse context isolated", () => {
     let state = createWorkspaceTabs(ids("one"));
-    state.tabs[0]!.history.saveCurrentViewport({
+    state = setWorkspaceTabViewport(state, "one", {
       scrollTop: 420,
       scrollProgress: 0.42,
       scrollExtent: 1_000,
@@ -103,17 +108,19 @@ describe("workspace tabs", () => {
       showIgnoredItems: false,
     });
     state = addWorkspaceTab(state, ids("two"));
-    const second = getWorkspaceTab(state, "two")!;
-    second.history.push({ kind: "collection", collectionId: "collection-a", recursive: true });
-    second.history.push({ kind: "trash", tombstoneId: null });
+    state = setWorkspaceTabLocation(state, "two", {
+      kind: "collection",
+      collectionId: "collection-a",
+      recursive: true,
+    });
 
-    expect(getWorkspaceTab(state, "one")?.history.current).toEqual({ kind: "all" });
+    expect(getWorkspaceTab(state, "one")?.location).toEqual({ kind: "all" });
     expect(getWorkspaceTab(state, "one")).toMatchObject({
       selectedAssetIds: ["asset-a", "asset-b"],
       selectedAssetId: "asset-a",
       cachedTitle: "Reference board.png",
     });
-    expect(getWorkspaceTab(state, "one")?.history.currentViewport).toMatchObject({
+    expect(getWorkspaceTab(state, "one")?.viewport).toMatchObject({
       scrollTop: 420,
       scrollProgress: 0.42,
     });
@@ -122,9 +129,12 @@ describe("workspace tabs", () => {
       sortField: "modified_at",
       folderRecursive: true,
     });
-    expect(second.history.canBack).toBe(true);
-    expect(second.history.back()).toEqual({ kind: "collection", collectionId: "collection-a", recursive: true });
-    expect(getWorkspaceTab(state, "one")?.history.canBack).toBe(false);
+    // The second tab carries its own location, independent of tab one.
+    expect(getWorkspaceTab(state, "two")?.location).toEqual({
+      kind: "collection",
+      collectionId: "collection-a",
+      recursive: true,
+    });
   });
 
   it("selects existing tabs and ignores unknown ids", () => {
@@ -151,8 +161,11 @@ describe("workspace tabs", () => {
 
   it("closing the only tab keeps one tab and resets it to all assets", () => {
     let state = createWorkspaceTabs(ids("one"));
-    state.tabs[0]!.history.push({ kind: "folder", folderId: "folder-a" });
-    state.tabs[0]!.history.saveCurrentViewport({
+    state = setWorkspaceTabLocation(state, "one", {
+      kind: "folder",
+      folderId: "folder-a",
+    });
+    state = setWorkspaceTabViewport(state, "one", {
       scrollTop: 800,
       scrollProgress: 0.8,
       scrollExtent: 1_000,
@@ -165,13 +178,12 @@ describe("workspace tabs", () => {
     const result = closeWorkspaceTab(state, "one");
     expect(result.state.tabs).toHaveLength(1);
     expect(result.state.activeTabId).toBe("one");
-    expect(result.state.tabs[0]?.history.current).toEqual({ kind: "all" });
-    expect(result.state.tabs[0]?.history.canBack).toBe(false);
+    expect(result.state.tabs[0]?.location).toEqual({ kind: "all" });
     expect(result.state.tabs[0]).toMatchObject({
       selectedAssetIds: [],
       selectedAssetId: null,
     });
-    expect(result.state.tabs[0]?.history.currentViewport.scrollTop).toBe(0);
+    expect(result.state.tabs[0]?.viewport.scrollTop).toBe(0);
     expect(result.shouldNavigateToAll).toBe(true);
   });
 
@@ -188,17 +200,20 @@ describe("workspace tabs", () => {
     expect(result.shouldNavigateToAll).toBe(true);
   });
 
-  it("reorders tabs without touching history or the active tab", () => {
+  it("reorders tabs without touching location or the active tab", () => {
     let state = createWorkspaceTabs(ids("one"));
     state = addWorkspaceTab(state, ids("two"));
     state = addWorkspaceTab(state, ids("three"));
     state = selectWorkspaceTab(state, "two");
-    getWorkspaceTab(state, "one")!.history.push({ kind: "folder", folderId: "folder-a" });
+    state = setWorkspaceTabLocation(state, "one", {
+      kind: "folder",
+      folderId: "folder-a",
+    });
 
     const moved = moveWorkspaceTab(state, "three", 0);
     expect(moved.tabs.map((tab) => tab.id)).toEqual(["three", "one", "two"]);
     expect(moved.activeTabId).toBe("two");
-    expect(getWorkspaceTab(moved, "one")?.history.current).toEqual({
+    expect(getWorkspaceTab(moved, "one")?.location).toEqual({
       kind: "folder",
       folderId: "folder-a",
     });

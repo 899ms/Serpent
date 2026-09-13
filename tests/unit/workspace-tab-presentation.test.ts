@@ -11,7 +11,7 @@ describe("workspace tab presentation", () => {
   it("keeps a cached viewer title after another tab replaces the shared asset list", () => {
     const state = createWorkspaceTabs(() => "viewer-tab");
     const tab = state.tabs[0]!;
-    tab.history.push({ kind: "preview", assetId: "asset-1" });
+    tab.location = { kind: "preview", assetId: "asset-1" };
     tab.cachedTitle = "Reference board.png";
 
     expect(presentWorkspaceTab(tab, {
@@ -33,7 +33,7 @@ describe("workspace tab presentation", () => {
   it("exposes folder and collection identities only for their contextual menus", () => {
     const state = createWorkspaceTabs(() => "folder-tab");
     const tab = state.tabs[0]!;
-    tab.history.push({ kind: "folder", folderId: "folder-1" });
+    tab.location = { kind: "folder", folderId: "folder-1" };
     const common = {
       folders: [{
         folderId: "folder-1",
@@ -63,7 +63,7 @@ describe("workspace tab presentation", () => {
   it("shows a managed folder's in-library path so same-named folders differ", () => {
     const state = createWorkspaceTabs(() => "folder-tab");
     const tab = state.tabs[0]!;
-    tab.history.push({ kind: "folder", folderId: "folder-1" });
+    tab.location = { kind: "folder", folderId: "folder-1" };
 
     expect(presentWorkspaceTab(tab, {
       folders: [{
@@ -90,7 +90,7 @@ describe("workspace tab presentation", () => {
   it("shows a linked folder's path on disk, not its label", () => {
     const state = createWorkspaceTabs(() => "linked-tab");
     const tab = state.tabs[0]!;
-    tab.history.push({ kind: "folder", folderId: "linked-1" });
+    tab.location = { kind: "folder", folderId: "linked-1" };
 
     expect(presentWorkspaceTab(tab, {
       folders: [],

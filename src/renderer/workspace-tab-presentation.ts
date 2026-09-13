@@ -70,7 +70,7 @@ export function presentWorkspaceTab(
   tab: WorkspaceTabSession,
   input: WorkspaceTabPresentationInput,
 ): WorkspaceTabPresentation {
-  const location = tab.history.current;
+  const location = tab.location;
   const presented = presentLocation(location, tab, input);
   return {
     ...presented,
