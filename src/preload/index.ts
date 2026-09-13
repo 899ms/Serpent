@@ -257,11 +257,23 @@ const library: SerpentLibraryApi = Object.freeze({
     return { ok: true as const, value: result.library };
   },
 
-  async open(): Promise<LibraryApiResult<RendererLibrarySummary>> {
-    const result = await request({ type: 'library.open.request' });
+  async open(input?: { libraryPath?: string }): Promise<LibraryApiResult<RendererLibrarySummary>> {
+    const result = await request({
+      type: 'library.open.request',
+      ...(input?.libraryPath ? { libraryPath: input.libraryPath } : {}),
+    });
     if (!result.ok) return failure(result);
     if (result.type !== 'library.opened') throw new Error('Unexpected open-library response.');
     return { ok: true as const, value: result.library };
+  },
+
+  async chooseLibraryPath(): Promise<LibraryApiResult<string | null>> {
+    const result = await request({ type: 'library.choose-path.request' });
+    if (!result.ok) return failure(result);
+    if (result.type !== 'library.choose-path') {
+      throw new Error('Unexpected choose-library-path response.');
+    }
+    return { ok: true as const, value: result.path };
   },
 
   async cancelOpen(): Promise<LibraryApiResult<void>> {

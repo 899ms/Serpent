@@ -157,6 +157,15 @@ export const rendererRequestSchema = z.discriminatedUnion('type', [
   }),
   z.strictObject({
     type: z.literal('library.open.request'),
+    /**
+     * When provided, the location dialog is skipped — the caller already ran
+     * `library.choose-path.request`. This keeps the open loading UI (and its
+     * timer) from covering the native picker (Serpent-565785 feedback).
+     */
+    libraryPath: selectedPathSchema.optional(),
+  }),
+  z.strictObject({
+    type: z.literal('library.choose-path.request'),
   }),
   z.strictObject({
     type: z.literal('library.open-cancel.request'),

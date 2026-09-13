@@ -1990,6 +1990,21 @@ function AppInner() {
     [assetCardSize, canvasWidthPx],
   );
   const workspaceCanvasRef = useRef<HTMLDivElement>(null);
+  // A viewport restore waiting to be applied in the same commit the new
+  // content paints in. Set when a navigation targets a saved offset; the
+  // layout effect below positions the canvas before the browser paints, which
+  // removes the "first frame at the top, second frame jumps" flicker when
+  // switching folders or tabs (UX principle 0005: reduce flashing).
+  const pendingViewportRestoreRef = useRef<WorkspaceNavViewport | null>(null);
+  useLayoutEffect(() => {
+    const viewport = pendingViewportRestoreRef.current;
+    if (!viewport) return;
+    const canvas = workspaceCanvasRef.current;
+    if (!canvas) return;
+    const extent = Math.max(0, canvas.scrollHeight - canvas.clientHeight);
+    if (extent <= 0) return;
+    canvas.scrollTop = resolveWorkspaceScrollTop(viewport, extent);
+  });
   const reportedVisibleWindowKeyRef = useRef("");
   // Serpent-wgl2: the marquee box div is always mounted and moved directly
   // through this ref — never through React state (per-frame state re-renders
@@ -4832,9 +4847,23 @@ function AppInner() {
     },
   ): void {
     if (!request.isCurrent()) return;
+    const canvas = workspaceCanvasRef.current;
+    if (canvas) {
+      // Content may already be committed (cached snapshot / history entry):
+      // flush anything pending and place the offset now, still pre-paint.
+      flushSync(() => {});
+      const extent = Math.max(0, canvas.scrollHeight - canvas.clientHeight);
+      canvas.scrollTop = resolveWorkspaceScrollTop(viewport, extent);
+    }
     restoreCurrentWorkspaceHistoryViewport(viewport, request.isCurrent, () => {
+      pendingViewportRestoreRef.current = null;
       if (request.isCurrent()) setWorkspaceNavigationPending(false);
     });
+    // Arm the same-commit restore *after* the previous restore was cancelled
+    // (its onComplete clears the ref): the layout effect above positions the
+    // canvas before the browser paints the commit in which the new content
+    // lands, so the restored folder never shows a top-of-list first frame.
+    pendingViewportRestoreRef.current = viewport;
   }
 
   async function restoreAllAssetsWorkspaceTab(isCurrent: () => boolean) {
@@ -5080,15 +5109,27 @@ function AppInner() {
 
   async function runLibraryOperation(kind: "create" | "open") {
     if (!api) return;
+    if (kind === "open") {
+      // Pick the location first (dialog only) so the loading overlay and its
+      // timer start with the actual load, never while the picker is open
+      // (Serpent-565785 feedback).
+      const chosen = await api.chooseLibraryPath();
+      if (!chosen.ok || chosen.value === null) return;
+      await runLibraryOpenPipeline(
+        "opening",
+        () => api.open({ libraryPath: chosen.value! }),
+        t("toast.libraryOpFailed"),
+        undefined,
+        null,
+      );
+      return;
+    }
     await runLibraryOpenPipeline(
-      kind === "create" ? "creating" : "opening",
-      () =>
-        kind === "create"
-          ? api.create({ displayName: dialogValue.trim() })
-          : api.open(),
+      "creating",
+      () => api.create({ displayName: dialogValue.trim() }),
       t("toast.libraryOpFailed"),
       undefined,
-      kind === "create" ? dialogValue.trim() || null : null,
+      dialogValue.trim() || null,
     );
   }
 

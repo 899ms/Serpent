@@ -2436,7 +2436,8 @@ async function commandFor(
         : undefined;
     }
     case "library.open.request": {
-      const selectedLibraryPath = await selectDirectory("openLibrary");
+      const selectedLibraryPath =
+        request.libraryPath ?? (await selectDirectory("openLibrary"));
       return selectedLibraryPath
         ? { type: "library.open", selectedLibraryPath }
         : undefined;
@@ -3775,6 +3776,9 @@ async function commandFor(
     case "library.open-cancel.request":
       // Main-only request; handled before Worker dispatch.
       return undefined;
+    case "library.choose-path.request":
+      // Main-only request (native picker); handled before Worker dispatch.
+      return undefined;
     default:
       return assertNever(request);
   }
@@ -3862,6 +3866,16 @@ async function handleLibraryRequest(input: unknown): Promise<RendererResult> {
       return {
         ok: true,
         type: "library.open-cancelled",
+      } satisfies RendererResult;
+    }
+    if (request.type === "library.choose-path.request") {
+      // Dialog only. The renderer starts its loading UI/timer only after this
+      // resolves, so the progress overlay never covers the native picker.
+      const chosenPath = await selectDirectory("openLibrary");
+      return {
+        ok: true,
+        type: "library.choose-path",
+        path: chosenPath ?? null,
       } satisfies RendererResult;
     }
     openCancellation = isLibraryOpenRequest(request)

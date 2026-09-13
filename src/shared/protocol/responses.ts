@@ -2123,6 +2123,12 @@ const rendererSuccessResultSchema = z.discriminatedUnion('type', [
   }),
   z.strictObject({
     ok: z.literal(true),
+    type: z.literal('library.choose-path'),
+    /** null when the user cancelled the native picker. */
+    path: nonBlankString.nullable(),
+  }),
+  z.strictObject({
+    ok: z.literal(true),
     type: z.literal('library.eagle-inspected'),
     displayName: nonBlankString,
   }),

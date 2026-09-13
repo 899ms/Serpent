@@ -197,7 +197,13 @@ export interface PluginJobStatus {
 
 export interface SerpentLibraryApi {
   create(input: { displayName: string }): Promise<LibraryApiResult<RendererLibrarySummary>>;
-  open(): Promise<LibraryApiResult<RendererLibrarySummary>>;
+  open(input?: { libraryPath?: string }): Promise<LibraryApiResult<RendererLibrarySummary>>;
+  /**
+   * Shows the native "choose library location" picker and returns the chosen
+   * path (null when cancelled) without opening anything, so callers can start
+   * their loading UI only after the dialog closes.
+   */
+  chooseLibraryPath(): Promise<LibraryApiResult<string | null>>;
   /** Request cancellation of the active library open/create transition. */
   cancelOpen(): Promise<LibraryApiResult<void>>;
   /** Reveal a Main-owned recovery report without exposing its filesystem path. */

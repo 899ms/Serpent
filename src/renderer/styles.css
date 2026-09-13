@@ -8992,7 +8992,11 @@ select.ai-config-input.ai-config-languages {
   position: absolute;
   inset: 0;
   z-index: var(--ui-layer-popover);
-  background: color-mix(in srgb, var(--canvas) 18%, transparent);
+  /* Intentionally transparent: it only captures pointer events (so the user
+     cannot act on content that is about to be replaced) and shows the progress
+     cursor. A tinted layer read as a brightness flash on every folder switch
+     (Serpent-565785 feedback); the switch must not change screen brightness. */
+  background: transparent;
   cursor: progress;
 }
 

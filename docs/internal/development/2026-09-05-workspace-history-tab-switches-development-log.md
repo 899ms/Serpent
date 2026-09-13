@@ -34,3 +34,23 @@
 ## 未验证 / 保留
 - 真实桌面人类视觉验收（切页前进后退手感、亮暗主题）。
 - packaged / Windows / Computer Use 未执行。
+
+## 用户反馈二（提交后）：切文件夹闪烁 + 开库进度条计时
+
+**1. 切换文件夹闪烁/整体亮度变化**
+- 排查：写一次性探针 E2E 统计切一次文件夹时的 DOM 行为，并在父提交（改动前 242a77f8）与当前 HEAD 各跑一次，结果**完全一致**（导航遮罩挂载/卸载各 1 次、`aria-busy` 只 true→false 一次、网格 1 次变更）→ 本次导航重构未改变切文件夹的渲染/繁忙行为。
+- 处置：可见的「亮度变化」来自导航遮罩 `.workspace-navigation-hold` 的半透明 `--canvas` 18% 覆盖层。**最终改为完全透明**（只保留拦截点击 + progress 光标）——先试过「延迟 200ms 淡入」，但加载超过 200ms 时仍会亮一下（用户实测仍有亮暗闪烁），故彻底去掉视觉淡色：切换过程不得改变屏幕亮度。探针（逐帧统计 DOM/繁忙 + sharp 逐帧量画布平均亮度）显示画布亮度恒定，闪烁源自该遮罩。
+
+**2. 打开资源库时进度条在「选择位置」对话框阶段就开始**
+- 根因：`library.open.request` 把「原生选路径对话框」与「打开」放在一次调用里，渲染层在调用前就 `setLibraryLoading` → 对话框期间进度条/计时已在跑。
+- 处置：**拆分**——新增 `library.choose-path.request`（只弹对话框，返回路径或 null，main 直接响应不走 Worker）；`library.open.request` 增加可选 `libraryPath`（提供时跳过对话框）；渲染层改为**先选路径、选完再进入 loading 流程**（App `runLibraryOperation("open")`），进度条/计时从实际加载开始。创建/最近库/eagle/billfish 流程未改。
+- 验证：`tsc`/`eslint` 通过；全量 unit 仅既有 `import-source-failure` 失败；`tests/e2e/library-lifecycle.test.ts` **3/3 通过**。
+
+## 用户反馈三：切换标签页/文件夹时首帧在顶部、次帧才跳到位（闪烁）
+
+- 排查：写一次性探针 E2E，跨一次「后退恢复」按动画帧采样 `scrollTop/scrollHeight`，判定「已有内容（extent>0）但 scrollTop=0」的帧即为闪烁帧。修复前实测：**1 个顶部帧**（`[0,7208] → [4325,7208]`）。
+- 根因：视口恢复 `restoreWorkspaceNavViewport` 在 `requestAnimationFrame` 里逐帧设置，而**内容提交的那一帧已经以 `scrollTop=0` 画出来了**；此前该帧被导航遮罩盖住，前一轮把遮罩改为延迟 200ms（快速切换不显示）后暴露出来。
+- 修复：
+  1. `finishWorkspaceNavigation` 里 `flushSync` 掉待提交的更新并**立即**按目标视口设置 `scrollTop`（同一任务内、绘制前）；
+  2. 新增 **`useLayoutEffect` + `pendingViewportRestoreRef`**：任何一次 React 提交（含稍后才落地的异步内容提交）都会在**浏览器绘制之前**把 `scrollTop` 放到目标位置（extent>0 时）；导航完成后清除 pending。rAF 循环仅用于后续布局变化的精修。
+- 验证：探针实测**两条路径 topFrames 均为 0**——后退首帧 `[4325,7208]`、切页首帧 `[2163,7208]`，都不再先画顶部。已把探针沉淀为常驻回归 E2E `tests/e2e/workspace-scroll-restore.test.ts`（并加入 `test:e2e` 清单）：断言后退恢复与切页恢复的采样中 `topFrames === 0` 且首帧 `scrollTop > 0`。探针文件已删除。
