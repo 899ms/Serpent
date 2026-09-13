@@ -150,6 +150,7 @@ import {
 import { resolveSearchFolderResults } from "./search-folder-results";
 import { useT, useLocale, translateForLocale, type AppLocale } from "./i18n";
 import type { AiApiFormat } from "../shared/ai-endpoints";
+import { DEFAULT_AI_API_FORMAT, DEFAULT_AI_MODELS } from "../shared/ai-endpoints";
 import type { SerpentMcpSettingsApi } from "../shared/mcp";
 import type { HistoryStatus } from "../shared/protocol/responses";
 import { isEditableTextTarget } from "../shared/edit-context-menu";
@@ -1770,8 +1771,8 @@ function AppInner() {
   }
 
   // AI analysis state
-  const [aiApiFormat, setAiApiFormat] = useState<AiApiFormat>("dashscope_native");
-  const [aiModel, setAiModel] = useState("qwen3-vl-plus");
+  const [aiApiFormat, setAiApiFormat] = useState<AiApiFormat>(DEFAULT_AI_API_FORMAT);
+  const [aiModel, setAiModel] = useState(DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT]);
   const [aiBaseUrl, setAiBaseUrl] = useState("");
   const [aiApiKey, setAiApiKey] = useState("");
   const [aiHasKey, setAiHasKey] = useState(false);
@@ -1800,8 +1801,8 @@ function AppInner() {
   /** Fingerprint of credentials last proven by a successful probe. */
   const aiVerifiedFingerprintRef = useRef<string | null>(null);
   const aiConfigPersistDraftRef = useRef({
-    apiFormat: "dashscope_native" as AiApiFormat,
-    model: "qwen3-vl-plus",
+    apiFormat: DEFAULT_AI_API_FORMAT as AiApiFormat,
+    model: DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT],
     baseUrl: "",
     apiKey: "",
     hasKey: false,
@@ -10591,9 +10592,9 @@ function AppInner() {
     const result = await api.getAiConfig();
     if (!result.ok) return;
     setAiApiFormat(
-      (result.value.apiFormat as AiApiFormat) ?? "dashscope_native",
+      (result.value.apiFormat as AiApiFormat) ?? DEFAULT_AI_API_FORMAT,
     );
-    setAiModel(result.value.model ?? "qwen3-vl-plus");
+    setAiModel(result.value.model ?? DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT]);
     setAiBaseUrl(result.value.baseUrl ?? "");
     setAiHasKey(result.value.hasKey);
     setAiDescriptionEnabled(result.value.enabledFields.description);

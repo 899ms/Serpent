@@ -16,6 +16,7 @@ import {
   AI_API_FORMAT_LABELS,
   AI_LANGUAGE_OPTIONS,
   DEFAULT_AI_BASE_URLS,
+  DEFAULT_AI_MODELS,
   type AiApiFormat,
   type AiLanguageId,
 } from "../shared/ai-endpoints";
@@ -458,15 +459,7 @@ export function AiConfigDialog({
                   onModelChange(e.target.value);
                   setTestInline(null);
                 }}
-                placeholder={
-                  apiFormat === "dashscope_native"
-                    ? "qwen3-vl-plus"
-                    : apiFormat.startsWith("openai")
-                    ? "gpt-4o-mini"
-                    : apiFormat === "gemini_native"
-                      ? "gemini-2.0-flash"
-                      : "claude-sonnet-4-20250514"
-                }
+                placeholder={DEFAULT_AI_MODELS[apiFormat]}
                 value={model}
               />
               <div

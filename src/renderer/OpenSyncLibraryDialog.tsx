@@ -102,14 +102,14 @@ export function OpenSyncLibraryDialog({
   return (
     <div
       className="dialog-backdrop"
-      onClick={(event) => {
-        if (event.target === event.currentTarget && busy === null) onClose();
-      }}
       role="presentation"
     >
       <DialogShell
         className="create-dialog open-sync-library-dialog"
         dialogId="open-sync-library-dialog"
+        onRequestClose={() => {
+          if (busy === null) onClose();
+        }}
         headerActions={(
           <button
             className="dialog-close"

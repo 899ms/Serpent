@@ -28,9 +28,6 @@ export function PluginUninstallDialog({
   return (
     <div
       className="dialog-backdrop"
-      onClick={(event) => {
-        if (event.target === event.currentTarget && !busy) onCancel();
-      }}
       role="presentation"
     >
       <DialogShell

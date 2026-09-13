@@ -506,9 +506,6 @@ export function TagManagementWorkspace({
       {pendingDeleteIds && (
         <div
           className="dialog-backdrop"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setPendingDeleteIds(null);
-          }}
           role="presentation"
         >
           <DialogShell
@@ -553,12 +550,6 @@ export function TagManagementWorkspace({
       {pendingMergeIds && (
         <div
           className="dialog-backdrop"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) {
-              setPendingMergeIds(null);
-              setMergeName("");
-            }
-          }}
           role="presentation"
         >
           <DialogShell

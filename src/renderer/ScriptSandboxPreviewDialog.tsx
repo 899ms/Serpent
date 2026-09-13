@@ -334,9 +334,6 @@ export function ScriptSandboxPreviewDialog({
   return (
     <div
       className="dialog-backdrop"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) close();
-      }}
       role="presentation"
     >
       <DialogShell

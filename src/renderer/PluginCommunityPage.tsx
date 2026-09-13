@@ -263,14 +263,14 @@ export function PluginCommunityPage({
   const installDialog = installTarget === undefined ? null : (
         <div
           className="dialog-backdrop"
-          onClick={(event) => {
-            if (event.target === event.currentTarget && !progressActive) closeInstall();
-          }}
           role="presentation"
         >
           <DialogShell
             className="create-dialog plugin-install-dialog"
             dialogId="plugin-community-install-dialog"
+            onRequestClose={() => {
+              if (!progressActive) closeInstall();
+            }}
             footer={progressActive ? (
               <button
                 className="secondary-button plugin-install-stop-button"

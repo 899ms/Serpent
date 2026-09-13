@@ -333,7 +333,9 @@ import {
   type AiReliabilitySettings,
 } from "../shared/ai-reliability";
 import {
+  DEFAULT_AI_API_FORMAT,
   DEFAULT_AI_LANGUAGES,
+  DEFAULT_AI_MODELS,
   listAiModels,
   migrateLegacyProviderToApiFormat,
   normalizeAiLanguages,
@@ -1027,8 +1029,8 @@ interface AiConfig {
 }
 
 const DEFAULT_AI_CONFIG: AiConfig = {
-  apiFormat: "dashscope_native",
-  model: "qwen3-vl-plus",
+  apiFormat: DEFAULT_AI_API_FORMAT,
+  model: DEFAULT_AI_MODELS[DEFAULT_AI_API_FORMAT],
   baseUrl: "",
   descriptionEnabled: true,
   tagEnabled: true,

@@ -140,9 +140,6 @@ export function AppSettingsDialog({
   return (
     <div
       className="dialog-backdrop"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) handleClose();
-      }}
       role="presentation"
     >
       <DialogShell

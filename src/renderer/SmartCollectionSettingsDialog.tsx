@@ -56,9 +56,6 @@ export function SmartCollectionSettingsDialog({
   return (
     <div
       className="dialog-backdrop"
-      onClick={(event) => {
-        if (event.target === event.currentTarget && !busy) onClose();
-      }}
       role="presentation"
     >
       <DialogShell

@@ -58,14 +58,12 @@ export function AppLogDialog({
   return (
     <div
       className="dialog-backdrop"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
       role="presentation"
     >
       <DialogShell
         className="create-dialog app-log-dialog"
         dialogId="app-log-dialog"
+        onRequestClose={onClose}
         description={<span className="app-log-subtitle">{t("dialog.appLog.subtitle")}</span>}
         headerActions={
           <button

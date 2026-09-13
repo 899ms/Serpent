@@ -34,6 +34,20 @@
 6. **平台差异**：Windows 无边框窗由 renderer 自绘 caption（受本规范约束）；
    macOS `hiddenInset` 使用系统原生红绿灯（绘制在 web content 之上，天然不受
    蒙层影响，无需代码）；涉及平台分支时两个平台都必须验证。
+7. **点击蒙层不得关闭模态面板**（2026-09-13 用户要求）：`dialog-backdrop` 上
+   **禁止**挂「点外部即关闭」的处理器（`onClick`/`onMouseDown` +
+   `event.target === event.currentTarget`）。用户在瞄准输入框时很容易点到面板外，
+   而设置/导入/确认面板被这样关掉会丢掉未提交的内容。关闭路径只有两条：面板自己的
+   关闭控件，以及 `DialogShell` 的 Escape（`onRequestClose`，仅最顶层生效）。
+   已有 15 处历史处理器按此移除（`AboutDialog`、`AppLogDialog`、`AppSettingsDialog`、
+   `IgnoredPathsDialog`、`LibraryRecoveryDialog`、`LibrarySettingsDialog`、
+   `OpenSourceLicensesDialog`、`OpenSyncLibraryDialog`、`PluginCommunityPage`、
+   `PluginSettingsPage`、`PluginUninstallDialog`、`ScriptSandboxPreviewDialog`、
+   `SmartCollectionSettingsDialog`，以及 `TagManagementWorkspace` 的删除确认）。
+   列表/导航**空白区点击取消选择**（`tag-management-grid`、侧栏文件夹列表）不是模态，
+   不受本约束，保留。
+   防回归：`tests/unit/modal-backdrop-dismiss.test.ts` 扫描 renderer 源码断言没有任何
+   `dialog-backdrop` 带该处理器。
 
 ## 实现参考
 
@@ -48,3 +62,4 @@
 - [ ] 使用 `dialog-backdrop`（或同一切口），未自造蒙层
 - [ ] 纳入 `dialogFocusTrapActive`（打开时 `serpent-modal-open` 生效）
 - [ ] 窗口控制按钮仍可点击（Windows 自绘按钮；macOS 红绿灯）
+- [ ] 蒙层上没有「点外部即关闭」处理器；关闭控制 + Escape（`onRequestClose`）齐全

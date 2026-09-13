@@ -304,3 +304,42 @@ refresh.managed-assets.stage  stage=precompute-fingerprints  dur≈35–38 ms   
 
 验证：typecheck / eslint 干净；`i18n-translate`、`asset-commands`（52 例）、
 `inspector-preview` 共 60 例通过。
+
+## 第五轮：AI 默认格式 + 模态面板不再点外部关闭（用户反馈）
+
+1. **AI 分析默认 API 格式改为 Anthropic Messages**（用户 2026-09-13）。原来散落三处
+   默认值（`App.tsx` 状态初值 / 持久化草稿 / 读配置兜底、`main` 的 `DEFAULT_AI_CONFIG`、
+   以及 `AiConfigDialog` 的模型占位映射），只改一处就会得到「Anthropic 协议 + DashScope
+   模型 id」这种自相矛盾的默认值。改为在 `src/shared/ai-endpoints.ts` 收成单一来源：
+   - `DEFAULT_AI_API_FORMAT = 'anthropic'`
+   - `DEFAULT_AI_MODELS: Record<AiApiFormat, string>`（anthropic → `claude-sonnet-4-20250514`）
+   上述四处全部改为读这两个常量。`tests/unit/ai-endpoints.test.ts` 新增 2 例：默认格式为
+   anthropic、且每个格式都有非空默认模型与 base URL（守住配对关系）。
+
+2. **所有模糊背景模态面板不再「点窗口外退出」**（用户 2026-09-13：设置面板点到外面
+   就退出）。清掉 15 处 `dialog-backdrop` 上的点外部关闭处理器
+   （`onClick`/`onMouseDown` + `event.target === event.currentTarget`，含
+   `&& !busy` / `&& !progressActive` 等带守卫的变体），覆盖：AboutDialog、AppLogDialog、
+   AppSettingsDialog、IgnoredPathsDialog、LibraryRecoveryDialog、LibrarySettingsDialog、
+   OpenSourceLicensesDialog、OpenSyncLibraryDialog、PluginCommunityPage、
+   PluginSettingsPage、PluginUninstallDialog、ScriptSandboxPreviewDialog、
+   SmartCollectionSettingsDialog、TagManagementWorkspace（删除确认）。
+   保留两条关闭路径：面板自己的关闭控件，以及 `DialogShell` 的 Escape
+   （`onRequestClose`，仅最顶层生效）——为此给 5 个缺 Escape 的面板补上
+   `onRequestClose`（沿用各自原有的 `busy`/`progressActive` 守卫）。
+   **不属于模态、予以保留**：`tag-management-grid` 与侧栏文件夹列表的「空白区点击取消
+   选择」。
+
+   规范与防回归：
+   - `docs/internal/ui/0007-modal-caption-interactivity.md` 增加第 7 条「点击蒙层不得关闭
+     模态面板」并纳入审查固定项；
+   - 新增 `tests/unit/modal-backdrop-dismiss.test.ts`：扫描 renderer 源码断言没有任何
+     `dialog-backdrop` 带该处理器；同时用「已知坏样本 + 列表空白区样本」自证检测器有效
+     （避免正则失效后静默全绿）；
+   - `tests/e2e/shell-navigation.test.ts` 增加真机断言：打开设置后点击面板外的蒙层，
+     面板仍在；Escape 仍能关闭。
+
+验证：typecheck / eslint 干净；`ai-endpoints`、`modal-backdrop-dismiss`、`ui-patterns`、
+`i18n-translate` 共 28 例通过；真机 `shell-navigation` 中新增的蒙层点击断言通过
+（该 E2E 另有一条**既有**失败：About「检查更新」状态轮询超时，已在干净 HEAD 上用
+`git stash` 复跑确认同样失败，与本次改动无关）。

@@ -134,9 +134,6 @@ export function AboutDialog({
   return (
     <div
       className="dialog-backdrop"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
       role="presentation"
     >
       <div

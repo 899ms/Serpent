@@ -892,14 +892,14 @@ export function PluginSettingsPage({
       {installOpen ? (
         <div
           className="dialog-backdrop plugin-install-dialog-backdrop"
-          onClick={(event) => {
-            if (event.target === event.currentTarget && !busy) closeInstallDialog();
-          }}
           role="presentation"
         >
           <DialogShell
             className="create-dialog plugin-install-dialog"
             dialogId="plugin-install-dialog"
+            onRequestClose={() => {
+              if (!busy) closeInstallDialog();
+            }}
             headerActions={(
               <button
                 className="dialog-close"
