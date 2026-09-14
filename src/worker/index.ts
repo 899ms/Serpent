@@ -2248,7 +2248,9 @@ async function handleRequestWithoutWriteLease(request: WorkerRequest): Promise<W
           await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
         }
       }
-      const library = libraryService.openLibrary(request.command.selectedLibraryPath);
+      const library = libraryService.openLibrary(request.command.selectedLibraryPath, {
+        replaceExisting: request.command.replaceExisting === true,
+      });
       return { ok: true, type: 'library.opened', library };
     }
     case 'library.recovery-report':

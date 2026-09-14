@@ -50,6 +50,12 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | NAS-NAV-001 / `Serpent-52eed4` | 网络库打开后画布可点、切文件夹不被后台工作卡住 | 待人类验收 | ① **完全退出**当前 Electron 后再 `npm start`（主进程/Worker 改动不会热更新）。② 打开网络共享上的资源库。③ 等卡片出现后立刻点击/框选画布。④ 在侧栏连续点几个文件夹（含从「所有资产」点进小文件夹）；观察名称和选中高亮是否马上跟上，以及卡顿时卡片是否仍能点。 | 点文件夹后名称和选中马上变；卡顿期间卡片和其它文件夹仍能点（不要再出现 hover 有效、点击全无效）。内容可以稍后到。开库仍可能超过 3 秒才进主界面。切文件夹本身变快属于 PERF2，不在本条已交付范围内。 | [开发日志](../development/2026-09-14-network-library-interactive-starvation-development-log.md) / `src/worker/library-service.ts` `createBrowseSession` / `src/renderer/App.tsx` `acknowledgeWorkspaceNavigation` / `src/renderer/styles.css` `.workspace-navigation-hold` | 2026-09-14 第二轮用户确认：**切文件夹卡顿仍在，但不再阻碍操作**（卡片/文件夹可点）。操作假死视为消除；内容切换耗时仍走 `Serpent-e9a66b` / PERF2。第一轮曾不通过（hover 有效、点击全无效）。定向 4 files / 44 passed，`tsc --noEmit` 通过。packaged 未执行。 |
 
+### 2026-09-14 重复打开同一资源库
+
+| ID | 功能 | 状态 | 人类操作 | 预期结果 | 证据 | 结果/反馈 |
+| --- | --- | --- | --- | --- | --- | --- |
+| LIB-OPEN-001 / `Serpent-79b839` | 再打开已打开的同一份资源库时给出提示，不当损坏 | 人类验收通过 | ① 打开一份资源库。② 再用「打开资源库」选同一份库的另一条路径，或打开复制出来的副本。③ 看按钮：应是「取消」和「确认」，没有「切换资源库」。④ 点「取消」，应留在当前库。⑤ 再走一遍②后点「确认」，应打开刚选的那条路径。⑥ 再从最近列表点当前正在用的那一份（同一路径）。界面改动请完全退出后再 `npm start`。 | ② 标题是「资源库已打开」，正文为「所选资源库和当前打开资源库有相同的资源库ID，可能是同一资源库的不同路径。是否视为不同资源库进行打开。」不说损坏/备份。④ 「取消」和关闭只关掉提示，留在当前已打开的库，**不**出现创建资源库界面。⑤ 「确认」把刚选的位置视为不同资源库打开。⑥ 同一路径再打开不弹窗。 | [开发日志](../development/2026-09-14-same-library-id-open-prompt-development-log.md) / `FatalAlertDialog` / `tests/unit/fatal-alert-dialog.test.ts` / `tests/unit/library-open-already-open.test.ts` / `tests/worker/library-availability.test.ts` | 2026-09-14 用户确认验收通过。此前：「切换资源库」会弹出创建资源库界面、点确认不切库，已改为取消留在当前库、确认打开刚选的位置。`npm run test:library-availability` 9 files / 214 passed / 1 skipped；定向单测 2 files / 6 passed。 |
+
 ### 2026-09-13 资源库切换与侧栏导航
 
 | ID | 功能 | 状态 | 人类操作 | 预期结果 | 证据 | 结果/反馈 |

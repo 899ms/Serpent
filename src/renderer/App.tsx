@@ -398,7 +398,12 @@ import { trashedFoldersToBrowseEntries } from "./trashed-folder-entries";
 import { computeMasonrySelectionAssetIds } from "./masonry-selection-order";
 import { resolveMasonryTabTarget } from "./masonry-focus-order";
 import { shuffleBrowseItems } from "./client-shuffle";
-import { toMessage, messageForPublicError, LibraryOperationError } from "./error-utils";
+import {
+  toMessage,
+  messageForPublicError,
+  LibraryOperationError,
+  libraryOpenBlockingTitleKey,
+} from "./error-utils";
 
 import type {
   AiSearchPlan,
@@ -776,6 +781,8 @@ function AppInner() {
   const [masonryGridWidth, setMasonryGridWidth] = useState(0);
   const assetGridRef = useRef<HTMLDivElement | null>(null);
   const [fatalDialogTitle, setFatalDialogTitle] = useState<string | null>(null);
+  const [fatalAlertAlreadyOpen, setFatalAlertAlreadyOpen] = useState(false);
+  const pendingAlreadyOpenPathRef = useRef<string | null>(null);
   const [selectedFolderIds, setSelectedFolderIds] = useState<string[]>([]);
   const managedImportTargetFolderIdRef = useRef<string | undefined>(undefined);
   const [allAssetCount, setAllAssetCount] = useState(0);
@@ -858,12 +865,21 @@ function AppInner() {
     (entry) => !entry.closing,
   )?.id;
   const dismissFatalAlert = useCallback(() => {
+    setFatalAlertAlreadyOpen(false);
     setFatalDialogTitle(null);
     setFatal(null);
   }, [setFatal]);
+  const dismissAlreadyOpenPrompt = useCallback(() => {
+    pendingAlreadyOpenPathRef.current = null;
+    dismissFatalAlert();
+  }, [dismissFatalAlert]);
 
   const showBlockingError = useCallback(
-    (title: string, message: string) => {
+    (title: string, message: string, options?: { alreadyOpen?: boolean }) => {
+      if (options?.alreadyOpen !== true) {
+        pendingAlreadyOpenPathRef.current = null;
+      }
+      setFatalAlertAlreadyOpen(options?.alreadyOpen === true);
       setFatalDialogTitle(title);
       setFatal(message);
     },
@@ -5153,6 +5169,7 @@ function AppInner() {
         t("toast.libraryOpFailed"),
         undefined,
         null,
+        { selectedLibraryPath: chosen.value },
       );
       return;
     }
@@ -5319,6 +5336,7 @@ function AppInner() {
         t("toast.openRecentFailed"),
         undefined,
         recent?.name ?? null,
+        { selectedLibraryPath: libraryPath },
       );
     },
     // Stable identity: the native menu effect above subscribes once, and the
@@ -5333,11 +5351,15 @@ function AppInner() {
     failureMessage: string,
     inlineOpeningOperation?: "open-eagle" | "open-billfish",
     loadingName?: string | null,
+    openOptions?: {
+      selectedLibraryPath?: string | null;
+      skipSwitchConfirm?: boolean;
+    },
   ) {
     if (!api) return;
     // A second library choice is safe to queue behind the current transition;
     // silently dropping it made a fast switch look like a frozen switcher.
-    if (!confirmLibrarySwitch()) return;
+    if (!openOptions?.skipSwitchConfirm && !confirmLibrarySwitch()) return;
     // Opening, closing, and deleting a library all replace the renderer's
     // active identity. Keep their request, UI teardown, and ref updates in one
     // order; otherwise a close clicked while an open is resolving can close
@@ -5419,16 +5441,26 @@ function AppInner() {
         setImportProgress(null);
         setLibraryTransferKind("import");
         setLibraryTransferName("");
+        const failureCode =
+          caught instanceof LibraryOperationError ? caught.code : undefined;
+        pendingAlreadyOpenPathRef.current =
+          failureCode === "LIBRARY_ALREADY_OPEN"
+            ? (openOptions?.selectedLibraryPath ?? null)
+            : null;
         showBlockingError(
           busyState === "creating"
             ? t("dialog.blockingError.libraryCreateFailed")
-            : t("dialog.blockingError.libraryOpenFailed"),
+            : t(libraryOpenBlockingTitleKey(failureCode)),
           toMessage(caught, failureMessage, locale),
+          { alreadyOpen: failureCode === "LIBRARY_ALREADY_OPEN" },
         );
         // Serpent-s0oq: opening an invalid library removes it from the recent
         // store in Main — refresh so the switcher menu and the no-library
-        // create dialog both drop it immediately.
-        void refreshRecentLibraries();
+        // create dialog both drop it immediately. Same-catalog identity is
+        // not invalid; keep the current recents list as-is.
+        if (failureCode !== "LIBRARY_ALREADY_OPEN") {
+          void refreshRecentLibraries();
+        }
       } finally {
         if (
           inlineOpeningOperation &&
@@ -5445,6 +5477,21 @@ function AppInner() {
         }
       }
     });
+  }
+
+  function confirmAlreadyOpenLibrarySwitch() {
+    const nextPath = pendingAlreadyOpenPathRef.current;
+    pendingAlreadyOpenPathRef.current = null;
+    dismissFatalAlert();
+    if (!nextPath || !api) return;
+    void runLibraryOpenPipeline(
+      "opening",
+      () => api.open({ libraryPath: nextPath, replaceExisting: true }),
+      t("toast.libraryOpFailed"),
+      undefined,
+      null,
+      { selectedLibraryPath: nextPath, skipSwitchConfirm: true },
+    );
   }
 
   function clearDiscoveryControls() {
@@ -14159,10 +14206,14 @@ function AppInner() {
         open={aiConnectionFailureGate.open}
       />
       <FatalAlertDialog
+        cancelLabel={fatalAlertAlreadyOpen ? t("common.cancel") : null}
+        confirmLabel={fatalAlertAlreadyOpen ? t("common.confirm") : null}
         message={fatalAlertMessage}
         title={fatalDialogTitle}
-        onDismiss={dismissFatalAlert}
-        onSwitchLibrary={openLibraryChooserFromError}
+        onCancel={fatalAlertAlreadyOpen ? dismissAlreadyOpenPrompt : undefined}
+        onConfirm={fatalAlertAlreadyOpen ? confirmAlreadyOpenLibrarySwitch : undefined}
+        onDismiss={fatalAlertAlreadyOpen ? dismissAlreadyOpenPrompt : dismissFatalAlert}
+        onSwitchLibrary={fatalAlertAlreadyOpen ? undefined : openLibraryChooserFromError}
       />
       <MediaJobsDialog
         open={mediaJobsOpen && library !== null}

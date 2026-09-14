@@ -28,6 +28,8 @@ export const PUBLIC_ERROR_MESSAGES = {
   IMPORT_APPLY_FAILED:
     'Import stopped before every file was copied and registered. Nothing was silently overwritten. Check disk space and that the source files are still readable, then retry; already-imported items do not need to be selected again.',
   LIBRARY_ALREADY_EXISTS: 'A file or folder with this library name already exists. Choose another name or another parent folder.',
+  LIBRARY_ALREADY_OPEN:
+    'The selected library and the currently open library have the same library ID. They may be different paths to the same library. Open it as a different library?',
   LIBRARY_NOT_FOUND:
     'Serpent cannot find that library folder. It may have been moved, renamed, or the disk may be disconnected. Reconnect the drive or choose the library again from Open Library.',
   NOT_A_LIBRARY:

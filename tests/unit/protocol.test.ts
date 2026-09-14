@@ -2084,6 +2084,24 @@ describe('worker request protocol', () => {
       },
     });
 
+    expect(
+      parseWorkerRequest({
+        requestId: 'req-01',
+        command: {
+          type: 'library.open',
+          selectedLibraryPath: '/Users/example/Library',
+          replaceExisting: true,
+        },
+      }),
+    ).toEqual({
+      requestId: 'req-01',
+      command: {
+        type: 'library.open',
+        selectedLibraryPath: '/Users/example/Library',
+        replaceExisting: true,
+      },
+    });
+
     expect(() =>
       parseWorkerRequest({
         requestId: 'req-01',

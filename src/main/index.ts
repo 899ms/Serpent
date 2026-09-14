@@ -2466,7 +2466,11 @@ async function commandFor(
       const selectedLibraryPath =
         request.libraryPath ?? (await selectDirectory("openLibrary"));
       return selectedLibraryPath
-        ? { type: "library.open", selectedLibraryPath }
+        ? {
+            type: "library.open",
+            selectedLibraryPath,
+            ...(request.replaceExisting === true ? { replaceExisting: true } : {}),
+          }
         : undefined;
     }
     case "library.recovery-report.request":
@@ -5858,7 +5862,8 @@ async function handleLibraryRequest(
         // unmigratable) must disappear from every recent list — the switcher
         // menu and the no-library create dialog share the same store. Only
         // deterministic invalid-open codes remove the entry; transient
-        // failures (picker cancel, busy) keep it.
+        // failures (picker cancel, busy) and same-catalog identity prompts
+        // (LIBRARY_ALREADY_OPEN) keep it.
         if (
           operation === "open" &&
           command.type === "library.open" &&

@@ -42939,7 +42939,10 @@ export class LibraryService {
    * intentionally kept separate so a failed recovery attempt cannot recurse
    * through this method and accidentally consume another backup slot.
    */
-  openLibrary(selectedLibraryPath: string): InternalLibrarySummary {
+  openLibrary(
+    selectedLibraryPath: string,
+    options?: { replaceExisting?: boolean },
+  ): InternalLibrarySummary {
     let canonicalPath: string | undefined;
     let normalizedPath: string | undefined;
     try {
@@ -42965,7 +42968,7 @@ export class LibraryService {
     }
 
     try {
-      return this.openLibraryPrimary(selectedLibraryPath);
+      return this.openLibraryPrimary(selectedLibraryPath, options);
     } catch (error) {
       if (
         normalizedPath !== undefined
@@ -43257,6 +43260,34 @@ export class LibraryService {
   }
 
   /**
+   * Same catalog identity can appear under more than one filesystem path.
+   * That is not damage. Same canonical path stays a silent reuse; a different
+   * path must prompt, unless the user confirmed replacing the current handle.
+   */
+  private reuseOrRejectDuplicateCatalog(input: {
+    libraryId: string;
+    canonicalPath: string;
+    connection: DatabaseConnection;
+    replaceExisting?: boolean;
+  }): InternalLibrarySummary | undefined {
+    const existingOpen = this.openById.get(input.libraryId);
+    if (!existingOpen) return undefined;
+    if (existingOpen.summary.libraryPath === input.canonicalPath) {
+      closeIgnoringFailure(input.connection);
+      this.openIdByPath.set(input.canonicalPath, existingOpen.summary.libraryId);
+      return existingOpen.summary;
+    }
+    if (input.replaceExisting !== true) {
+      closeIgnoringFailure(input.connection);
+      throw new LibraryServiceError('LIBRARY_ALREADY_OPEN');
+    }
+    // Keep the already-opened connection for the chosen path. Release the
+    // current handle first so this catalog is not registered twice.
+    this.closeLibrary(input.libraryId);
+    return undefined;
+  }
+
+  /**
    * Register a writable open handle. Desktop never offers a read-only library:
    * too-new schemas stay writable, stuck migrations stay writable at the last
    * good version, and physical damage goes through backup/rescue instead.
@@ -43271,7 +43302,15 @@ export class LibraryService {
     supportedSchemaVersion?: number;
     migrationStuck?: boolean;
     startServices: boolean;
+    replaceExisting?: boolean;
   }): InternalLibrarySummary {
+    const existingSummary = this.reuseOrRejectDuplicateCatalog({
+      libraryId: input.library.library_id,
+      canonicalPath: input.canonicalPath,
+      connection: input.connection,
+      replaceExisting: input.replaceExisting,
+    });
+    if (existingSummary) return existingSummary;
     try {
       for (const directoryName of REGENERABLE_DIRECTORIES) {
         mkdirSync(path.join(input.serpentPath, directoryName), { recursive: true });
@@ -43288,10 +43327,6 @@ export class LibraryService {
       input.connection,
       input.networkStorage === true,
     );
-    if (this.openById.get(input.library.library_id)) {
-      closeIgnoringFailure(input.connection);
-      throw new LibraryServiceError('LIBRARY_CORRUPT');
-    }
 
     const networkReadThrough = input.networkStorage
       ? this.createNetworkMetadataReadThrough({
@@ -43515,7 +43550,10 @@ export class LibraryService {
     }
   }
 
-  private openLibraryPrimary(selectedLibraryPath: string): InternalLibrarySummary {
+  private openLibraryPrimary(
+    selectedLibraryPath: string,
+    options?: { replaceExisting?: boolean },
+  ): InternalLibrarySummary {
     // Serpent-4bdd26：开库阶段计时（SERPENT_OPEN_STAGE_LOG=1），用于大库打开
     // 的归因。生产默认关闭。
     const openStageLog = process.env.SERPENT_OPEN_STAGE_LOG === '1';
@@ -43615,6 +43653,7 @@ export class LibraryService {
           // A stuck library is still on an older schema; skip current-schema
           // watchers/jobs. A newer schema already contains today's tables.
           startServices: !migrationStuck,
+          replaceExisting: options?.replaceExisting,
         });
       }
       connection = openConfiguredDatabase(
@@ -43645,6 +43684,7 @@ export class LibraryService {
         serpentPath,
         networkStorage,
         startServices: true,
+        replaceExisting: options?.replaceExisting,
       });
       markStage('adopt-services');
       return summary;
@@ -43657,7 +43697,9 @@ export class LibraryService {
       if (
         migrationAttempted &&
         !(error instanceof LibraryServiceError &&
-          (error.code === 'LIBRARY_CORRUPT' || error.code === 'LINKED_FOLDER_UNAVAILABLE'))
+          (error.code === 'LIBRARY_CORRUPT'
+            || error.code === 'LINKED_FOLDER_UNAVAILABLE'
+            || error.code === 'LIBRARY_ALREADY_OPEN'))
       ) {
         try {
           recordMigrationFailure(
@@ -43726,11 +43768,12 @@ export class LibraryService {
       connection.pragma('trusted_schema = ON');
       connection.pragma('query_only = ON');
       const library = verifyDatabase(connection);
-      const existingIdentity = this.openById.get(library.library_id);
-      if (existingIdentity) {
-        closeIgnoringFailure(connection);
-        throw new LibraryServiceError('LIBRARY_CORRUPT');
-      }
+      const existingSummary = this.reuseOrRejectDuplicateCatalog({
+        libraryId: library.library_id,
+        canonicalPath,
+        connection,
+      });
+      if (existingSummary) return existingSummary;
 
       const summary: InternalLibrarySummary = {
         libraryId: library.library_id,

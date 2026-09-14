@@ -874,6 +874,7 @@ export const zhCN = {
     blockingError: {
       fallback: "操作未完成",
       libraryOpenFailed: "无法打开资源库",
+      libraryAlreadyOpen: "资源库已打开",
       libraryCreateFailed: "无法创建资源库",
       importFailed: "导入失败",
       importContinueFailed: "无法继续导入",
@@ -2118,6 +2119,8 @@ export const zhCN = {
       IMPORT_NOT_FOUND: "待处理的导入已失效，请重新选择文件。",
       IMPORT_APPLY_FAILED: "导入在复制或登记完成前停止，没有静默覆盖已有文件。请检查磁盘空间和源文件是否仍可读取后重试；已经导入成功的条目不必再选一次。",
       LIBRARY_ALREADY_EXISTS: "该位置已经存在同名文件或文件夹。请换一个名称，或选择另一个父文件夹。",
+      LIBRARY_ALREADY_OPEN:
+        "所选资源库和当前打开资源库有相同的资源库ID，可能是同一资源库的不同路径。是否视为不同资源库进行打开。",
       LIBRARY_NOT_FOUND: "找不到该资源库文件夹。它可能已被移动、重命名，或磁盘已断开。请重新连接磁盘，或从「打开资源库」再次选择。",
       NOT_A_LIBRARY: "所选文件夹不是 Serpent 资源库（缺少 .serpent 数据库）。",
       LIBRARY_CORRUPT: "无法读取该资源库的数据库（完整性检查或迁移记录失败）。请重新打开资源库，Serpent 会尝试从备份恢复。若需留底，请先把整个资源库文件夹复制到本机磁盘。",

@@ -18,6 +18,7 @@ Serpent 的错误与确认文案应**说清楚发生了什么、为什么、下�
 | 场景 | 中文标题示例 | 英文示例 |
 |------|--------------|----------|
 | 打开资源库失败 | 无法打开资源库 | Couldn't open library |
+| 同一资源库已打开 | 资源库已打开 | Library already open |
 | 创建资源库失败 | 无法创建资源库 | Couldn't create library |
 | 导入失败 | 导入失败 | Import failed |
 | 继续导入失败 | 无法继续导入 | Couldn't continue import |

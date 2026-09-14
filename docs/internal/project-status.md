@@ -1,5 +1,7 @@
 # Serpent 项目状态
 
+- **2026-09-14 同 ID 开库提示（`Serpent-79b839`）**：已打开一份库后再打开同一 `library_id` 的另一条路径（网络位置的不同到达方式，或复制出的副本），不再报 `LIBRARY_CORRUPT`、不走备份抢救、不从最近列表删除。Worker 抛 `LIBRARY_ALREADY_OPEN`；界面标题为「资源库已打开」。取消留在当前库；确认打开刚选择的路径。同一规范化路径再打开仍静默复用。**用户 2026-09-14 验收通过**，清单 `LIB-OPEN-001`。packaged 未验证。见[开发日志](development/2026-09-14-same-library-id-open-prompt-development-log.md)。
+
 - **2026-09-14 切文件夹假死第二轮（`Serpent-52eed4`）**：用户确认切文件夹**卡顿仍在，但不再阻碍操作**。已交付：侧栏选中即时更新、导航挡板不吞点击、浏览会话先返回有界首屏；路径查询/状态轮询让出 interactive 槽，协议读 2 路并发门。内容切换变快仍属 PERF2（`Serpent-e9a66b`），本单保持 open。见[开发日志](development/2026-09-14-network-library-interactive-starvation-development-log.md)。清单 `NAS-NAV-001`。
 
 - **2026-09-14 网络库浏览卡死（`Serpent-52eed4`，当前 `dev`）**：安装包打开 UNC 网络库时，源路径解析、1 秒状态轮询和 AI 测连占着唯一的 `interactive-control` 槽，切文件夹与点击像被卡住；主进程并发 `open` 网络文件还会打满 libuv 线程池。已把路径查询和轮询改到 background，浏览会话保留 interactive，并给协议读加 2 路并发门。调度器 interactive 互斥未改（避免回归切库饿死）。见[开发日志](development/2026-09-14-network-library-interactive-starvation-development-log.md)。不关闭 `Serpent-3kfe` / `Serpent-e9a66b`。packaged/真实网络库待用户复验。
@@ -8,7 +10,7 @@
 
 - **2026-09-13 交互性能设计与拆分**：针对文件夹切换、NAS、资源加载和新建文件夹反馈慢，形成[第二阶段顶层设计](implementation/2026-09-13-interactive-performance-design.md)与[执行安排](development/2026-09-13-interactive-performance-execution.md)。采用受控只读执行隔离、有界首屏、NAS版本化快照、提交后局部投影及定向刷新。PERF2-01 协议已开始实施；产品能力验收仍未执行；不替代历史用户工单关闭证据。
 
-> 更新时间：2026-09-13
+> 更新时间：2026-09-14
 > 事实来源：`docs/internal/implementation/mvp-roadmap.md` 与各切片开发/审查/QA 文档
 
 - **2026-09-13 工作区标签页收尾二（Serpent-3ad7ed）**：按用户反馈补齐六项——标签可拖动实时换位（顺序持久化）、只剩一个标签时不出现关闭入口（× 与右键菜单项同步隐藏）、文件夹标签 hover 显示**库内路径**（普通文件夹为 Assets 之下的相对路径，链接文件夹为磁盘路径，只用 Renderer 已有的 `folder.relativePath` / `linkedFolder.absoluteRootPath`，未新增路径能力）、标签条按标签数动态收窄（220px 逐级降到 132px）、右键「关闭其他标签页」补 close 图标、以及**重启恢复标签页**：按资源库存 `serpent.workspace-tabs.v1.<libraryId>`（位置与顺序，不含前进/后退分支），启动恢复先于浏览范围恢复，使上次浏览位置落回关闭时活动的那个标签；关库/换库的拆除不写会话。见[开发日志](development/2026-09-13-workspace-tabs-followups-development-log.md)。**用户当天复验：1/3/4/5 通过**；2 与 6 要求改并已改——拖动成功换位后松手不再播「飞影飞回原位」动画（实时重排让被拖标签停在光标下，原先对它自身的 `dragover` 不 `preventDefault`，Chromium 按未接受的投放处理；改为整条标签栏都接受投放，只在拖出栏外时拒收），标签最长宽度从 220px 收到「刚好放下 8 个汉字」的 `calc(8em + 82px)`（约 182px，用 `em` 以跟随界面字号设置，不会因放大字号而截断）。隔离 Electron E2E 两个用例 **2 passed（32.3 秒）**；早前几轮的 120s 超时是开发机当时负载所致（`load average ≈ 5.6`），同一份代码负载回落后 32 秒跑完，既有 flaky 断言仍记在 `Serpent-75a2df`。清单 TABS-005~009 待用户复验。另顺带修正该 E2E 里写死 Windows 文案的「在文件浏览器中打开」断言（macOS 上为「在 Finder 中打开」），并把用例 `finally` 里无超时的退出等待换成有界 helper。全量单测中 `import-source-failure.test.ts` 在 macOS 上失败（`path.basename` 平台相关），已开 `Serpent-ee725a`。
@@ -71,7 +73,7 @@
   已锁行高/caption band、CSS gap 改为 0。2026-08-29 用户真机验收通过。详见
   [开发日志](development/2026-08-29-justified-visible-thumbnail-window-development-log.md)。
 
-- **2026-08-27 `Serpent-79b839` 同 ID 开库**：本机已打开 A 时再打开复制到 NAS 的副本，当前只按 `library_id` 判重并抛 `LIBRARY_CORRUPT`。路径不能当身份（盘符挂载 vs UNC 可能是同一份远端库）。未修。同 ID 应确认提示，禁止当损坏抢救。关联 `Serpent-f863df` / `Serpent-6c5c65`。
+- **2026-08-27 `Serpent-79b839` 同 ID 开库**：本机已打开 A 时再打开复制到 NAS 的副本，只按 `library_id` 判重并抛 `LIBRARY_CORRUPT` 的路径已改掉。路径不能当身份（盘符挂载 vs 网络路径可能是同一份远端库）。**2026-09-14 已改为 `LIBRARY_ALREADY_OPEN` 提示，用户验收通过。** 关联 `Serpent-f863df` / `Serpent-6c5c65`。
 
 - **2026-08-27 P0 导入 ZIP 后全部卡片损坏（`Serpent-e04fbc` / LIB-ZIP-001）**：从硬盘删除资源库会按 `libraryId` 拦住 `serpent://` 读取；成功删除后未释放。ZIP 导入保留同一 `library_id`，重导入后每张卡 410。删除请求结束后释放 fence。用户 Windows 真机验收通过。详见
   [开发日志](development/2026-08-27-zip-reimport-media-fence-development-log.md)。
