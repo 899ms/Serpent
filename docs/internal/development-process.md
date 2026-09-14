@@ -28,6 +28,8 @@
 4. 推送 dev 保持正常流程（pre-push 自动同步 beads）。
 5. 合流后核对：`git ls-tree main --name-only` 不含开发文件；`git merge-base --is-ancestor main dev` 为真。
 
+**dev 侧不再用 `.gitignore` 拦 `docs/internal/`（2026-09-14 用户要求）：** 内部文档在 dev 上必须能正常跟踪提交。此前 `.gitignore` 的 `docs/internal/` 只会拦未跟踪文件，新版开发日志/审查/工单会被静默跳过（当日实测漏掉一份开发日志，需要 `git add -f` 才补回）。现在 `.gitignore` 仅保留 `AGENTS.md`、`CLAUDE.md`、`.beads/`、`.github/`；main 剥离仍由上面的合流流程与 `scripts/hooks/pre-commit` 钩子强制。
+
 执行记录：2026-08-15 完成首次重构——main `3d6474f`（strip dev-only files），dev `f4a37d4`（restore dev-only files，派生自 main）。
 
 ## 每个切片的文档集合
