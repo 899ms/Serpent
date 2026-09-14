@@ -92,6 +92,8 @@ type ActiveEntry = {
   request: ScheduledRequest;
   cancel?: () => void;
   startedAt: number;
+  /** Set while the owner has released its admission at a safe point. */
+  yieldState?: { promise: Promise<void>; release: () => void };
 };
 
 export type ScheduleOptions = {
@@ -147,6 +149,8 @@ const MAX_STALL_REPORT_MS = 30_000;
 export class InteractiveScheduler {
   readonly #queue: QueueEntry<unknown>[] = [];
   readonly #active = new Set<ActiveEntry>();
+  /** Serpent-be29a9: active owners that released their admission at a safe point. */
+  readonly #yielded = new Set<ActiveEntry>();
   readonly #latestGenerationByKey = new Map<string, number>();
   readonly #options: InteractiveSchedulerOptions;
   #sequence = 0;
@@ -265,7 +269,7 @@ export class InteractiveScheduler {
    */
   cancelActiveBackgroundForLibrary(libraryId: string): number {
     let requested = 0;
-    for (const active of this.#active) {
+    for (const active of [...this.#active, ...this.#yielded]) {
       if (active.request.libraryId !== libraryId) continue;
       if (!isBackgroundPerformanceLane(active.request.lane) || !active.cancel) continue;
       active.cancel();
@@ -281,12 +285,65 @@ export class InteractiveScheduler {
    */
   cancelActiveBackgroundOwners(): number {
     let requested = 0;
-    for (const active of this.#active) {
+    for (const active of [...this.#active, ...this.#yielded]) {
       if (!isBackgroundPerformanceLane(active.request.lane) || !active.cancel) continue;
       active.cancel();
       requested += 1;
     }
     return requested;
+  }
+
+  /**
+   * Serpent-be29a9: release a long background owner's admission at a safe point
+   * so a queued interactive request or mutation can start, then take the
+   * admission back before continuing.
+   *
+   * Measured before this existed: one open reconciliation held the single
+   * background admission for up to 25.8 s while `browse.session.open` waited
+   * 28.3 s and 1,509 status polls piled up behind it. The rule here is narrow on
+   * purpose —
+   *   - nothing interactive or mutating is waiting → return immediately, so a
+   *     quiet library pays nothing;
+   *   - interactive requests and mutations preempt the yield;
+   *   - the yielded owner keeps the slot ahead of other *background* work, so
+   *     the maintenance pass still makes bounded progress instead of losing the
+   *     admission to a 1/s status poll forever.
+   */
+  async yieldAdmission(requestId: string): Promise<void> {
+    if (!this.hasWaitingInteractiveOrMutation()) return;
+    const entry = [...this.#active]
+      .find((candidate) => candidate.request.requestId === requestId);
+    if (!entry || entry.yieldState !== undefined) return;
+    let release!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    entry.yieldState = { promise, release };
+    // Keep the entry out of the active set: that is what frees the single
+    // background admission (and lets a mutation see a fully idle scheduler).
+    this.#active.delete(entry);
+    this.#yielded.add(entry);
+    this.drain();
+    await promise;
+  }
+
+  private hasWaitingInteractiveOrMutation(): boolean {
+    return this.#queue.some((entry) =>
+      entry.request.lane === 'mutation'
+      || isInteractivePerformanceLane(entry.request.lane));
+  }
+
+  /** Hand the admission back to the oldest yielded owner. */
+  private resumeYieldingEntry(): boolean {
+    for (const entry of this.#yielded) {
+      this.#yielded.delete(entry);
+      this.#active.add(entry);
+      const state = entry.yieldState;
+      entry.yieldState = undefined;
+      state?.release();
+      return true;
+    }
+    return false;
   }
 
   cancelAllQueued(): number {
@@ -343,11 +400,23 @@ export class InteractiveScheduler {
       this.discardExpiredQueuedRequests();
       const index = this.nextRunnableIndex();
       if (index < 0) {
+        // Nothing queued can run: give a yielded owner its admission back so it
+        // finishes instead of stalling behind an empty (or blocked) queue.
+        if (this.resumeYieldingEntry()) continue;
         // Nothing can be admitted right now. If work is still waiting, that is
         // either a short burst or a genuine lane deadlock; the watchdog reports
         // the holder instead of leaving a silent hang.
         this.armStallWatch();
         return;
+      }
+      if (
+        this.#yielded.size > 0
+        && isBackgroundPerformanceLane(this.#queue[index]!.request.lane)
+        && this.resumeYieldingEntry()
+      ) {
+        // The yielded owner keeps the slot ahead of other background work; only
+        // interactive requests and mutations preempt it.
+        continue;
       }
       this.clearStallWatch();
       const [entry] = this.#queue.splice(index, 1);
@@ -390,6 +459,12 @@ export class InteractiveScheduler {
       }
       result.then(entry.resolve, entry.reject).finally(() => {
         this.#active.delete(active);
+        // A yielded owner that finished (or was cancelled) must release any
+        // waiter and leave the yielded set, otherwise the admission is lost.
+        this.#yielded.delete(active);
+        const yieldState = active.yieldState;
+        active.yieldState = undefined;
+        yieldState?.release();
         this.drain();
       });
     }
@@ -507,8 +582,16 @@ export class InteractiveScheduler {
     const hasQueuedMutation = this.#queue.some((entry) => entry.request.lane === 'mutation');
     const activeInteractive = [...this.#active]
       .filter((entry) => isInteractivePerformanceLane(entry.request.lane)).length;
-    const activeBackground = [...this.#active]
-      .filter((entry) => isBackgroundPerformanceLane(entry.request.lane)).length;
+    const activeBackgroundEntries = [...this.#active]
+      .filter((entry) => isBackgroundPerformanceLane(entry.request.lane));
+    const activeBackground = activeBackgroundEntries.length;
+    // Serpent-52eed4（实测 2026-09-14）：开库对账是 30 秒级的 maintenance owner，
+    // 而缩略图泵与可见卡 artifact 路径解析是 background-primary。「同时只允许一个
+    // 后台任务」让用户切文件夹后等 34.6 秒才看到 15 张缩略图（schedulerWaitMs
+    // 34,897 ms）。只放行一个服务可见内容的 background-primary 与 maintenance
+    // 并行；background-secondary（状态轮询）与第二个 background-primary 仍被挡住。
+    const onlyMaintenanceActive = activeBackground === 1
+      && activeBackgroundEntries[0]!.request.lane === 'maintenance';
 
     let bestIndex = -1;
     let bestPriority = -1;
@@ -530,7 +613,8 @@ export class InteractiveScheduler {
           ? mayReadDuringOtherLibraryClose
           : isInteractivePerformanceLane(lane)
             ? activeInteractive < 1
-            : activeBackground < 1 && !hasQueuedMutation;
+            : !hasQueuedMutation
+              && (activeBackground < 1 || (lane === 'background-primary' && onlyMaintenanceActive));
       if (!canStart) continue;
       const priority = this.#queue[index]!.request.lifecyclePriority === true
         ? LIFECYCLE_PRIORITY

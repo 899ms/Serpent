@@ -1,9 +1,11 @@
 # 2026-09-14 文件夹切换与资源加载性能优化方向
 
-> 状态：两轮当前实例诊断与拆单完成，尚未实施。
+> 状态：第三轮 CPU profile、真实库只读 SQL A/B 与当前实例日志复核完成；第二轮未提交实现已被证伪，禁止按原方案提交。
 > 父计划：`Serpent-e9a66b`（交互性能第二阶段）。
 > 直接用户问题：`Serpent-52eed4`（切换仍慢，但不再吞操作）。
 > 本文补充既有 [`2026-09-13-interactive-performance-design.md`](2026-09-13-interactive-performance-design.md)，不取代其只读进程、NAS 快照、两阶段 BrowseSession 与媒体描述符设计。
+
+> 2026-09-14 第三轮纠偏：此前把问题概括为「后台许可被 reconciliation 长占」仍不够准确。新的端到端时间线证明，浏览 SQL 已返回后，Main 还会在向 Renderer 返回结果之前同步等待 `media.get-asset-drag-infos`；该请求又被降级到 background-primary，因此会在 reconciliation 后等待约一分钟。这是一次由“把辅助预热降级为后台”引入的关键路径优先级反转。与此同时，任务状态协调器虽然限制了 in-flight 数，却仍在每个媒体完成事件后重查完整任务列表，形成 2.71 次/秒、累计占用 Worker 约 206 秒的查询风暴。后续必须先消除这两条自制造负载，再决定是否启动独立只读进程等大改造。
 
 ## 1. 问题定义与完成边界
 
@@ -74,6 +76,44 @@
 - 约 2,000 个持久任务不等于 2,000 个 Scheduler command；更准确的模型是少量活动解码持续占用资源，同时状态轮询、产物完成事件和路径查询不断制造跨进程与数据库 churn。
 - 暂停通过一次批量状态更新并 cooperative-abort 少量活动解码，不需要逐条取消 2,000 次；暂停后迅速恢复强烈支持“共享资源竞争”这一因果方向。
 
+### 2.2 第三轮 profile：真正的关键路径与查询热区
+
+第三轮重新读取完整 Worker CPU profile、逐条核对同会话 `worker.cmd`，并在当前真实库上做只读 `EXPLAIN QUERY PLAN`；随后把数据库备份到一次性临时副本，只在副本上测试候选索引。临时副本和诊断脚本在测量后已清理，未修改用户资源库。
+
+该样本约有 43,938 个资产、89,580 条历史任务，其中媒体任务 74,496 条；61,414 条已成功，仍有 9,667 条排队与 1,691 条暂停。344 秒 profile 的主要结果如下：
+
+| 调用/阶段 | 次数或耗时 | 结论 |
+| --- | ---: | --- |
+| `media.list-jobs` | 933 次，2.71 次/秒 | single-flight 只限制同时在飞，并未限制媒体完成事件后的重新查询 |
+| `media.list-jobs` Worker 执行 | 累计 206.4 秒，平均 221 ms，最大 367 ms | 占据 profile 的主要时间 |
+| `better-sqlite3 all()` → `listMediaJobs` | 自耗约 204.7 秒 | 最大 SQL 热区的确切业务调用，不是 browse 查询 |
+| `all()` → RAW metadata admission | 自耗约 22.6 秒 | 每轮 secondary pump 都会重新寻找候选，空结果也重复扫描 |
+| `lstat` → 打开对账 | 约 14.7 秒 | 仍是次级文件系统热区，但不是本次第一热区 |
+| Renderer | 约 72% idle；滚动无 long task | 前端计算与滚动绘制不是一分钟等待的主因 |
+
+`listMediaJobs` 每次执行两条 SQL：一条按状态计数，一条取最近 500 条；两条都会关联资产，并对每条任务执行显式忽略与 `.gitignore` 的相关子查询。真实库只读计时与临时副本 A/B：
+
+| 查询 | 当前中位数 | 去掉资产可见性重算 | 候选索引后 |
+| --- | ---: | ---: | ---: |
+| 状态计数 | 约 142.2 ms | 约 42.3 ms | 约 133.1 ms |
+| 最近 500 条 | 约 166.6 ms | 约 52.8 ms | 约 1.0 ms |
+
+运行计划显示当前最近列表使用 `jobs_library_status_priority` 后仍建立临时 B-tree 排序；增加 `(library_id, created_at DESC, job_id DESC)` 后该部分可降到约 1 ms。计数几乎不受普通索引改善，证明其算法问题是反复遍历约 7.4 万历史任务并重新计算资产可见性，而不只是“缺一个索引”。
+
+更关键的是端到端链路：一次 `browse.session.open` 在约 1.206 秒内完成 Worker 往返，但 Main 在把结果交给 Renderer 前调用并 `await` 首屏 64 项的 `media.get-asset-drag-infos`。同一时段 reconciliation 作为 maintenance owner 连续运行至少 66.3 秒；两个 background-primary 拖拽预热请求分别等待约 65 秒以上，命令记录的 scheduler wait 约 67.8–68.0 秒。因此浏览 SQL 已完成，旧卡片却仍在屏幕上，直到辅助拖拽预热结束。这条隐藏在 Worker roundtrip 之后的 Main 后处理正是“命令很快、内容一分钟不换”的直接解释。
+
+当前实例的另一段日志独立复现了相同结构：同一 reconciliation owner 连续活跃至少 37.8 秒，等待队列从 8 项增长到 34 项。它证明长 maintenance owner 仍存在，但不应再把所有可见延迟笼统归因于 reconciliation；真正的错误是把一个被同步 `await` 的关键路径子请求标成后台任务。
+
+### 2.3 现有 profiler 判据的有效与无效部分
+
+现有 `navigation-profile.test.ts` 的 CPU profile 与命令时间线有效，但页面判据仍有三个假阴性来源：
+
+1. 它按 DOM 顺序点击任意 `.nav-row`，没有限定为非空、内容不同的文件夹/合集，也没有先确认目标行已经成为 active scope。
+2. `waitForContentChange` 要求新卡片数大于零，所以正确切到空文件夹也会被记成 60 秒超时。
+3. 文件夹循环结束后没有恢复到可滚动的大 scope；随机跳转可能在空或很小的 scope 上执行，并且图片覆盖率可能仍统计旧卡片。
+
+因此“3/4 文件夹、3/3 跳转超时”不能整体当作产品耗时分布；报告还把 timeout 常量写进 timing，容易伪装成真实观测值。但上述约 68 秒的 `browse → Main drag prime → Renderer` 链路由独立命令时间线和 scheduler stall 直接证明，至少一个一分钟级卡顿不是测试假象。基准必须修正后再承担最终 A/B 判定。
+
 ## 3. 根因与优化方向
 
 ### 3.1 去除打开对账的文件系统 I/O 放大
@@ -104,26 +144,31 @@
 - navigation generation 变化时，旧 continuation 在安全点停止；不得通过反复 abort→从头扫描制造新的 I/O 风暴。
 - 每个时间片必须同时受最大连续占用时间与批量大小约束，记录真实占用、让步、重新入队和完成进度；后台仍须获得有限进展。
 
-### 3.3 让状态更新有界，消除轮询积压
+### 3.3 拆分任务摘要与任务列表，完成事件不得触发全表重查
 
-Renderer 当前对每个已打开资源库每秒并发查询媒体任务、AI 状态和插件任务；任务面板打开时还可能有第二组相同轮询。请求没有 single-flight、latest-wins 或基于活动状态的退避。
+第二轮 `JobStatusCoordinator` 的 single-flight/coalesce 只解决“堵住时无限积压”，没有解决“上一轮很快结束后，下一条完成事件立即再查”。缩略图与尺寸完成事件密集时，`noteActivity("media")` 仍会直接调用同时包含全量计数和最近 500 行的 `media.list-jobs`，所以测得 2.71 次/秒和 206 秒累计执行。
 
-优化方向：
+新的算法边界：
 
-- 优先复用现有 Worker 事件，将任务变化作为增量状态源。
-- 保留的兜底轮询必须按“库 + 查询种类”single-flight；上一轮未完成时不得再入队同类请求。
-- 无活动任务、窗口隐藏、库正在切换或 owner 已知繁忙时退避；恢复时只做一次合并刷新。
-- 对 `media.list-jobs`、`ai.status`、`plugin.jobs.list`、`history.status` 等读定义 latest-wins/coalescing 语义，过期响应不得覆盖新库或新 generation。
-- 队列上限必须与堵塞时长无关；不能通过扩大 Worker 并发掩盖无限生产请求。
+- 拆成 `media.job-summary` 与分页 `media.list-jobs`。常驻状态栏只消费摘要；任务面板打开时才拉最近页，滚动时使用 cursor 分页。
+- 媒体完成事件携带或驱动 O(1) 的状态增量，不能把“事件是主源”实现成“事件触发全量回源”。面板关闭且没有人工控制动作时，浏览旅程中的 `media.list-jobs` 请求数目标为零。
+- 第一阶段允许开库后异步重建一次摘要，但必须晚于首屏；最终可用事务内计数表或 Worker 内存计数 + 崩溃后一次重建保证一致。忽略规则变化应批量修正摘要，不能在每次读取时对 7.4 万任务重新执行资产可见性子查询。
+- 最近列表增加与排序匹配的索引；临时副本已证明该查询可从约 166.6 ms 降到约 1 ms。索引只解决列表页，不得把它当成计数问题已解决。
+- 面板打开时最多按低频摘要兜底，上一轮未完成不补发；暂停/恢复/取消成功后主动应用命令回执，再做一次合并校准。窗口隐藏、切库与 generation 变化清理旧状态。
+- 新指标分开记录“事件数、摘要增量数、摘要重建数、列表页请求数”，禁止再用合并数掩盖高频成功查询。
 
-### 3.4 合并 thumbnail 完成后的拖拽缓存预热
+### 3.4 从浏览关键路径移除拖拽预热，禁止全结果后台预热
 
-Main 当前在每个 thumbnail ready/failed 事件后单独请求 `media.get-asset-drag-infos`。Renderer 的 RAF 批量只减少 UI 更新，没有合并 Main→Worker 请求；大量任务完成时，这条旁路会产生与完成事件同量级的额外请求。
+第二轮把每个完成事件改为 500 项分批、每库最多 20,000 项，虽然把逐事件请求降为 304 次，但仍在一个纯浏览 profile 中产生 304 个 `media.get-asset-drag-infos`。更严重的是，首屏 64 项仍在 Main 返回浏览结果前同步 `await`，而同一命令被归类为 background-primary；这直接制造了约 68 秒的优先级反转。
 
-- 复用现有 drag cache，在 Main 按 library、generation 和短时间窗去重合并。
-- 优先当前可见资产或确有预热价值的集合；其余资产首次拖拽时按需补齐。
-- pending 数、单批大小和每轮调用数必须有上限，不能把逐项请求改成一次无界大包。
-- 切库、关闭库、窗口销毁与 generation 变化时清理旧 pending；迟到结果不得污染新库。
+新的算法边界：
+
+- `browse.session.open/page` 的 Worker 结果一旦返回，Main 不得再等待任何拖拽缓存请求才能交给 Renderer。端到端 span 必须显式记录 Worker 返回、Main 后处理和 Renderer 收到三个阶段。
+- 首选方案是在 Worker 构造首屏结果时，同时携带只供 Main 消费的受控拖拽描述符；Main 缓存后剥离，Renderer 仍不接收绝对路径。这样不需要第二个 Worker 请求，也不破坏安全边界。
+- 若协议包络暂时不能携带 Main-only 数据，则浏览结果先返回；只对当前可见卡片或明确的 pointer/drag intent 做异步预热。不能为了极低概率的“卡片出现后立即拖出”而阻塞所有文件夹切换。
+- 删除“剩余全部结果后台预热”。虚拟化滚动到新窗口时最多按当前可见窗口补齐；缩略图 ready/failed 不改变源路径，不应触发拖拽路径重新解析。只有 move/rename/relink/revision/library generation 等真正影响描述符的事件才失效或更新缓存。
+- 若同一底层查询同时存在关键路径与后台预取用途，必须使用不同命令语义/车道或显式请求意图；禁止用一个静态 lane 同时承担二者。
+- 验收基线：不发生 pointer/drag intent 的纯浏览旅程，`media.get-asset-drag-infos` 为 0（采用 Main-only 包络时）或严格受可见窗口数约束；浏览响应的 Main 后处理不超过 50 ms；拖拽冷、热路径继续可用。
 
 ### 3.5 热预览缓存必须先于写 owner
 
@@ -164,18 +209,29 @@ Scheduler 当前只决定命令何时开始，自动媒体 pump 还会与浏览�
 - 前台预算覆盖数据库读取、artifact locator、文件读取和必要解码，不只覆盖 Scheduler lane。
 - 后台必须有有限进展和最大饥饿保护；“每次切文件夹就暂停全部任务”只能作为诊断手段，不能成为产品算法。
 
+### 3.9 RAW metadata admission 采用可失效游标，禁止每轮空结果重扫
+
+CPU profile 中第二个 `all()` 热区来自 `enqueueRawImageMetadataBackfill`。当前真实库有约 2,202 个 RAW 资产；一次候选查询当前约 94 ms，但 secondary media pump 每轮都先调用它，已经处理完的库仍重复执行扩展名后缀扫描、多个 jobs/artifact 反连接和忽略规则子查询，累计约 22.6 秒。
+
+- 为每库、generation 维护 RAW metadata admission cursor 与 `exhausted` 状态；扫描到尾后不再重查，只有新增 RAW、revision 变化、用户 retry 或相关忽略规则变化才精确失效。
+- 资产入库时已经知道扩展名/媒体类型，应持久化规范化分类并建立候选索引，避免每轮对 `LOWER(relative_file_path) LIKE '%后缀'` 做全资产扫描。迁移必须兼容旧库并后台分批回填。
+- 活跃/成功/失败状态应由一条可索引的唯一 admission policy 查询表达，避免同一 asset/revision 对 jobs 表执行三组相关反连接；claim 前仍做最终防竞态校验。
+- 每轮只读取游标后的有界候选，时间片同时受条数和连续执行毫秒预算约束；空结果后不得靠定时器不断从头再扫。
+- 临时实验中简单建立 RAW id 临时表反而使查询更慢，不能照搬；正式方案必须以 `EXPLAIN QUERY PLAN` 和 20k/真实库 A/B 证明选中索引与扫描行数。
+
 ## 4. 工单分解与依赖
 
-本文先后新增七个窄工单：
+本文先后新增八个窄工单：
 
 | 工单 | 范围 | 与既有 PERF2 的关系 |
 | --- | --- | --- |
 | `Serpent-26f22b` | 对账探针去放大与阶段指标 | PERF2-07 的实现前置 |
-| `Serpent-e97c00` | 任务状态事件化、single-flight 与有界兜底轮询 | `Serpent-52eed4` 的剩余根因；独立于只读进程先落地 |
+| `Serpent-e97c00` | 任务摘要/列表拆分、增量状态与面板按需分页 | 原 single-flight 实现已证伪，需按 §3.3 重做 |
 | `Serpent-1de919` | ready artifact 与 queued 派生任务收敛 | PERF2-09 的队列正确性前置 |
-| `Serpent-be29a9` | reconciliation 时间片归还 background admission | PERF2-07 的调度前置；直接消除本次优先级反转 |
-| `Serpent-8ee170` | thumbnail 完成事件的 drag-cache 请求有界合并 | 可由 Luna High 独立实施的小边界 |
-| `Serpent-217028` | 2,000 后台任务下的端到端 navigation span 与回放基准 | 前台资源预算的测量前置 |
+| `Serpent-be29a9` | reconciliation continuation 真正归还 background admission | 原批次 yield 只让交互/写抢占，仍需完成 continuation；排在关键路径修正之后 |
+| `Serpent-8ee170` | 从浏览关键路径移除 drag prime，取消全结果预热 | 原“分批合并”方案制造约 68 秒优先级反转，需按 §3.4 重做 |
+| `Serpent-217028` | 修正 profiler 判据与 Main 后处理端到端 span | 所有优化 A/B 的最高优先级前置 |
+| `Serpent-288cd9` | RAW metadata admission 游标/exhaustion 与可索引分类 | PERF2-09 的独立前置；消除累计 22.6 秒空结果重扫 |
 | `Serpent-7ac453` | foreground epoch、资源保留与后台媒体自适应降载 | 依赖 `Serpent-217028` |
 
 既有工单继续承担其原边界：
@@ -187,7 +243,16 @@ Scheduler 当前只决定命令何时开始，自动媒体 pump 还会与浏览�
 - `Serpent-aea5b9` / PERF2-08：媒体描述符与本地缓存直达。
 - `Serpent-312c29` / PERF2-09：元数据队列预算和维护事务预算。
 
-建议实施顺序：先并行完成 `Serpent-e97c00`、`Serpent-8ee170` 和 `Serpent-217028`，停止请求放大并补齐因果测量；随后实施 `Serpent-be29a9`，让 maintenance 真正归还许可；基于同一回放结果实施 `Serpent-7ac453`。PERF2-02 → 03 → 04 继续承担最终导航读隔离，`Serpent-26f22b` 与 PERF2-07 降低对账总成本，PERF2-08 负责热预览绕过写 owner，`Serpent-1de919` 完成后再统一 PERF2-09 的后台预算。涉及 `LibraryService`、`App.tsx`、Main 入口时仍需串行文件所有权。
+新的顺序禁止并行抢跑：
+
+1. **PERF2-P0A / `Serpent-217028`**：先修正 profile 判据并加入 Renderer → Main → Worker → Main 后处理 → Renderer commit 的相关 span。timeout 作为失败状态单列，不写成耗时样本。
+2. **PERF2-P0B / `Serpent-8ee170`**：移除同步 drag prime 与全结果后台预热；以同一真实库证明一分钟尾延迟消失。
+3. **PERF2-P0C / `Serpent-e97c00`**：拆分摘要/列表，关闭面板时停止完整任务列表查询；为最近页加排序索引，再证明 344 秒旅程中不再出现 933 次重查。
+4. **PERF2-P0D / `Serpent-288cd9`**：加入 RAW admission cursor/exhaustion 与可索引分类，清掉累计 22.6 秒的空结果扫描；完成后再并入 `Serpent-312c29` 的整体元数据预算。
+5. **PERF2-P1 / `Serpent-be29a9`、`Serpent-26f22b`、`Serpent-777a14`**：再把 reconciliation 改成真正返回/重新入队的 continuation，并收口 `lstat` 放大。
+6. **重新决策架构升级**：只有完成 P0/P1 A/B 后，才依据剩余的 browse/preview profile 决定是否继续 `Serpent-6dc70b` → `Serpent-0ecab5` → `Serpent-078a15` 的独立只读进程路线。独立进程无法修复 Main 自己等待后台 drag prime，也无法消除 Renderer 主动制造的查询风暴，当前不得把它当作默认下一步。
+
+`Serpent-7ac453` 的前台资源预算在上述自制造负载清除后再调参；否则 governor 会把错误请求模式隐藏成限流问题。PERF2-08 继续负责热预览绕过写 owner，`Serpent-1de919` 负责 ready artifact 收敛。涉及 `LibraryService`、`App.tsx`、Main 入口时仍需串行文件所有权。
 
 ## 5. 自动化与验收矩阵
 
@@ -196,12 +261,13 @@ Scheduler 当前只决定命令何时开始，自动媒体 pump 还会与浏览�
 | 有效 artifact 不发生逐文件 `lstat` | 构造大量已引用 artifact，断言 probe 数接近真实孤儿候选数；目录/DB最终一致 | 本地冷/热实测；Windows Defender、SMB 分列 |
 | reconciliation 中仍可导航 | 实际 barrier 阻塞写 owner，新文件夹由独立读路径先返回 | 真实 Electron 连续 A→B→C；不能只看选中态 |
 | 热缓存绕过 owner | 阻塞 `media.get-artifact-paths`，完整重启后缓存图片仍 `complete && naturalWidth > 0` | 本地与 SMB；视频 Range 单列 |
-| 状态请求有界 | 阻塞 owner 30 秒，逐类 pending/in-flight 数保持 O(1)，过期响应不跨库 | 任务面板开/关、窗口隐藏/恢复 |
+| 状态请求不制造负载 | 面板关闭的浏览旅程 `media.list-jobs=0`；2,000 完成事件只产生 O(1) 摘要增量；最近页命中排序索引 | 任务面板开/关、窗口隐藏/恢复，计数最终一致 |
 | maintenance 让步归还许可 | barrier 阻塞一个 reconciliation 时间片，路径请求在片间先返回；continuation 最终完成 | 2,000 任务运行中连续切换文件夹 |
-| thumbnail 事件请求有界 | 突发 2,000 个完成事件，drag-cache Worker 调用与 pending 保持有界 | 冷拖拽与热拖拽均可用 |
+| drag prime 不阻塞浏览 | browse Worker 返回后 Main 后处理 <50 ms；无拖拽意图时 drag-info 请求为 0 或严格限于可见窗口 | 冷拖拽与热拖拽均可用，快速出现后立即拖拽单列 |
 | 前台资源预算 | 同一 fixture 对比任务运行/暂停，记录 claim、decode、DB、I/O 与首图 p50/p95/max；无 timeout 和 abort 循环 | 本地、SMB、Windows 分列 |
 | ready artifact 与 queued job 收敛 | 打开恢复、重复入队、claim 前竞态、生成器换版分别覆盖 | 大库任务数量和后台吞吐对照 |
-| 切换首屏预算 | 首屏前无全范围 IDs/精确 COUNT；严格统计全部可见图片 | 本地 20k、真实 SMB、Windows/packaged 未跑则标未验证 |
+| RAW admission 不重扫 | exhausted 后连续 100 个 secondary turn 不再执行候选全扫；新增/换 revision 精确失效 | 大 RAW 库后台吞吐与 Inspector 最终一致 |
+| 切换首屏预算 | 只选择已确认非空且内容不同的 scope；scope active、目标 generation 首卡、90%/100% 解码分段记录；任何 timeout 直接失败 | 本地 20k、真实库任务运行/暂停同场 A/B、SMB、Windows/packaged 未跑则标未验证 |
 
 任何资源库打开、对账、任务恢复或协议修改都必须完整运行 `npm run test:library-availability`。跨 Main/Worker/Renderer 和媒体协议修改必须运行真实 Electron E2E，使用隔离 userData，后台串行执行，并清理本次产物。最终大功能完成后按仓库规则由一个独立审查 agent 同时做 Standards 与 Spec 双轴审查；用户本人确认前不得把 UI 条目标为人类验收通过。
 
@@ -215,3 +281,6 @@ Scheduler 当前只决定命令何时开始，自动媒体 pump 还会与浏览�
 - 不用清空所有派生任务或 artifact 的方式掩盖队列状态漂移。
 - 不把 `media.get-artifact-paths` 简单塞回现有 interactive lane；网络路径解析可能重新占住唯一交互许可。
 - 不把提高 Worker timeout、无界增加解码并发或“导航时暂停全部任务”当作正式优化。
+- 不在向 Renderer 返回浏览结果前 `await` 任何标为 background 的辅助预热；静态 lane 不得掩盖调用点的真实关键路径语义。
+- 不把“事件到达后立即全量查询”称为事件化，也不以 single-flight 证明查询频率已经有界。
+- 不把 30/60 秒 timeout 常量写进 p50/p95；timeout 必须作为失败计数并使性能验收失败。

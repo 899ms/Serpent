@@ -1037,7 +1037,14 @@ function scheduleOpenBackgroundReconciliation(
       },
       () => traceActivity(
         `open-reconciliation:${libraryId}`,
-        async () => libraryService.runOpenBackgroundReconciliation(libraryId),
+        async () => libraryService.runOpenBackgroundReconciliation(libraryId, {
+          // Serpent-be29a9: this pass runs in 60-asset batches for many seconds.
+          // Release the single background admission between batches whenever an
+          // interactive request or mutation is waiting.
+          admissionYield: () => interactiveScheduler.yieldAdmission(
+            `reconciliation:${libraryId}:${libraryGeneration}`,
+          ),
+        }),
       ),
       { cancel: () => libraryService.cancelOpenBackgroundReconciliation(libraryId) },
     );

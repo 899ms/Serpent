@@ -285,6 +285,7 @@ import {
   hasActivePluginJobs,
   selectPluginJobActivity,
 } from "./plugin-job-activity";
+import { JobStatusCoordinator } from "./job-status-coordinator";
 import { useScrollbarActivity } from "./use-scrollbar-activity";
 import { splitFilenameForDisplay } from "./filename-display";
 
@@ -2306,13 +2307,20 @@ function AppInner() {
     const aiActive = (aiJobs?.queued ?? 0) + (aiJobs?.running ?? 0) > 0;
     return mediaActive || aiActive || pluginJobsActive;
   }, [aiAnalyzing, aiJobs, mediaJobs, pluginJobsActive]);
-  const openMediaJobs = useCallback(() => setMediaJobsOpen(true), []);
+  const openMediaJobs = useCallback(() => {
+    // Matches the previous behaviour: opening the panel shows its loading state
+    // until the coordinator's immediate refresh settles.
+    setMediaJobsLoading(true);
+    setMediaJobsOpen(true);
+  }, []);
   const hidePluginJobActivity = useCallback((jobId: string) => {
     setHiddenPluginJobActivityId(jobId);
   }, []);
   const controlAiJobsRef = useRef<
     (action: "pause" | "resume" | "cancel" | "retry", jobIds?: string[]) => Promise<void>
   >(async () => undefined);
+  /** Serpent-e97c00: bounded fallback status polling for the open library. */
+  const jobStatusCoordinatorRef = useRef<JobStatusCoordinator | null>(null);
   const {
     gate: aiConnectionFailureGate,
     notifyBatchStarted: notifyAiConnectionBatchStarted,
@@ -4388,6 +4396,8 @@ function AppInner() {
     };
     const unsubscribe = api.onThumbnailEvent((event) => {
       if (event.libraryId !== effectLibraryId || !isEffectLibraryCurrent()) return;
+      // A completion event is the cheapest status signal the panel has.
+      jobStatusCoordinatorRef.current?.noteActivity("media");
       if (event.type === "asset.dimensions.ready") {
         queuePatch(event.assetId, {
           width: event.width,
@@ -4506,6 +4516,9 @@ function AppInner() {
     if (!api || !library) return;
     const unsubscribeProgress = api.onAiProgress((event) => {
       if (event.libraryId !== library.libraryId) return;
+      // Progress events already carry the counts; the fallback poll only needs
+      // to learn that AI work exists (and stop backing off).
+      jobStatusCoordinatorRef.current?.noteActivity("ai");
       // Serpent-u0tn: do not arm analyzing UI for background/import auto jobs
       // when no user-initiated batch size was set (JOBS-007 rollback residue).
       setAiJobs((current) =>
@@ -4531,6 +4544,7 @@ function AppInner() {
     });
     const unsubscribeCompleted = api.onAiCompleted((event) => {
       if (event.libraryId !== library.libraryId) return;
+      jobStatusCoordinatorRef.current?.noteActivity("ai");
       // Refresh only — completion toast is owned by queue-drain (Serpent-4i18).
       void reloadCurrentContentRef.current();
       if (selectedAssetIdRef.current === event.assetId) {
@@ -4543,6 +4557,7 @@ function AppInner() {
     });
     const unsubscribeCleared = api.onAiCleared((event) => {
       if (event.libraryId !== library.libraryId) return;
+      jobStatusCoordinatorRef.current?.noteActivity("ai");
       setAiContent(null);
       setNotice(t("toast.aiContentCleared", { count: event.affectedAssetCount }));
       // Serpent-c9r3: clearing AI must NOT disturb the browsing view, selection
@@ -11266,68 +11281,83 @@ function AppInner() {
   };
 
   useEffect(() => {
-    if (!mediaJobsOpen || !library || !api) return;
-    let active = true;
-    const poll = async () => {
-      try {
-        const [mediaResult, aiResult, pluginResult] = await Promise.all([
-          api.listMediaJobs({ libraryId: library.libraryId }),
-          api.getAiJobStatus({ libraryId: library.libraryId }),
-          api.listPluginJobs({ libraryId: library.libraryId }),
-        ]);
-        if (active && mediaResult.ok) setMediaJobs(mediaResult.value);
-        if (active && aiResult.ok) setAiJobs(aiResult.value);
-        if (active && pluginResult.ok) setPluginJobs(pluginResult.value);
-      } catch {
-        // Keep the last known task state during a transient Worker restart.
-      } finally {
-        if (active) setMediaJobsLoading(false);
+    // Serpent-e97c00: one bounded, coalesced fallback stream per open library.
+    // Worker events stay the primary source; this only catches missed ones, and
+    // it never queues a second request for a kind that is already in flight —
+    // a Worker blocked for 30 seconds can therefore not accumulate 30 requests.
+    if (!api || !library) return;
+    const libraryId = library.libraryId;
+    const mediaActive = (value: MediaJobStatus | null) =>
+      (value?.queued ?? 0) + (value?.running ?? 0) > 0;
+    const aiActive = (value: AiJobStatus | null) =>
+      (value?.queued ?? 0) + (value?.running ?? 0) > 0;
+    const coordinator = new JobStatusCoordinator({
+      probes: {
+        media: async () => {
+          const result = await api.listMediaJobs({ libraryId });
+          return result.ok ? { value: result.value, active: mediaActive(result.value) } : null;
+        },
+        ai: async () => {
+          const result = await api.getAiJobStatus({ libraryId });
+          return result.ok ? { value: result.value, active: aiActive(result.value) } : null;
+        },
+        plugin: async () => {
+          const result = await api.listPluginJobs({ libraryId });
+          return result.ok
+            ? { value: result.value, active: hasActivePluginJobs(result.value) }
+            : null;
+        },
+      },
+      onResult: (kind, value) => {
+        if (kind === "media") setMediaJobs(value as MediaJobStatus);
+        else if (kind === "ai") setAiJobs(value as AiJobStatus);
+        else setPluginJobs(value as PluginJobStatus);
+        // Diagnostics for the performance benchmark; counts only, no identifiers.
+        (
+          globalThis as unknown as { __serpentJobStatusStats?: unknown }
+        ).__serpentJobStatusStats = coordinator.stats();
+      },
+      onSettled: (kind) => {
+        if (kind === "media") setMediaJobsLoading(false);
+      },
+    });
+    jobStatusCoordinatorRef.current = coordinator;
+    coordinator.setHidden(document.hidden);
+    coordinator.start();
+    // A hidden window keeps its last known task state instead of polling.
+    const onVisibilityChange = () => coordinator.setHidden(document.hidden);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      coordinator.stop();
+      if (jobStatusCoordinatorRef.current === coordinator) {
+        jobStatusCoordinatorRef.current = null;
       }
     };
-    const initial = window.setTimeout(() => {
-      if (active) setMediaJobsLoading(true);
-      void poll();
-    }, 0);
-    const timer = window.setInterval(() => void poll(), 1_000);
-    return () => {
-      active = false;
-      window.clearTimeout(initial);
-      window.clearInterval(timer);
-    };
-  }, [api, library, mediaJobsOpen]);
+  }, [api, library]);
 
   useEffect(() => {
-    if (!library || !api) return;
-    let active = true;
-    const poll = async () => {
-      try {
-        const [mediaResult, aiResult, pluginResult] = await Promise.all([
-          api.listMediaJobs({ libraryId: library.libraryId }),
-          api.getAiJobStatus({ libraryId: library.libraryId }),
-          api.listPluginJobs({ libraryId: library.libraryId }),
-        ]);
-        if (active && mediaResult.ok) setMediaJobs(mediaResult.value);
-        if (active && aiResult.ok) setAiJobs(aiResult.value);
-        if (active && pluginResult.ok) setPluginJobs(pluginResult.value);
-      } catch {
-        // Keep the last known task state during a transient Worker restart.
-      }
-    };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 1_000);
+    // Opening the panel tightens the cadence and re-enables event-driven
+    // refreshes; closing it drops browsing back to the slow fallback so the
+    // canvas does not pay for status queries it never displays.
+    jobStatusCoordinatorRef.current?.setPanelOpen(mediaJobsOpen);
+    jobStatusCoordinatorRef.current?.setEventDrivenQueries(mediaJobsOpen);
+  }, [mediaJobsOpen]);
+
+  useEffect(() => {
+    // Plugin work announces completion; treat it as a status change instead of
+    // waiting for the next fallback tick.
     const onPluginCommandCompleted = (event: Event) => {
       const detail = (event as CustomEvent<{ libraryId?: string }>).detail;
-      if (!detail?.libraryId || detail.libraryId === library.libraryId) {
-        void poll();
+      if (!detail?.libraryId || detail.libraryId === library?.libraryId) {
+        jobStatusCoordinatorRef.current?.noteActivity("plugin");
       }
     };
     window.addEventListener("serpent:plugin-command-completed", onPluginCommandCompleted);
     return () => {
-      active = false;
-      window.clearInterval(timer);
       window.removeEventListener("serpent:plugin-command-completed", onPluginCommandCompleted);
     };
-  }, [api, library]);
+  }, [library]);
 
   async function controlMediaJobs(
     action: "pause" | "resume" | "cancel" | "retry",

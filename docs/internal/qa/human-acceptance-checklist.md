@@ -298,6 +298,7 @@
 | ID | 功能 | 状态 | 人类操作 | 预期结果 | 证据 | 结果/反馈 |
 | --- | --- | --- | --- | --- | --- | --- |
 | MEDIA-PERF-004 | 大库自动色卡补齐吞吐 | 待人类验收 | 在万级真实资源库导入或首次打开后观察 Inspector 色卡与颜色筛选的补齐速度；补齐期间持续滚动浏览、切换文件夹并观察卡片与滚动是否跟手 | 色卡后台补齐不与首屏/可见卡片抢资源；浏览、滚动、切文件夹始终可交互；万级库色卡补齐不再需要几十分钟 | [2026-09-14 开发日志](../development/2026-09-14-palette-extraction-throughput-development-log.md) / `tests/worker/palette-benchmark.test.ts` / `tests/unit/palette-extractor-equivalence.test.ts` / `scripts/run-palette-benchmark.mjs` / `src/worker/index.ts` | 自动化：200 张真实图片基准实测二级泵 12.57 → 56.86 张/秒（2 万线性投影 26.5 → 5.9 分钟），2 MP 帧提取 2.78× 且输出逐字节不变；真实 2 万库端到端计时、交互响应性真机观测、NAS/SMB、Windows、packaged、Computer Use 未执行 |
+| NAV-PERF-001 | 大库对账期间导航不再排 28 秒队（交互请求可抢占后台维护） | 待人类验收 | 打开万级真实资源库，在后台任务/对账进行中连续切换文件夹与合集、上下滚动、打开查看器；观察选中态、内容切换与滚动是否跟手 | 点击后内容在 1 秒量级内切换，不再出现半分钟无响应；后台对账仍能推进并最终收敛；状态轮询不再堆积 | [2026-09-14 开发日志](../development/2026-09-14-folder-switch-and-resource-loading-optimization-development-log.md) / `tests/e2e/navigation-perf-benchmark.test.ts` / `scripts/run-navigation-benchmark.mjs` / `tests/unit/interactive-scheduler-admission-yield.test.ts` / `tests/unit/job-status-coordinator.test.ts` / `tests/unit/native-asset-drag-prime-scheduler.test.ts` / `src/worker/interactive-scheduler.ts` | 自动化（真实 4.3 万资产库，同旅程前后对比）：`browse.session.open` 最大准入等待 28,325 → 1,374 ms、`folder.browse-entries` 28,327 → 1,167 ms、`asset.search` 28,451 → 2,443 ms；状态轮询 p95 等待 29.2 s → 0.2 ms；拖拽预热请求 535 → 44 次。未执行：Windows、SMB/NAS、packaged、真实 2 万夹具、Computer Use、任务面板/窗口隐藏 E2E；一次运行出现 Worker `0xFFFFFFFF` 退出未复现 |
 
 ### 2026-08-25 媒体任务资源安全与查看器回退
 

@@ -3447,6 +3447,12 @@ interface OpenReconciliationTask {
   openLibrary: OpenLibrary;
   promise: Promise<void>;
   reason: 'open' | 'watcher' | 'network';
+  /**
+   * Serpent-be29a9: release the scheduler's background admission at a safe
+   * point and take it back before the next batch. Supplied by the Worker, which
+   * owns the scheduler; absent for reconciliations the Worker did not schedule.
+   */
+  admissionYield?: () => Promise<void>;
 }
 
 interface ArtifactPathCacheEntry {
@@ -27525,18 +27531,33 @@ export class LibraryService {
 
     let removed = 0;
     let scanned = 0;
+    let enumerated = 0;
+    let probed = 0;
+    let skippedReferenced = 0;
+    const scanStartedAt = performance.now();
     const now = Date.now();
     const directory = await opendirAsync(artifactsRoot);
     try {
       for (;;) {
         const entry = await directory.read();
         if (entry === null) break;
+        enumerated += 1;
         // Normalization writes `<uuid>.tmp` before its atomic final rename;
         // leave temporary files to the existing job cleanup path.
         if (entry.name.startsWith('.') || entry.name.endsWith('.tmp')) continue;
         const candidatePath = path.join(artifactsRoot, entry.name);
+        // Serpent-26f22b: consult the reference set *before* the filesystem.
+        // This directory holds tens of thousands of artifacts and nearly every
+        // one is still referenced, so probing first spent the whole scan on
+        // paths the database already accounted for (measured on a 44k-asset
+        // library: 17.2 s of `artifact-orphan-cleanup` per open).
+        if (referencedPaths.has(candidatePath)) {
+          skippedReferenced += 1;
+          continue;
+        }
         let entryStat: Awaited<ReturnType<typeof lstatAsync>>;
         try {
+          probed += 1;
           entryStat = await lstatAsync(candidatePath);
         } catch {
           continue;
@@ -27544,7 +27565,6 @@ export class LibraryService {
         if (
           !entryStat.isFile()
           || entryStat.isSymbolicLink()
-          || referencedPaths.has(candidatePath)
           || now - entryStat.mtimeMs < ORPHAN_ARTIFACT_GRACE_MS
         ) continue;
         try {
@@ -27561,6 +27581,21 @@ export class LibraryService {
       }
     } finally {
       await directory.close();
+    }
+    // Stage metrics for the reconciliation perf ticket: enumeration, probes,
+    // candidates excluded by reference and actual removals are separate numbers.
+    if (process.env.SERPENT_REFRESH_STAGE_LOG === '1') {
+      console.error(JSON.stringify({
+        scope: 'open.reconciliation.stage',
+        libraryId: openLibrary.summary.libraryId,
+        stage: 'artifact-orphan-scan',
+        enumerated,
+        probed,
+        skippedReferenced,
+        referencedPaths: referencedPaths.size,
+        candidates: removed,
+        durationMs: Math.round((performance.now() - scanStartedAt) * 100) / 100,
+      }));
     }
     return removed;
   }
@@ -28070,7 +28105,10 @@ export class LibraryService {
    * has been delivered; each step yields the event loop so the user's first
    * browse requests are not starved behind a large-library rescan.
    */
-  async runOpenBackgroundReconciliation(libraryId: string): Promise<void> {
+  async runOpenBackgroundReconciliation(
+    libraryId: string,
+    options?: { admissionYield?: () => Promise<void> },
+  ): Promise<void> {
     const openLibrary = this.openById.get(libraryId);
     if (!openLibrary || openLibrary.readOnly) return;
     this.cancelDeferredOpenMaintenance(libraryId);
@@ -28085,6 +28123,7 @@ export class LibraryService {
       openLibrary,
       promise: Promise.resolve(),
       reason: 'open',
+      ...(options?.admissionYield === undefined ? {} : { admissionYield: options.admissionYield }),
     };
     this.reconciliationByLibrary.set(libraryId, task);
     const stageLog = process.env.SERPENT_REFRESH_STAGE_LOG === '1';
@@ -41714,6 +41753,13 @@ export class LibraryService {
   private async yieldReconciliation(task: OpenReconciliationTask): Promise<void> {
     this.assertReconciliationActive(task);
     await new Promise<void>((resolve) => setImmediate(resolve));
+    this.assertReconciliationActive(task);
+    // Serpent-be29a9: hand the background admission back before parking. The
+    // scheduler admits a queued interactive request or mutation immediately
+    // instead of waiting for this pass to finish (measured: 28.3 s of
+    // navigation wait behind one open reconciliation that ran up to 25.8 s as a
+    // single admitted task). No-op when nothing is waiting.
+    await task.admissionYield?.();
     this.assertReconciliationActive(task);
     // A single 100ms sleep is not an idle window: it merely delays the next
     // synchronous stage while the user is still interacting. The old code

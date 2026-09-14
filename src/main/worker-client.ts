@@ -239,9 +239,16 @@ export class LibraryWorkerClient {
   }
 
   async #startAttempt(attempt: number): Promise<void> {
+    // Profiling hook: `SERPENT_WORKER_INSPECT=<port>` starts the Library Worker
+    // with a V8 inspector so an operator benchmark can attach a CPU profiler to
+    // the process that owns SQLite and the filesystem. Never set in production.
+    const inspectPort = process.env.SERPENT_WORKER_INSPECT;
     const child = utilityProcess.fork(this.#modulePath, [], {
       serviceName: 'Serpent Library Worker',
       stdio: 'pipe',
+      ...(inspectPort && /^\d+$/.test(inspectPort)
+        ? { execArgv: [`--inspect=127.0.0.1:${inspectPort}`] }
+        : {}),
       // GUI / UtilityProcess PATH often omits user-installed ffmpeg; pin
       // absolute bundled/dev media CLIs so video posters match hover preview.
       env: mediaBinaryWorkerEnv(this.workerEnvironment),
