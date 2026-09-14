@@ -580,8 +580,19 @@ export class InteractiveScheduler {
       .filter((entry) => entry.request.lane === 'mutation');
     const hasActiveMutation = activeMutations.length > 0;
     const hasQueuedMutation = this.#queue.some((entry) => entry.request.lane === 'mutation');
-    const activeInteractive = [...this.#active]
-      .filter((entry) => isInteractivePerformanceLane(entry.request.lane)).length;
+    const activeInteractiveEntries = [...this.#active]
+      .filter((entry) => isInteractivePerformanceLane(entry.request.lane));
+    const activeInteractive = activeInteractiveEntries.length;
+    /**
+     * Serpent-52eed4（真实实例日志 2026-09-14）：`media.get-preview-artifact` 是
+     * viewer-upgrade，单次可跑 5.6–15.7 秒（冷预览/RAW/OIIO 解码或插件）。它占着
+     * 唯一交互槽时，`browse.session.open` / `folder.browse-entries` /
+     * `asset.thumbnail.visible-window` 全部排队——用户看到的就是「切一个文件夹卡 20 秒」。
+     * 导航属于 interactive-control：允许它在 viewer-upgrade 正在跑时另开一个槽，
+     * 但导航之间仍串行、且同一时刻仍只允许一个 viewer-upgrade。
+     */
+    const activeInteractiveControl = activeInteractiveEntries
+      .filter((entry) => entry.request.lane === 'interactive-control').length;
     const activeBackgroundEntries = [...this.#active]
       .filter((entry) => isBackgroundPerformanceLane(entry.request.lane));
     const activeBackground = activeBackgroundEntries.length;
@@ -612,7 +623,13 @@ export class InteractiveScheduler {
         : hasActiveMutation
           ? mayReadDuringOtherLibraryClose
           : isInteractivePerformanceLane(lane)
-            ? activeInteractive < 1
+            ? (lane === 'interactive-control'
+              // 只针对长耗时的 viewer-upgrade（冷预览/RAW 解码）另开槽；visible-media
+              // 仍需保持原来的串行，否则「变更需要完全空闲」的保证会被破坏。
+              ? activeInteractiveControl < 1
+                && activeInteractiveEntries.every((entry) =>
+                  entry.request.lane !== 'visible-media')
+              : activeInteractive < 1)
             : !hasQueuedMutation
               && (activeBackground < 1 || (lane === 'background-primary' && onlyMaintenanceActive));
       if (!canStart) continue;

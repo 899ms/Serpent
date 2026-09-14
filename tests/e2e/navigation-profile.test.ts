@@ -42,6 +42,7 @@ const outDir = process.env.SERPENT_PROFILE_OUT;
 const workerInspectPort = Number(process.env.SERPENT_WORKER_INSPECT ?? 9333);
 const wheelMs = Number(process.env.SERPENT_PROFILE_WHEEL_MS ?? 8_000);
 const navTarget = process.env.SERPENT_PROFILE_NAV_TARGET;
+const contended = process.env.SERPENT_PROFILE_CONTENDED === "1";
 const switches = Number(process.env.SERPENT_PROFILE_SWITCHES ?? 4);
 
 test.describe.configure({ timeout: 1_800_000 });
@@ -191,6 +192,7 @@ async function waitForAllVisibleThumbnails(
 ): Promise<{ elapsedMs: number; imageCards: number; decoded: number; placeholders: number; timedOut: boolean }> {
   const startedAt = Date.now();
   let last: { imageCards: number; decoded: number; placeholders: number };
+  let emptySamples = 0;
   for (;;) {
     const sample = await window.evaluate(() => {
       const canvas = document.querySelector<HTMLElement>(".workspace-canvas");
@@ -214,6 +216,16 @@ async function waitForAllVisibleThumbnails(
     last = sample;
     if (last.placeholders === 0 && last.imageCards > 0 && last.decoded === last.imageCards) {
       return { ...last, elapsedMs: Date.now() - startedAt, timedOut: false };
+    }
+    // 目标 scope 里没有可见图片卡（空文件夹/非图片）：没有等待对象，
+    // 连续两次采样确认后立即返回，不能把这个当超时。
+    if (last.imageCards === 0 && last.placeholders === 0) {
+      emptySamples += 1;
+      if (emptySamples >= 2) {
+        return { ...last, elapsedMs: Date.now() - startedAt, timedOut: false };
+      }
+    } else {
+      emptySamples = 0;
     }
     if (Date.now() - startedAt >= timeoutMs) {
       return { ...last, elapsedMs: Date.now() - startedAt, timedOut: true };
@@ -281,6 +293,29 @@ test("profile navigation hotspots on a real library", async () => {
       record("target.placeholders", thumbs.placeholders);
       record("target.totalMs", Date.now() - clickAt);
       console.info(`NAV_TARGET ${JSON.stringify({ changedMs: changed, thumbs, totalMs: Date.now() - clickAt })}`);
+    }
+
+    if (contended) {
+      // 复现用户实例日志里的争用：media.get-preview-artifact（viewer-upgrade）单次跑
+      // 5.6–15.7 秒时，切文件夹是否还能拿到交互槽。
+      await window.locator(".navigation-pane button.nav-row").first().click();
+      await window.waitForTimeout(1_500);
+      const rows = window.locator(".navigation-pane button.nav-row");
+      const rowCount = await rows.count();
+      for (let index = 0; index < 3; index += 1) {
+        const card = window.locator(".asset-card[data-media-type='image']").first();
+        if (await card.count() === 0) break;
+        await card.dblclick();
+        // 不等待查看器渲染完：立刻切文件夹，模拟“预览在解码时导航”。
+        await window.locator(".navigation-pane button.nav-row").nth(1 + (index % Math.max(1, rowCount - 1))).click();
+        const startedAt = Date.now();
+        const thumbs = await waitForAllVisibleThumbnails(window, 60_000);
+        record("contended.allThumbnailsMs", thumbs.elapsedMs);
+        record("contended.totalMs", Date.now() - startedAt);
+        record("contended.imageCards", thumbs.imageCards);
+        await window.keyboard.press("Escape").catch(() => undefined);
+        await window.waitForTimeout(500);
+      }
     }
 
     // --- folder switches, measured by real content change ---

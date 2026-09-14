@@ -345,3 +345,36 @@ preview-cache: 281 miss / 281 store，其中 15:29:37 → 15:30:19 有 42 秒完
 - `Serpent-217028`：基准已交付；随机 scope 判据仍有假阴性（新卡片数为 0 时等满预算），`navigationId` 未贯穿协议层。
 - 待开新单：**形状随浏览页下发**（`revisions.source_width/height` 为空时才逐条 `asset.dimensions.ready` 修正，导致整页几何反复重算）。
 - 未验证：Windows、SMB/NAS、packaged、真实 2 万夹具、Computer Use；四次 profile 运行中有一次出现 Worker `0xFFFFFFFF` 退出（未复现，无 JS 报错）。
+
+## 13. 第四轮实施：导航不再被长预览挡住交互槽（用户实例日志驱动）
+
+### 13.1 证据（用户当前实例日志 `%APPDATA%\Serpent\logs`，2026-09-14 23:57–00:02）
+
+```
+15:58:38 STALL waited=2009  active=reconciliation(maintenance, run=55,781ms)  queued=45（~40 条 sync.poll-remote）
+16:00:53 STALL waited=2007  active=media.get-preview-artifact(viewer-upgrade, run=12,539ms)  queued=15: browse.session.open, asset.thumbnail.visible-window, …
+16:01:23 STALL waited=2010  active=media.get-preview-artifact(viewer-upgrade, run=11,231ms)  queued=8: browse.session.open, folder.browse-entries, …
+16:01:43 STALL waited=2005  active=media.get-preview-artifact(viewer-upgrade, run=15,707ms)  queued=5
+15:59:11 STALL active=ai.test-connection(background-secondary, run=3,665ms)
+```
+
+`media.get-preview-artifact` 是 viewer-upgrade（冷预览/RAW/OIIO 解码、插件），单次 5.6–15.7 秒，却占着**唯一**交互槽，导航与可见缩略图只能排在后面 → 用户体感「切一个 30+ 文件的文件夹卡 20 秒」。
+
+### 13.2 改动
+
+`src/worker/interactive-scheduler.ts`：interactive-control（导航）在 **viewer-upgrade 正在跑时**可另开一个槽；明确**不允许**与 `visible-media` 并行，保住「变更需要完全空闲」的既有保证。首次放宽过头（导航可与 visible-media 并行）被既有测试 `does not starve a library transition behind the interactive backlog` 抓住，收窄后 28 个调度器测试全绿。
+
+### 13.3 实测
+
+| 场景 | 结果 |
+| --- | --- |
+| 预览在解码时切文件夹（`SERPENT_PROFILE_CONTENDED=1`，19 张可见卡） | **45 / 126 ms** |
+| 对照：改前实例日志 | 预览 run 5.6–15.7 s，`browse.session.open`/`folder.browse-entries` 排队 2 s+（队列 5–15 条） |
+| 滚轮 8 s | frameP95 6.8 ms、frameMax 11.7 ms、long task 0 |
+
+判据修正：目标 scope 无可见图片卡（空文件夹/非图片）时不再空等到 60/90 秒，连续两次采样确认后即返回。
+
+### 13.4 本窗口 Worker 热点与剩余阻塞
+
+- `mf`（指纹计算）**10.4 s** 成为第一自耗，`lstat` 11.6 s、`readdir` 1.3 s、`all()` ≈ 2.5 s（对应 §3.1/§3.9 与 `Serpent-26f22b`）。
+- 用户实例日志里仍可见：`sync.poll-remote` 把维护队列堆到 45 条；`ai.test-connection` 反复占用后台槽 2–3 秒。两者都需要 single-flight/合并/退避。
