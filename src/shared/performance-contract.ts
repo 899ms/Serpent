@@ -242,11 +242,27 @@ const VIEWER_UPGRADE_COMMANDS = new Set([
   'model.convert-fbx',
 ]);
 
+/**
+ * The user is waiting on this result: folder/collection switch, search, and
+ * the first browse page. These keep the exclusive `interactive-control` slot.
+ *
+ * Cheap path lookups and 1s status polls used to live here (or fall through
+ * to this default) and starved navigation on a packaged network library.
+ */
 const INTERACTIVE_CONTROL_COMMANDS = new Set([
-  'media.get-artifact-path',
-  'media.get-artifact-paths',
-  'media.get-thumbnail-artifact',
-  'media.get-source-path',
+  'asset.search',
+  'asset.list',
+  'asset.list-trash',
+  'folder.list',
+  'folder.browse-entries',
+  'folder.list-trashed',
+  'linked-folder.list',
+  'collection.list',
+  'collection.assets.list',
+  'browse.session.open',
+  'browse.session.page',
+  'browse.session.ids',
+  'browse.session.close',
 ]);
 
 const VISIBLE_MEDIA_COMMANDS = new Set([
@@ -278,8 +294,20 @@ const BACKGROUND_PRIMARY_COMMANDS = new Set([
    *
    * Priming only has to be ready before the *user* starts a drag, never before
    * a library/folder switch, so it belongs in a lane that yields.
+   *
+   * Source/artifact path lookups used to sit on `interactive-control` with
+   * browse. A packaged network session logged ten `serpent://source` resolves
+   * for one asset; each held the only user-facing slot and made folder clicks
+   * look like a frozen mouse. They yield like drag priming.
    */
   'media.get-asset-drag-infos',
+  'media.get-artifact-path',
+  'media.get-artifact-paths',
+  'media.get-thumbnail-artifact',
+  'media.get-source-path',
+  'media.resolve-asset-paths',
+  'media.get-asset-path',
+  'media.get-asset-paths',
 ]);
 
 const BACKGROUND_SECONDARY_COMMANDS = new Set([
@@ -287,11 +315,19 @@ const BACKGROUND_SECONDARY_COMMANDS = new Set([
   'assets.analyze',
   'ai.process-queue',
   'ai.enqueue-analysis',
+  'ai.test-connection',
   // Sidebar hydration is progressive: it must yield between its independent
   // count/list passes so a browse page can enter the Worker while it runs.
   'library.navigation-summary',
   'plugin.jobs.claim-next',
   'plugin.derived-fields.materialize',
+  // Renderer status polls used to default to interactive-control and steal
+  // the only user-facing slot every second (media/ai/plugin job lists).
+  'media.list-jobs',
+  'ai.status',
+  'plugin.jobs.list',
+  'history.status',
+  'sync.asset-card-status',
 ]);
 
 const MAINTENANCE_COMMANDS = new Set([
@@ -320,6 +356,9 @@ export function performanceLaneForCommand(command: WorkerCommandLike): Performan
 export function performanceInteractionKeyForCommand(command: WorkerCommandLike): string | undefined {
   if (command.type === 'asset.thumbnail.visible-window') return 'visible-window';
   if (command.type === 'sync.asset-card-status') return 'sync-card-status';
+  // Rapid folder/collection clicks must drop the previous queued open, not
+  // run them back-to-back on a high-latency network volume.
+  if (command.type === 'browse.session.open') return 'browse-session';
   if (command.assetId === undefined) return undefined;
   switch (command.type) {
     case 'asset.preview': return `viewer:${command.assetId}`;

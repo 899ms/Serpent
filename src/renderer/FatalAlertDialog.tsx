@@ -11,6 +11,12 @@ export interface FatalAlertDialogProps {
   onDismiss: () => void;
   /** Keeps a failed library open recoverable without requiring a relaunch. */
   onSwitchLibrary?: () => void;
+  /** Secondary dismiss that does not switch libraries (already-open prompt). */
+  onCancel?: () => void;
+  /** Primary action when it is not the same as dismiss (already-open switch). */
+  onConfirm?: () => void;
+  confirmLabel?: string | null;
+  cancelLabel?: string | null;
 }
 
 /**
@@ -22,12 +28,29 @@ export function FatalAlertDialog({
   title,
   onDismiss,
   onSwitchLibrary,
+  onCancel,
+  onConfirm,
+  confirmLabel,
+  cancelLabel,
 }: FatalAlertDialogProps) {
   const t = useT();
   if (!message) return null;
 
   const heading =
     title?.trim() || t("dialog.blockingError.fallback");
+  const primaryLabel = confirmLabel?.trim() || t("dialog.blockingError.confirm");
+  const cancelActionLabel = cancelLabel?.trim() || t("common.cancel");
+  const secondary = onCancel
+    ? {
+        label: cancelActionLabel,
+        onClick: onCancel,
+      }
+    : onSwitchLibrary
+      ? {
+          label: t("dialog.blockingError.switchLibrary"),
+          onClick: onSwitchLibrary,
+        }
+      : null;
 
   return (
     <div className="dialog-backdrop" role="presentation">
@@ -44,9 +67,9 @@ export function FatalAlertDialog({
           </div>
           <button
             className="dialog-close"
-            onClick={onDismiss}
+            onClick={onCancel ?? onDismiss}
             type="button"
-            {...iconActionAttrs(t("dialog.blockingError.confirm"))}
+            {...iconActionAttrs(secondary ? cancelActionLabel : primaryLabel)}
           >
             <Icon name="close" size={16} />
           </button>
@@ -55,13 +78,13 @@ export function FatalAlertDialog({
           {message}
         </p>
         <div className="dialog-actions">
-          {onSwitchLibrary ? (
-            <button className="secondary-button" onClick={onSwitchLibrary} type="button">
-              {t("dialog.blockingError.switchLibrary")}
+          {secondary ? (
+            <button className="secondary-button" onClick={secondary.onClick} type="button">
+              {secondary.label}
             </button>
           ) : null}
-          <button className="primary-button" onClick={onDismiss} type="button">
-            {t("dialog.blockingError.confirm")}
+          <button className="primary-button" onClick={onConfirm ?? onDismiss} type="button">
+            {primaryLabel}
           </button>
         </div>
       </div>

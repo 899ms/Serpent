@@ -888,6 +888,7 @@ export const en = {
     blockingError: {
       fallback: "Couldn't finish",
       libraryOpenFailed: "Couldn't open library",
+      libraryAlreadyOpen: "Library already open",
       libraryCreateFailed: "Couldn't create library",
       importFailed: "Import failed",
       importContinueFailed: "Couldn't continue import",
@@ -2136,6 +2137,8 @@ export const en = {
       IMPORT_NOT_FOUND: "The pending import is no longer valid. Select the files again.",
       IMPORT_APPLY_FAILED: "Import stopped before every file was copied and registered. Nothing was silently overwritten. Check disk space and that the source files are still readable, then retry; already-imported items do not need to be selected again.",
       LIBRARY_ALREADY_EXISTS: "A file or folder with this name already exists at that location. Choose another name or another parent folder.",
+      LIBRARY_ALREADY_OPEN:
+        "The selected library and the currently open library have the same library ID. They may be different paths to the same library. Open it as a different library?",
       LIBRARY_NOT_FOUND: "Serpent cannot find that library folder. It may have been moved, renamed, or the disk may be disconnected. Reconnect the drive or choose the library again from Open Library.",
       NOT_A_LIBRARY: "The selected folder is not a Serpent library (it has no .serpent database).",
       LIBRARY_CORRUPT: "Serpent could not read this library’s database (integrity check or migration history failed). Reopen the library so Serpent can restore from a backup. Copy the whole library folder to a local disk first if you want a safety copy.",

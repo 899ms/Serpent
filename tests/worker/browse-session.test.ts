@@ -38,7 +38,25 @@ describe('BrowseSession', () => {
     });
     expect(session.total).toBe(2);
     expect(session.items).toHaveLength(1);
+    expect(session.session.assetIds).toHaveLength(1);
+    expect(session.session.declaredTotal).toBe(2);
     expect(session.items[0]!.displayName).toBe('a.png');
+    const secondPage = service.readBrowseSessionPage({
+      libraryId: library.libraryId,
+      libraryGeneration: 7,
+      sessionId: session.session.sessionId,
+      limit: 1,
+      offset: 1,
+    });
+    expect(secondPage).toMatchObject({ status: 'ready', total: 2, offset: 1 });
+    if (secondPage.status === 'ready') expect(secondPage.items[0]!.displayName).toBe('b.png');
+    const selected = service.readBrowseSessionAssetIds({
+      libraryId: library.libraryId,
+      libraryGeneration: 7,
+      sessionId: session.session.sessionId,
+    });
+    expect(selected).toMatchObject({ status: 'ready' });
+    if (selected.status === 'ready') expect(selected.assetIds).toHaveLength(2);
 
     const page = service.readBrowseSessionPage({
       libraryId: library.libraryId,

@@ -106,3 +106,15 @@ export function shouldSuppressClipboardPasteFeedback(error: unknown): boolean {
       error.code === "INVALID_DROP_SELECTION")
   );
 }
+
+/**
+ * Same-catalog identity via another path is a prompt, not an open failure.
+ * Serpent-79b839: do not title this “Couldn't open library”.
+ */
+export function libraryOpenBlockingTitleKey(
+  code: PublicErrorCode | undefined,
+): "dialog.blockingError.libraryAlreadyOpen" | "dialog.blockingError.libraryOpenFailed" {
+  return code === "LIBRARY_ALREADY_OPEN"
+    ? "dialog.blockingError.libraryAlreadyOpen"
+    : "dialog.blockingError.libraryOpenFailed";
+}

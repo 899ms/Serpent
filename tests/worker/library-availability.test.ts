@@ -3,7 +3,7 @@
 // schema skew, migration failure, and database damage. Desktop never presents
 // a read-only library. `npm run test:library-availability` is the required
 // gate for any library-related change.
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -270,6 +270,58 @@ describe('library availability baseline', () => {
     const recovered = service.openLibrary(created.libraryPath);
     expect(recovered.recovery?.mode).toBe('rescue');
     assertUsable(service, recovered, '篡改后抢救可写');
+  });
+
+  it('reuses the same path of an already-open catalog without prompting', () => {
+    const service = newService();
+    const created = service.createLibrary({
+      displayName: '同路径重开',
+      selectedParentPath: temporaryRoot(),
+    });
+    const reopened = service.openLibrary(created.libraryPath);
+    expect(reopened.libraryId).toBe(created.libraryId);
+    assertUsable(service, reopened, '同路径重开可写');
+  });
+
+  it('rejects a second path for an already-open catalog instead of treating it as damage', () => {
+    const root = temporaryRoot();
+    const service = newService();
+    const created = service.createLibrary({
+      displayName: '路径别名源',
+      selectedParentPath: root,
+    });
+    service.closeAll();
+    const aliasPath = path.join(root, 'path-alias-library');
+    cpSync(created.libraryPath, aliasPath, { recursive: true });
+
+    const opened = service.openLibrary(created.libraryPath);
+    expect(() => service.openLibrary(aliasPath)).toThrow('LIBRARY_ALREADY_OPEN');
+    expect(() => service.openLibraryReadOnly(aliasPath)).toThrow('LIBRARY_ALREADY_OPEN');
+    expect(service.listLibraries()).toHaveLength(1);
+    expect(service.listLibraries()[0]?.libraryId).toBe(opened.libraryId);
+    expect(opened.recovery).toBeUndefined();
+    assertUsable(service, opened, '已打开库仍可写');
+  });
+
+  it('opens the chosen path after confirmation instead of keeping the first handle', () => {
+    const root = temporaryRoot();
+    const service = newService();
+    const created = service.createLibrary({
+      displayName: '确认切库源',
+      selectedParentPath: root,
+    });
+    service.closeAll();
+    const aliasPath = path.join(root, 'path-alias-library');
+    cpSync(created.libraryPath, aliasPath, { recursive: true });
+
+    service.openLibrary(created.libraryPath);
+    expect(() => service.openLibrary(aliasPath)).toThrow('LIBRARY_ALREADY_OPEN');
+    const replaced = service.openLibrary(aliasPath, { replaceExisting: true });
+    expect(replaced.libraryId).toBe(created.libraryId);
+    expect(replaced.libraryPath).toBe(realpathSync(aliasPath));
+    expect(service.listLibraries()).toHaveLength(1);
+    expect(replaced.recovery).toBeUndefined();
+    assertUsable(service, replaced, '确认后切到所选路径可写');
   });
 
   it('closes one library and keeps another library writable', () => {

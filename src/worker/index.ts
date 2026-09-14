@@ -1037,7 +1037,14 @@ function scheduleOpenBackgroundReconciliation(
       },
       () => traceActivity(
         `open-reconciliation:${libraryId}`,
-        async () => libraryService.runOpenBackgroundReconciliation(libraryId),
+        async () => libraryService.runOpenBackgroundReconciliation(libraryId, {
+          // Serpent-be29a9: this pass runs in 60-asset batches for many seconds.
+          // Release the single background admission between batches whenever an
+          // interactive request or mutation is waiting.
+          admissionYield: () => interactiveScheduler.yieldAdmission(
+            `reconciliation:${libraryId}:${libraryGeneration}`,
+          ),
+        }),
       ),
       { cancel: () => libraryService.cancelOpenBackgroundReconciliation(libraryId) },
     );
@@ -1190,6 +1197,30 @@ const SECONDARY_MEDIA_JOB_KINDS = [
   'generate_audio_proxy',
   'extract_palette',
 ] as const;
+/**
+ * Secondary derivatives used to claim exactly one job per turn and then wait a
+ * fixed 50 ms before the next turn. Measured against 200 real images
+ * (`npm run test:perf:palette -- <image-directory>`), that capped secondary
+ * throughput at 12.5 jobs/s: each palette job costs ~12 ms, so a 20 000-asset
+ * library needed ~26 minutes of `色卡` work, and a single-job claim also paid
+ * ~8 ms of per-call claim/transaction overhead that a larger claim amortizes.
+ *
+ * The turn now claims a bounded wave, the way the primary preview lane claims
+ * `workerMediaDecodeWaveSize()`. Native concurrency is still capped by
+ * `workerMediaDecodeConcurrency()` (two background tasks, shared with the
+ * primary lane through the Sharp semaphore) and by the per-decoder lanes, so
+ * the wave is a claim budget rather than extra parallelism. A backlog is paced
+ * with a short yield so it actually drains, while a queue that has almost
+ * nothing left keeps the original 50 ms gap. Responsiveness is still governed
+ * by the interactive idle window and the cooperative abort in
+ * `scheduleSecondaryMediaQueue`, the claim-time deferral of secondary work
+ * behind pending primary previews, and the decoder semaphores.
+ */
+const SECONDARY_MEDIA_BATCH_SIZE = Math.max(1, Math.min(8, workerMediaDecodeWaveSize()));
+/** Pacing once a full wave was claimed, i.e. the secondary queue has a backlog. */
+const SECONDARY_MEDIA_BACKLOG_YIELD_MS = 10;
+/** Pacing when the queue is draining and the next turn will find little. */
+const SECONDARY_MEDIA_IDLE_TURN_MS = 50;
 const activeSecondaryMediaQueues = new Set<string>();
 const activeSecondaryMediaQueueControllers = new Map<string, AbortController>();
 const secondaryMediaIdleUntil = new Map<string, number>();
@@ -1415,7 +1446,7 @@ function scheduleSecondaryMediaQueue(
         traceActivity(
           `secondary-media:${libraryId}`,
           () => libraryService.processThumbnailQueue(libraryId, {
-            maxJobs: 1,
+            maxJobs: SECONDARY_MEDIA_BATCH_SIZE,
             jobKinds,
             ...(urgentAssetIds && urgentAssetIds.size > 0
               ? { assetIds: [...urgentAssetIds] }
@@ -1459,7 +1490,14 @@ function scheduleSecondaryMediaQueue(
         return;
       }
       if (processed > 0 && !queueController.signal.aborted) {
-        setTimeout(() => void runOne(), 50);
+        // A full wave means the secondary queue still holds work, so pace the
+        // backlog with a short yield instead of the idle cadence; a short wave
+        // means it is draining and the 50 ms gap costs nothing.
+        const backlogged = !urgent && processed >= SECONDARY_MEDIA_BATCH_SIZE;
+        setTimeout(
+          () => void runOne(),
+          backlogged ? SECONDARY_MEDIA_BACKLOG_YIELD_MS : SECONDARY_MEDIA_IDLE_TURN_MS,
+        );
         return;
       }
       if (!urgent && !queueController.signal.aborted) {
@@ -2217,7 +2255,9 @@ async function handleRequestWithoutWriteLease(request: WorkerRequest): Promise<W
           await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
         }
       }
-      const library = libraryService.openLibrary(request.command.selectedLibraryPath);
+      const library = libraryService.openLibrary(request.command.selectedLibraryPath, {
+        replaceExisting: request.command.replaceExisting === true,
+      });
       return { ok: true, type: 'library.opened', library };
     }
     case 'library.recovery-report':

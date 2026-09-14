@@ -197,7 +197,10 @@ export interface PluginJobStatus {
 
 export interface SerpentLibraryApi {
   create(input: { displayName: string }): Promise<LibraryApiResult<RendererLibrarySummary>>;
-  open(input?: { libraryPath?: string }): Promise<LibraryApiResult<RendererLibrarySummary>>;
+  open(input?: {
+    libraryPath?: string;
+    replaceExisting?: boolean;
+  }): Promise<LibraryApiResult<RendererLibrarySummary>>;
   /**
    * Shows the native "choose library location" picker and returns the chosen
    * path (null when cancelled) without opening anything, so callers can start

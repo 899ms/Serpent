@@ -259,10 +259,14 @@ const library: SerpentLibraryApi = Object.freeze({
     return { ok: true as const, value: result.library };
   },
 
-  async open(input?: { libraryPath?: string }): Promise<LibraryApiResult<RendererLibrarySummary>> {
+  async open(input?: {
+    libraryPath?: string;
+    replaceExisting?: boolean;
+  }): Promise<LibraryApiResult<RendererLibrarySummary>> {
     const result = await request({
       type: 'library.open.request',
       ...(input?.libraryPath ? { libraryPath: input.libraryPath } : {}),
+      ...(input?.replaceExisting === true ? { replaceExisting: true } : {}),
     });
     if (!result.ok) return failure(result);
     if (result.type !== 'library.opened') throw new Error('Unexpected open-library response.');

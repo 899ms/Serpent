@@ -1,7 +1,7 @@
 {
   "name": "serpent",
   "productName": "Serpent",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "An open-source digital asset manager for creative professionals.",
   "author": "dolag233",
   "license": "MIT",
@@ -39,6 +39,8 @@
     "pretest:library-availability": "node scripts/ensure-native.mjs",
     "test:perf:search": "node scripts/run-vitest-with-electron.mjs run --config vitest.config.ts tests/worker/search-performance.test.ts",
     "test:perf:media-tasks": "node scripts/run-media-task-performance.mjs",
+    "test:perf:palette": "node scripts/run-palette-benchmark.mjs",
+    "test:perf:navigation": "node scripts/run-navigation-benchmark.mjs",
     "large-library:generate": "node scripts/generate-large-library.mjs",
     "test:perf:large-library": "node scripts/run-large-library-performance.mjs",
     "test:e2e:large-library-benchmark": "node scripts/run-large-library-e2e-benchmark.mjs",

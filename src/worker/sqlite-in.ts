@@ -5,8 +5,15 @@
  */
 export const SQLITE_IN_BIND_LIMIT = 900;
 
-interface SqliteStatement {
+interface SqliteReadStatement {
   all(...parameters: unknown[]): unknown[];
+}
+
+interface SqliteReadConnection {
+  prepare(sql: string): SqliteReadStatement;
+}
+
+interface SqliteStatement extends SqliteReadStatement {
   run(...parameters: unknown[]): { changes: number };
 }
 
@@ -34,7 +41,7 @@ export function sqliteInPlaceholders(values: readonly unknown[]): string {
 }
 
 export function sqliteAllInChunks<T, R>(input: {
-  connection: SqliteConnection;
+  connection: SqliteReadConnection;
   values: readonly T[];
   buildSql: (placeholders: string) => string;
   bind?: (chunk: readonly T[]) => readonly unknown[];

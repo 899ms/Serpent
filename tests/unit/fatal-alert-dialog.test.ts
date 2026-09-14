@@ -53,6 +53,71 @@ describe("FatalAlertDialog library recovery action", () => {
     expect(onSwitchLibrary).toHaveBeenCalledTimes(1);
   });
 
+  it("uses cancel and confirm for an already-open library prompt", async () => {
+    const onDismiss = vi.fn();
+    const onCancel = vi.fn();
+    const onConfirm = vi.fn();
+    const onSwitchLibrary = vi.fn();
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root?.render(
+        createElement(
+          LocaleProvider,
+          { children: null, initialPreference: "zh-CN" },
+          createElement(FatalAlertDialog, {
+            cancelLabel: "取消",
+            confirmLabel: "确认",
+            message: "所选资源库和当前打开资源库有相同的资源库ID，可能是同一资源库的不同路径。是否视为不同资源库进行打开。",
+            title: "资源库已打开",
+            onCancel,
+            onConfirm,
+            onDismiss,
+            onSwitchLibrary,
+          }),
+        ),
+      );
+    });
+
+    const labels = [...container.querySelectorAll("button")].map(
+      (button) => button.textContent?.trim(),
+    );
+    expect(labels).toContain("取消");
+    expect(labels).toContain("确认");
+    expect(labels).not.toContain("切换资源库");
+    expect(labels).not.toContain("知道了");
+
+    const cancelButton = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent?.trim() === "取消",
+    );
+    await act(async () => {
+      cancelButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(onConfirm).not.toHaveBeenCalled();
+    expect(onSwitchLibrary).not.toHaveBeenCalled();
+    expect(onDismiss).not.toHaveBeenCalled();
+
+    const confirmButton = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent?.trim() === "确认",
+    );
+    await act(async () => {
+      confirmButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(onSwitchLibrary).not.toHaveBeenCalled();
+    expect(onDismiss).not.toHaveBeenCalled();
+
+    const closeButton = container.querySelector(".dialog-close");
+    await act(async () => {
+      closeButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onCancel).toHaveBeenCalledTimes(2);
+    expect(onDismiss).not.toHaveBeenCalled();
+  });
+
   it("marks the blocking alert as a modal that the global focus trap can own", async () => {
     container = document.createElement("div");
     document.body.append(container);

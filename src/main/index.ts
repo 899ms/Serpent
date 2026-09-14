@@ -37,7 +37,7 @@ import {
   NativeAssetDragCache,
   startNativeAssetDrag,
 } from "./native-asset-drag";
-import { nativeDragAssetsForResult } from "./native-asset-drag-prime";
+import { nativeDragAssetsForResult, NativeAssetDragPrimeScheduler } from "./native-asset-drag-prime";
 import {
   clearViewerVideoShortcutCapture,
   isViewerVideoShortcutContentsActive,
@@ -557,24 +557,42 @@ function resolveArtifactPathBatched(
   });
 }
 const nativeAssetDragCache = new NativeAssetDragCache();
-type NativeAssetDragPrimeQueue = {
-  pending: Set<string>;
-  generation: number;
-  running: boolean;
-};
-const nativeAssetDragPrimeQueues = new Map<string, NativeAssetDragPrimeQueue>();
-
-function cancelNativeAssetDragPrime(libraryId: string): void {
-  const queue = nativeAssetDragPrimeQueues.get(libraryId);
-  if (!queue) return;
-  queue.generation += 1;
-  queue.pending.clear();
-  if (!queue.running) nativeAssetDragPrimeQueues.delete(libraryId);
-}
+/**
+ * Serpent-8ee170: every media completion enqueues here instead of issuing its
+ * own Worker request, so a 2,000-job wave cannot become 2,000 background
+ * requests competing with the queue that produced them.
+ */
+const nativeAssetDragPrimer = new NativeAssetDragPrimeScheduler({
+  fetchEntries: async (libraryId, assetIds) => {
+    if (!workerClient) return null;
+    try {
+      const result = await workerClient.request({
+        type: "media.get-asset-drag-infos",
+        libraryId,
+        assetIds: [...assetIds],
+      });
+      return result.ok && result.type === "media.asset-drag-infos" ? result.entries : null;
+    } catch (error) {
+      logger?.info("main.native-asset-drag-cache", "Could not preheat native drag entries.", {
+        libraryId,
+        assetCount: assetIds.length,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  },
+  applyEntries: (libraryId, entries, mode) => {
+    if (mode === "replace") {
+      nativeAssetDragCache.replace(libraryId, entries as Parameters<NativeAssetDragCache["replace"]>[1]);
+    } else {
+      nativeAssetDragCache.upsert(libraryId, entries as Parameters<NativeAssetDragCache["upsert"]>[1]);
+    }
+  },
+});
 
 function clearNativeAssetDragCache(libraryId: string): void {
   nativeAssetDragCache.clear(libraryId);
-  cancelNativeAssetDragPrime(libraryId);
+  nativeAssetDragPrimer.invalidate(libraryId);
 }
 /**
  * Serpent-1e3d4f: Chromium never persists custom-protocol responses on disk,
@@ -2269,40 +2287,6 @@ function toRendererResult(
   return parseRendererResult(result);
 }
 
-async function primeNativeAssetDragCache(
-  libraryId: string,
-  assetIds: readonly string[],
-  mode: "replace" | "upsert",
-): Promise<void> {
-  if (!workerClient || assetIds.length === 0) {
-    if (mode === "replace") nativeAssetDragCache.replace(libraryId, []);
-    return;
-  }
-  try {
-    const result = await workerClient.request({
-      type: "media.get-asset-drag-infos",
-      libraryId,
-      assetIds: [...new Set(assetIds)],
-    });
-    if (!result.ok || result.type !== "media.asset-drag-infos") return;
-    if (mode === "replace") {
-      nativeAssetDragCache.replace(libraryId, result.entries);
-    } else {
-      nativeAssetDragCache.upsert(libraryId, result.entries);
-    }
-  } catch (error) {
-    logger?.info(
-      "main.native-asset-drag-cache",
-      "Could not preheat native drag entries.",
-      {
-        libraryId,
-        assetCount: assetIds.length,
-        error: error instanceof Error ? error.message : String(error),
-      },
-    );
-  }
-}
-
 /**
  * Serpent-v4jf/Serpent-29125f: how many sorted-list-head assets to prime
  * synchronously before a card-bearing response reaches the renderer. Native
@@ -2312,62 +2296,6 @@ async function primeNativeAssetDragCache(
  * few dozen cards, so keep this bounded to a small first-screen cushion.
  */
 const NATIVE_DRAG_PRIME_VISIBLE_COUNT = 64;
-
-/**
- * Fire-and-forget primer for the rest of a large browse result. Chunked so a
- * 50k result does not post one giant worker request and does not hold the
- * worker for a single long burst; each chunk is a normal upsert.
- */
-async function drainNativeAssetDragPrimeQueue(
-  libraryId: string,
-  queue: NativeAssetDragPrimeQueue,
-): Promise<void> {
-  const generation = queue.generation;
-  try {
-    // Keep each background request below the Worker-side 500-id resolution
-    // batch. A 5,000-id request was technically fire-and-forget but still held
-    // the Worker callback queue for a long burst in text-heavy libraries.
-    const chunkSize = 500;
-    while (queue.generation === generation && queue.pending.size > 0) {
-      const chunk = [...queue.pending].slice(0, chunkSize);
-      for (const assetId of chunk) queue.pending.delete(assetId);
-      await primeNativeAssetDragCache(libraryId, chunk, "upsert");
-      // Leave a small scheduling gap between chunks. This is deliberately
-      // longer than a microtask: viewer, search and thumbnail requests must be
-      // able to enter the Worker queue between background drag hydration waves.
-      await new Promise<void>((resolve) => setTimeout(resolve, 25));
-    }
-  } finally {
-    queue.running = false;
-    if (nativeAssetDragPrimeQueues.get(libraryId) === queue) {
-      if (queue.pending.size === 0) {
-        nativeAssetDragPrimeQueues.delete(libraryId);
-      } else {
-        // A new request arrived while the queue was being cancelled/replaced;
-        // continue with the current generation instead of dropping its entries.
-        queue.running = true;
-        void drainNativeAssetDragPrimeQueue(libraryId, queue);
-      }
-    }
-  }
-}
-
-function primeNativeAssetDragCacheInBackground(
-  libraryId: string,
-  assetIds: readonly string[],
-): void {
-  if (assetIds.length === 0) return;
-  const queue = nativeAssetDragPrimeQueues.get(libraryId) ?? {
-    pending: new Set<string>(),
-    generation: 0,
-    running: false,
-  } satisfies NativeAssetDragPrimeQueue;
-  nativeAssetDragPrimeQueues.set(libraryId, queue);
-  for (const assetId of assetIds) queue.pending.add(assetId);
-  if (queue.running) return;
-  queue.running = true;
-  void drainNativeAssetDragPrimeQueue(libraryId, queue);
-}
 
 function createNativeDialogHost(): NativeDialogHost {
   return {
@@ -2466,7 +2394,11 @@ async function commandFor(
       const selectedLibraryPath =
         request.libraryPath ?? (await selectDirectory("openLibrary"));
       return selectedLibraryPath
-        ? { type: "library.open", selectedLibraryPath }
+        ? {
+            type: "library.open",
+            selectedLibraryPath,
+            ...(request.replaceExisting === true ? { replaceExisting: true } : {}),
+          }
         : undefined;
     }
     case "library.recovery-report.request":
@@ -5097,18 +5029,20 @@ async function handleLibraryRequest(
       const dragAssetIds = nativeDragAssets.flatMap((asset) =>
         asset.sequence?.frames.map((frame) => frame.assetId) ?? [asset.assetId],
       );
-      await primeNativeAssetDragCache(
+      // Serpent-8ee170（第三轮纠偏）: the browse result must reach the Renderer
+      // without waiting for any drag-cache work. `media.get-asset-drag-infos`
+      // shares the background-primary lane with reconciliation, so awaiting it
+      // here held a 1.206 s browse response behind a ~68 s maintenance owner —
+      // the measured cause of "the command is fast but the content does not
+      // change for a minute". The visible first screen still warms in the
+      // background (bounded by NATIVE_DRAG_PRIME_VISIBLE_COUNT); the rest of a
+      // large result is no longer primed at all — a card resolves on demand
+      // when a drag actually starts.
+      void nativeAssetDragPrimer.primeImmediately(
         nativeDragLibraryId,
         dragAssetIds.slice(0, NATIVE_DRAG_PRIME_VISIBLE_COUNT),
         "upsert",
       );
-      const rest = dragAssetIds.slice(NATIVE_DRAG_PRIME_VISIBLE_COUNT);
-      if (rest.length > 0) {
-        void primeNativeAssetDragCacheInBackground(
-          nativeDragLibraryId,
-          rest,
-        );
-      }
     }
 
     if (!workerResult.ok && relinkPreviewContext) {
@@ -5858,7 +5792,8 @@ async function handleLibraryRequest(
         // unmigratable) must disappear from every recent list — the switcher
         // menu and the no-library create dialog share the same store. Only
         // deterministic invalid-open codes remove the entry; transient
-        // failures (picker cancel, busy) keep it.
+        // failures (picker cancel, busy) and same-catalog identity prompts
+        // (LIBRARY_ALREADY_OPEN) keep it.
         if (
           operation === "open" &&
           command.type === "library.open" &&
@@ -7669,11 +7604,11 @@ async function startApplication(): Promise<void> {
       event.type === "asset.thumbnail.ready" ||
       event.type === "asset.thumbnail.failed"
     ) {
-      void primeNativeAssetDragCache(
-        event.libraryId,
-        [event.assetId],
-        "upsert",
-      );
+      // Serpent-8ee170（第三轮纠偏）: a ready/failed thumbnail does not change a
+      // source path, so it must not re-resolve drag descriptors. Re-priming on
+      // every completion produced 304 background `media.get-asset-drag-infos`
+      // requests in a pure browse profile; the first screen is warmed by the
+      // browse response itself and anything else resolves on demand.
     }
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.webContents.send(THUMBNAIL_CHANNEL, event);

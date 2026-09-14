@@ -163,6 +163,11 @@ export const rendererRequestSchema = z.discriminatedUnion('type', [
      * timer) from covering the native picker (Serpent-565785 feedback).
      */
     libraryPath: selectedPathSchema.optional(),
+    /**
+     * Same catalog at a different path: close the current handle and open the
+     * chosen location. Default stays a prompt (`LIBRARY_ALREADY_OPEN`).
+     */
+    replaceExisting: z.boolean().optional(),
   }),
   z.strictObject({
     type: z.literal('library.choose-path.request'),
@@ -1286,6 +1291,7 @@ export const workerCommandSchema = z.discriminatedUnion('type', [
   z.strictObject({
     type: z.literal('library.open'),
     selectedLibraryPath: selectedPathSchema,
+    replaceExisting: z.boolean().optional(),
   }),
   z.strictObject({
     type: z.literal('library.recovery-report'),
