@@ -24475,11 +24475,13 @@ export class LibraryService {
       const palette = await runSharpDecoder(execution.signal, execution.lane, async () => {
         const sharp = this.options.paletteSharpFn
           ?? (requireSharp() as unknown as PaletteSharpModule);
+        // No `ensureAlpha()`: the extractor accepts RGB or RGBA and skips only
+        // genuinely transparent pixels, so forcing a fourth channel on opaque
+        // sources only widened the buffer it has to scan.
         const decoded = await sharp(sourcePath)
           .rotate()
           .toColourspace('srgb')
           .resize({ width: 64, height: 64, fit: 'inside', withoutEnlargement: true })
-          .ensureAlpha()
           .raw()
           .toBuffer({ resolveWithObject: true });
         if (execution.signal?.aborted) {

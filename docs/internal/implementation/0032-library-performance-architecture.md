@@ -162,7 +162,7 @@ totalMs        = Main 收到 - Main 发送
 | `viewer-upgrade` | 当前查看器原图、RAW 高清、PDF 页、播放 fallback | 每个 viewer session 最多一个主升级任务 |
 | `mutation` | 导入提交、重命名、移动、删除、恢复 | 每个资源库串行；短事务提交 |
 | `background-primary` | 非可见缩略图、技术元数据、索引补齐 | 有界并发；交互活跃时暂停 claim |
-| `background-secondary` | 色卡、AI、联系表、低优先级代理 | 默认单路；系统压力时最先暂停 |
+| `background-secondary` | 色卡、AI、联系表、低优先级代理 | 有界 claim wave（≤ `workerMediaDecodeWaveSize()`）；原生并发仍受 `workerMediaDecodeConcurrency()` 与解码器 lane 约束；系统压力时最先暂停 |
 | `maintenance` | 对账、备份、清理、远端轮询 | 4–8 ms 时间片；每片后让出事件循环 |
 
 ### 6.2 默认预算
@@ -172,7 +172,7 @@ totalMs        = Main 收到 - Main 发送
 - SQLite Owner 同时只执行一个同步事务；交互读事务目标小于 50 ms，写事务目标小于 100 ms。
 - `visible-media + viewer-upgrade` 共用原生解码预算，默认最多 2 个外部解码进程；viewer 至少保留一个名额。
 - `background-primary` 默认最多 2 个原生任务。
-- `background-secondary` 默认 1 个任务。
+- `background-secondary` 的 claim wave 默认为 `workerMediaDecodeWaveSize()`（4）；单次 `processThumbnailQueue` 的实际 worker 数仍是 `min(maxJobs, workerMediaDecodeConcurrency())` = 2，与 `background-primary` 共用同一个 Sharp 解码信号量，因此**原生并发不随 wave 放大**。2026-09-14 实测：`maxJobs: 1` + 每轮 50 ms 空转 = 12.5 张/秒（2 万资产约 26.6 分钟），wave=4 + backlog 10 ms 让出 = 56.1 张/秒（约 5.9 分钟）；见 `npm run test:perf:palette` 与 [色卡提取吞吐开发日志](../development/2026-09-14-palette-extraction-throughput-development-log.md)。
 - model offscreen、HTML capture 等单窗口 renderer 继续 single-flight。
 - 任一资源压力错误触发全局 cooldown，但 interactive SQL/source path 查询不能被一起冻结。
 

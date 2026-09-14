@@ -8,14 +8,6 @@ export interface DominantColorMetrics {
   lightness: number;
 }
 
-interface HistogramBucket {
-  key: number;
-  count: number;
-  red: number;
-  green: number;
-  blue: number;
-}
-
 interface Cluster {
   count: number;
   red: number;
@@ -23,14 +15,22 @@ interface Cluster {
   blue: number;
 }
 
+/**
+ * Four high bits per component keep the histogram bounded to 4096 bins no
+ * matter how large the decoded frame is.
+ */
+const HISTOGRAM_BIN_COUNT = 4096;
+
 function colorDistanceSquared(
-  left: Pick<Cluster, 'red' | 'green' | 'blue'>,
-  right: Pick<Cluster, 'red' | 'green' | 'blue'>,
+  red: number,
+  green: number,
+  blue: number,
+  cluster: Pick<Cluster, 'red' | 'green' | 'blue'>,
 ): number {
-  const red = left.red - right.red;
-  const green = left.green - right.green;
-  const blue = left.blue - right.blue;
-  return red * red + green * green + blue * blue;
+  const deltaRed = red - cluster.red;
+  const deltaGreen = green - cluster.green;
+  const deltaBlue = blue - cluster.blue;
+  return deltaRed * deltaRed + deltaGreen * deltaGreen + deltaBlue * deltaBlue;
 }
 
 function byteHex(value: number): string {
@@ -65,6 +65,14 @@ export function dominantColorMetrics(hex: string): DominantColorMetrics {
  * Deterministic, bounded representative-colour extraction for already decoded
  * sRGB pixels. Quantized histogram peaks seed a small weighted k-means pass;
  * no randomness means identical content always produces identical JSON.
+ *
+ * The histogram lives in flat typed arrays instead of a per-pixel `Map`
+ * (Serpent-3a9f1c). The previous shape paid one hash lookup plus a bucket
+ * object per pixel, so extraction time tracked the decoded pixel count even
+ * though only 4096 quantized bins can ever exist. Output is unchanged: the
+ * same bins, the same count/key ordering and the same k-means updates, only
+ * without the per-pixel allocation. When every occupied bin already fits the
+ * requested colour count the k-means pass is a provable no-op and is skipped.
  */
 export function extractRepresentativePalette(
   pixels: Uint8Array,
@@ -78,67 +86,141 @@ export function extractRepresentativePalette(
     throw new Error('Palette pixel buffer is empty or misaligned.');
   }
   const colorLimit = Math.max(1, Math.min(12, Math.trunc(maxColors)));
-  const histogram = new Map<number, HistogramBucket>();
+
+  const binCounts = new Uint32Array(HISTOGRAM_BIN_COUNT);
+  // Float64 keeps the per-bin channel sums exact for any realistic pixel count
+  // (integers stay exact well past 2^53) while staying cheaper than BigInt.
+  const binRed = new Float64Array(HISTOGRAM_BIN_COUNT);
+  const binGreen = new Float64Array(HISTOGRAM_BIN_COUNT);
+  const binBlue = new Float64Array(HISTOGRAM_BIN_COUNT);
+  const skipTransparent = channels === 4;
 
   for (let offset = 0; offset < pixels.length; offset += channels) {
-    if (channels === 4 && pixels[offset + 3]! < 16) continue;
+    if (skipTransparent && pixels[offset + 3]! < 16) continue;
     const red = pixels[offset]!;
     const green = pixels[offset + 1]!;
     const blue = pixels[offset + 2]!;
-    // Four high bits per component keep the histogram bounded to 4096 bins.
     const key = (red >> 4) << 8 | (green >> 4) << 4 | (blue >> 4);
-    const bucket = histogram.get(key) ?? { key, count: 0, red: 0, green: 0, blue: 0 };
-    bucket.count += 1;
-    bucket.red += red;
-    bucket.green += green;
-    bucket.blue += blue;
-    histogram.set(key, bucket);
+    binCounts[key] = binCounts[key]! + 1;
+    binRed[key] = binRed[key]! + red;
+    binGreen[key] = binGreen[key]! + green;
+    binBlue[key] = binBlue[key]! + blue;
   }
 
-  const buckets = [...histogram.values()];
-  if (buckets.length === 0) return [];
-  buckets.sort((left, right) => right.count - left.count || left.key - right.key);
+  const occupiedKeys: number[] = [];
+  for (let key = 0; key < HISTOGRAM_BIN_COUNT; key += 1) {
+    if (binCounts[key]! > 0) occupiedKeys.push(key);
+  }
+  if (occupiedKeys.length === 0) return [];
 
-  let clusters: Cluster[] = buckets.slice(0, colorLimit).map((bucket) => ({
-    count: bucket.count,
-    red: bucket.red / bucket.count,
-    green: bucket.green / bucket.count,
-    blue: bucket.blue / bucket.count,
-  }));
-
-  // A few deterministic passes merge the complete histogram into the seeds,
-  // so the emitted ratios cover the whole visible image and sum to one.
-  for (let iteration = 0; iteration < 4; iteration += 1) {
-    const assignments = clusters.map(() => ({ count: 0, red: 0, green: 0, blue: 0 }));
-    for (const bucket of buckets) {
-      const color = {
-        red: bucket.red / bucket.count,
-        green: bucket.green / bucket.count,
-        blue: bucket.blue / bucket.count,
-      };
-      let selected = 0;
-      let selectedDistance = colorDistanceSquared(color, clusters[0]!);
-      for (let index = 1; index < clusters.length; index += 1) {
-        const distance = colorDistanceSquared(color, clusters[index]!);
-        if (distance < selectedDistance) {
-          selected = index;
-          selectedDistance = distance;
-        }
+  // Pick the heaviest bins in one pass: a bounded insertion into a `colorLimit`
+  // sized list is exactly "sort the histogram by count, then bin key, then take
+  // the head", without sorting up to 4096 entries to keep at most 12.
+  const seedKeys: number[] = [];
+  const seedCounts: number[] = [];
+  for (const key of occupiedKeys) {
+    const count = binCounts[key]!;
+    if (seedKeys.length === colorLimit) {
+      if (count <= seedCounts[seedCounts.length - 1]!) continue;
+      let position = seedKeys.length - 1;
+      while (position > 0 && seedCounts[position - 1]! < count) {
+        seedKeys[position] = seedKeys[position - 1]!;
+        seedCounts[position] = seedCounts[position - 1]!;
+        position -= 1;
       }
-      const assignment = assignments[selected]!;
-      assignment.count += bucket.count;
-      assignment.red += bucket.red;
-      assignment.green += bucket.green;
-      assignment.blue += bucket.blue;
+      seedKeys[position] = key;
+      seedCounts[position] = count;
+      continue;
     }
-    clusters = assignments
-      .filter((assignment) => assignment.count > 0)
-      .map((assignment) => ({
-        count: assignment.count,
-        red: assignment.red / assignment.count,
-        green: assignment.green / assignment.count,
-        blue: assignment.blue / assignment.count,
-      }));
+    let position = seedKeys.length;
+    while (position > 0 && seedCounts[position - 1]! < count) {
+      seedKeys[position] = seedKeys[position - 1]!;
+      seedCounts[position] = seedCounts[position - 1]!;
+      position -= 1;
+    }
+    seedKeys[position] = key;
+    seedCounts[position] = count;
+  }
+
+  let clusters: Cluster[] = seedKeys.map((key, index) => {
+    const count = seedCounts[index]!;
+    return {
+      count,
+      red: binRed[key]! / count,
+      green: binGreen[key]! / count,
+      blue: binBlue[key]! / count,
+    };
+  });
+
+  // Every occupied bin as its own cluster already: assigning each bin to its
+  // nearest cluster would map it to itself (bin colours are distinct per bin),
+  // so a few deterministic passes would return these exact clusters again.
+  if (occupiedKeys.length > clusters.length) {
+    const bucketTotal = occupiedKeys.length;
+    const bucketWeight = new Float64Array(bucketTotal);
+    const bucketMeanRed = new Float64Array(bucketTotal);
+    const bucketMeanGreen = new Float64Array(bucketTotal);
+    const bucketMeanBlue = new Float64Array(bucketTotal);
+    const bucketSumRed = new Float64Array(bucketTotal);
+    const bucketSumGreen = new Float64Array(bucketTotal);
+    const bucketSumBlue = new Float64Array(bucketTotal);
+    for (let index = 0; index < bucketTotal; index += 1) {
+      const key = occupiedKeys[index]!;
+      const count = binCounts[key]!;
+      const red = binRed[key]!;
+      const green = binGreen[key]!;
+      const blue = binBlue[key]!;
+      bucketWeight[index] = count;
+      bucketSumRed[index] = red;
+      bucketSumGreen[index] = green;
+      bucketSumBlue[index] = blue;
+      bucketMeanRed[index] = red / count;
+      bucketMeanGreen[index] = green / count;
+      bucketMeanBlue[index] = blue / count;
+    }
+
+    // A few deterministic passes merge the complete histogram into the seeds,
+    // so the emitted ratios cover the whole visible image and sum to one.
+    for (let iteration = 0; iteration < 4; iteration += 1) {
+      const clusterTotal = clusters.length;
+      const assignmentCount = new Float64Array(clusterTotal);
+      const assignmentRed = new Float64Array(clusterTotal);
+      const assignmentGreen = new Float64Array(clusterTotal);
+      const assignmentBlue = new Float64Array(clusterTotal);
+      for (let index = 0; index < bucketTotal; index += 1) {
+        const red = bucketMeanRed[index]!;
+        const green = bucketMeanGreen[index]!;
+        const blue = bucketMeanBlue[index]!;
+        let selected = 0;
+        let selectedDistance = colorDistanceSquared(red, green, blue, clusters[0]!);
+        for (let cluster = 1; cluster < clusterTotal; cluster += 1) {
+          const distance = colorDistanceSquared(red, green, blue, clusters[cluster]!);
+          if (distance < selectedDistance) {
+            selected = cluster;
+            selectedDistance = distance;
+          }
+        }
+        // Accumulate the raw per-bin sums exactly as the histogram stored
+        // them, so every cluster mean matches the previous implementation bit
+        // for bit instead of round-tripping through a mean times a weight.
+        assignmentCount[selected] = assignmentCount[selected]! + bucketWeight[index]!;
+        assignmentRed[selected] = assignmentRed[selected]! + bucketSumRed[index]!;
+        assignmentGreen[selected] = assignmentGreen[selected]! + bucketSumGreen[index]!;
+        assignmentBlue[selected] = assignmentBlue[selected]! + bucketSumBlue[index]!;
+      }
+      const merged: Cluster[] = [];
+      for (let cluster = 0; cluster < clusterTotal; cluster += 1) {
+        const count = assignmentCount[cluster]!;
+        if (count === 0) continue;
+        merged.push({
+          count,
+          red: assignmentRed[cluster]! / count,
+          green: assignmentGreen[cluster]! / count,
+          blue: assignmentBlue[cluster]! / count,
+        });
+      }
+      clusters = merged;
+    }
   }
 
   const merged = new Map<string, number>();

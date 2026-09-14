@@ -287,6 +287,12 @@
 
 | LIB-PERF-005 / `Serpent-08a344` | 远程资源库 SQLite 元数据本地快照缓存 | 待人类验收 | 在 SMB/NAS 临时库中首次打开、完整关闭后再次打开；观察后台命中/刷新；从另一台设备修改资产/元数据后等待低频校验；断开再恢复网络并尝试读写；路径暂时不可用时确认只读 degraded 状态 | 二次打开优先使用本地只读元数据快照且主窗口仍可交互；所有写入仍落到远端真相库；他机 browse cursor/指纹变化后快照失效并重建；断线不把旧快照伪装成可写数据；mount-missing 只允许合法快照浏览/搜索且拒绝写入；关闭/重开无旧 generation 访问 | [D.7 开发日志](../development/2026-08-26-library-performance-architecture-stage-d7-network-metadata-cache-development-log.md) / `src/worker/network-metadata-cache.ts` / `src/worker/library-service.ts` / `tests/unit/network-metadata-cache.test.ts` / `tests/worker/network-metadata-cache.test.ts` / `tests/worker/large-library-performance.test.ts` / `tests/e2e/library-lifecycle.test.ts` / `Serpent-08a344` | 自动化：定向 3 files / 22 passed，Worker 86 files / 1,245 passed / 22 skipped，library-availability 9 files / 207 passed，真实 macOS APFS 20k Worker/SQLite 对照 3/3，开库生命周期 Electron 3 passed（10.8s）；真实 SMB/NAS 多机/断线、Windows、packaged、Computer Use 与人类视觉未执行，等待产品验收 |
 
+### 2026-09-14 色卡提取吞吐与二级媒体泵预算（0032 增量）
+
+| ID | 功能 | 状态 | 人类操作 | 预期结果 | 证据 | 结果/反馈 |
+| --- | --- | --- | --- | --- | --- | --- |
+| MEDIA-PERF-004 | 大库自动色卡补齐吞吐 | 待人类验收 | 在万级真实资源库导入或首次打开后观察 Inspector 色卡与颜色筛选的补齐速度；补齐期间持续滚动浏览、切换文件夹并观察卡片与滚动是否跟手 | 色卡后台补齐不与首屏/可见卡片抢资源；浏览、滚动、切文件夹始终可交互；万级库色卡补齐不再需要几十分钟 | [2026-09-14 开发日志](../development/2026-09-14-palette-extraction-throughput-development-log.md) / `tests/worker/palette-benchmark.test.ts` / `tests/unit/palette-extractor-equivalence.test.ts` / `scripts/run-palette-benchmark.mjs` / `src/worker/index.ts` | 自动化：200 张真实图片基准实测二级泵 12.57 → 56.86 张/秒（2 万线性投影 26.5 → 5.9 分钟），2 MP 帧提取 2.78× 且输出逐字节不变；真实 2 万库端到端计时、交互响应性真机观测、NAS/SMB、Windows、packaged、Computer Use 未执行 |
+
 ### 2026-08-25 媒体任务资源安全与查看器回退
 
 | ID | 功能 | 状态 | 人类操作 | 预期结果 | 证据 | 结果/反馈 |
