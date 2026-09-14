@@ -43,12 +43,18 @@ describe('performance command classification', () => {
     expect(performanceLaneForCommand({ type: 'asset.thumbnail.visible-window' })).toBe('visible-media');
     expect(performanceLaneForCommand({ type: 'asset.preview' })).toBe('viewer-upgrade');
     expect(performanceLaneForCommand({ type: 'media.get-preview-artifact' })).toBe('viewer-upgrade');
-    expect(performanceLaneForCommand({ type: 'media.get-artifact-path' })).toBe('interactive-control');
-    expect(performanceLaneForCommand({ type: 'media.get-thumbnail-artifact' })).toBe('interactive-control');
-    expect(performanceLaneForCommand({ type: 'media.get-source-path' })).toBe('interactive-control');
+    expect(performanceLaneForCommand({ type: 'media.get-artifact-path' })).toBe('background-primary');
+    expect(performanceLaneForCommand({ type: 'media.get-thumbnail-artifact' })).toBe('background-primary');
+    expect(performanceLaneForCommand({ type: 'media.get-source-path' })).toBe('background-primary');
+    expect(performanceLaneForCommand({ type: 'browse.session.open' })).toBe('interactive-control');
+    expect(performanceLaneForCommand({ type: 'browse.session.page' })).toBe('interactive-control');
     expect(performanceLaneForCommand({ type: 'media.process-thumbnail-queue' })).toBe('background-primary');
     expect(performanceLaneForCommand({ type: 'ai.enqueue-analysis' })).toBe('background-secondary');
     expect(performanceLaneForCommand({ type: 'library.navigation-summary' })).toBe('background-secondary');
+    expect(performanceLaneForCommand({ type: 'media.list-jobs' })).toBe('background-secondary');
+    expect(performanceLaneForCommand({ type: 'ai.status' })).toBe('background-secondary');
+    expect(performanceLaneForCommand({ type: 'plugin.jobs.list' })).toBe('background-secondary');
+    expect(performanceLaneForCommand({ type: 'ai.test-connection' })).toBe('background-secondary');
   });
 
   it('assigns lifecycle generations and bounded deadlines in Main', () => {
@@ -98,11 +104,11 @@ describe('performance command classification', () => {
     )).toBe(false);
     expect(shouldPreemptAutomaticMedia(
       { type: 'media.get-source-path', libraryId: 'library-1', assetId: 'asset-1' },
-      'interactive-control',
+      'background-primary',
     )).toBe(false);
     expect(shouldPreemptAutomaticMedia(
       { type: 'media.get-thumbnail-artifact', libraryId: 'library-1', assetId: 'asset-1' },
-      'interactive-control',
+      'background-primary',
     )).toBe(false);
     expect(shouldPreemptAutomaticMedia(
       { type: 'media.get-asset-path', libraryId: 'library-1', assetId: 'asset-1' },
@@ -122,7 +128,7 @@ describe('performance command classification', () => {
     )).toBe(false);
     expect(shouldPreemptAutomaticMedia(
       { type: 'ai.status', libraryId: 'library-1' },
-      'interactive-control',
+      'background-secondary',
     )).toBe(false);
     expect(shouldPreemptAutomaticMedia(
       { type: 'media.get-asset-drag-infos', libraryId: 'library-1' },
@@ -154,6 +160,17 @@ describe('performance command classification', () => {
       type: 'library.open',
       selectedLibraryPath: 'C:\\library',
     })).toBe('mutation');
+  });
+
+  it('gives browse session open a latest-wins interaction key', () => {
+    expect(performanceInteractionKeyForCommand({
+      type: 'browse.session.open',
+      libraryId: 'library-1',
+    })).toBe('browse-session');
+    expect(performanceInteractionKeyForCommand({
+      type: 'browse.session.page',
+      libraryId: 'library-1',
+    })).toBeUndefined();
   });
 });
 

@@ -707,6 +707,8 @@ import {
 import {
   BrowseSessionStore,
   browseQueryFingerprint,
+  browseSessionIndexComplete,
+  browseSessionPageUsesSnapshot,
   type BrowseSessionLookup,
   type BrowseSessionSnapshot,
 } from './browse-session-store';
@@ -30969,36 +30971,51 @@ export class LibraryService {
       sort,
       showIgnored: input.showIgnored === true,
     };
-    const scopeResult = this.searchAssets({
-      libraryId: input.libraryId,
-      ...definition,
-      idsOnly: true,
-      limit: null,
-      offset: 0,
-    });
-    const assetIds = scopeResult.assetIds ?? [];
-    const session = this.browseSessionStore.create({
-      libraryId: input.libraryId,
-      libraryGeneration: input.libraryGeneration,
-      changeSequence: this.getBrowseChangeSequence(input.libraryId),
-      queryFingerprint: browseQueryFingerprint(definition),
-      query: definition.query,
-      sort: definition.sort,
-      assetIds,
-    });
+    // PERF2-04 / Serpent-52eed4: paint the bounded first window before enumerating
+    // every id. Full-scope idsOnly on a network library occupied the only
+    // interactive slot for seconds, so folder clicks looked dead until it finished.
     const page = this.searchAssets({
       libraryId: input.libraryId,
       query: definition.query,
+      filters: definition.filters,
+      scope: definition.scope,
       sort: definition.sort,
       showIgnored: definition.showIgnored,
-      sessionAssetIds: session.assetIds,
       limit: input.limit ?? 100,
       offset: 0,
+    });
+    const changeSequence = this.getBrowseChangeSequence(input.libraryId);
+    const cachedBrowse = openLibrary.browseIndexCache;
+    const firstPageIds = page.items.map((item) => item.assetId);
+    const cachedIds = cachedBrowse !== undefined
+      && cachedBrowse.browseChangeSequence === changeSequence
+      && this.isDefaultBrowseIndexRequest({
+        query: definition.query,
+        filters: definition.filters,
+        scope: definition.scope,
+        sort: definition.sort,
+        showIgnored: definition.showIgnored,
+      })
+      && cachedBrowse.assetIds.length === page.total
+      ? cachedBrowse.assetIds
+      : undefined;
+    const session = this.browseSessionStore.create({
+      libraryId: input.libraryId,
+      libraryGeneration: input.libraryGeneration,
+      changeSequence,
+      queryFingerprint: browseQueryFingerprint(definition),
+      query: definition.query,
+      filters: definition.filters,
+      scope: definition.scope,
+      sort: definition.sort,
+      showIgnored: definition.showIgnored,
+      declaredTotal: page.total,
+      assetIds: cachedIds ?? firstPageIds,
     });
     return {
       session,
       items: page.items,
-      total: session.assetIds.length,
+      total: page.total,
       offset: 0,
       ...(page.snippets ? { snippets: page.snippets } : {}),
     };
@@ -31023,19 +31040,27 @@ export class LibraryService {
     if (lookup.status !== 'ready') return lookup;
     const offset = Math.max(0, input.offset ?? 0);
     const limit = Math.min(500, Math.max(1, input.limit ?? 100));
+    const session = lookup.session;
+    const useSnapshot = browseSessionPageUsesSnapshot(session, offset, limit);
     const page = this.searchAssets({
       libraryId: input.libraryId,
-      query: lookup.session.query,
-      sort: lookup.session.sort,
-      sessionAssetIds: lookup.session.assetIds,
+      query: session.query,
+      ...(useSnapshot
+        ? { sessionAssetIds: session.assetIds }
+        : {
+            filters: session.filters ? [...session.filters] : null,
+            scope: session.scope,
+          }),
+      sort: session.sort,
+      showIgnored: session.showIgnored,
       limit,
       offset,
     });
     return {
       status: 'ready',
-      session: lookup.session,
+      session,
       items: page.items,
-      total: lookup.session.assetIds.length,
+      total: session.declaredTotal,
       offset,
       ...(page.snippets ? { snippets: page.snippets } : {}),
     };
@@ -31085,15 +31110,43 @@ export class LibraryService {
     });
     if (lookup.status !== 'ready') return lookup;
 
+    const session = lookup.session;
     const startIndex = Math.min(
-      lookup.session.assetIds.length,
+      session.declaredTotal,
       Math.max(0, input.startIndex ?? 0),
     );
     const limit = Math.min(500, Math.max(1, input.limit ?? 128));
+    const useSnapshot = browseSessionPageUsesSnapshot(session, startIndex, limit);
+    if (!useSnapshot) {
+      const page = this.searchAssets({
+        libraryId: input.libraryId,
+        query: session.query,
+        filters: session.filters ? [...session.filters] : null,
+        scope: session.scope,
+        sort: session.sort,
+        showIgnored: session.showIgnored,
+        limit,
+        offset: startIndex,
+      });
+      return {
+        status: 'ready',
+        session,
+        startIndex,
+        entries: page.items.map((item, index) => ({
+          index: startIndex + index,
+          assetId: item.assetId,
+          width: item.width,
+          height: item.height,
+          ...(item.thumbnailArtifactId !== undefined
+            ? { previewArtifactId: item.thumbnailArtifactId }
+            : {}),
+        })),
+      };
+    }
     const page = this.searchAssets({
       libraryId: input.libraryId,
       query: null,
-      sessionAssetIds: lookup.session.assetIds,
+      sessionAssetIds: session.assetIds,
       layoutOnly: true,
       limit,
       offset: startIndex,
@@ -31115,7 +31168,7 @@ export class LibraryService {
     }));
     return {
       status: 'ready',
-      session: lookup.session,
+      session,
       startIndex,
       entries,
     };
@@ -31135,10 +31188,33 @@ export class LibraryService {
       changeSequence: this.getBrowseChangeSequence(input.libraryId),
     });
     if (lookup.status !== 'ready') return lookup;
+    if (browseSessionIndexComplete(lookup.session)) {
+      return {
+        status: 'ready',
+        session: lookup.session,
+        assetIds: [...lookup.session.assetIds],
+      };
+    }
+    const completed = this.searchAssets({
+      libraryId: input.libraryId,
+      query: lookup.session.query,
+      filters: lookup.session.filters ? [...lookup.session.filters] : null,
+      scope: lookup.session.scope,
+      sort: lookup.session.sort,
+      showIgnored: lookup.session.showIgnored,
+      idsOnly: true,
+      limit: null,
+      offset: 0,
+    });
+    const session = this.browseSessionStore.replaceAssetIds(
+      input.libraryId,
+      input.sessionId,
+      completed.assetIds ?? [],
+    ) ?? lookup.session;
     return {
       status: 'ready',
-      session: lookup.session,
-      assetIds: [...lookup.session.assetIds],
+      session,
+      assetIds: [...session.assetIds],
     };
   }
 

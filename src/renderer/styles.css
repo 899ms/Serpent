@@ -9007,16 +9007,20 @@ select.ai-config-input.ai-config-languages {
   min-height: 0;
 }
 
+.workspace-canvas-host.is-navigating:not(.is-viewing) {
+  cursor: progress;
+}
+
 .workspace-navigation-hold {
   position: absolute;
   inset: 0;
   z-index: var(--ui-layer-popover);
-  /* Intentionally transparent: it only captures pointer events (so the user
-     cannot act on content that is about to be replaced) and shows the progress
-     cursor. A tinted layer read as a brightness flash on every folder switch
-     (Serpent-565785 feedback); the switch must not change screen brightness. */
+  pointer-events: none;
+  /* Transparent wait cursor only. Capturing pointer here made the canvas look
+     frozen (cards ignored clicks) while sidebar CSS hover still worked —
+     Serpent-52eed4. Folder selection now updates on click; this layer must not
+     eat the next click. */
   background: transparent;
-  cursor: progress;
 }
 
 .workspace-canvas-host > .activity-strip {

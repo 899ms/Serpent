@@ -1,5 +1,9 @@
 # Serpent 项目状态
 
+- **2026-09-14 切文件夹假死第二轮（`Serpent-52eed4`）**：用户确认切文件夹**卡顿仍在，但不再阻碍操作**。已交付：侧栏选中即时更新、导航挡板不吞点击、浏览会话先返回有界首屏；路径查询/状态轮询让出 interactive 槽，协议读 2 路并发门。内容切换变快仍属 PERF2（`Serpent-e9a66b`），本单保持 open。见[开发日志](development/2026-09-14-network-library-interactive-starvation-development-log.md)。清单 `NAS-NAV-001`。
+
+- **2026-09-14 网络库浏览卡死（`Serpent-52eed4`，当前 `dev`）**：安装包打开 UNC 网络库时，源路径解析、1 秒状态轮询和 AI 测连占着唯一的 `interactive-control` 槽，切文件夹与点击像被卡住；主进程并发 `open` 网络文件还会打满 libuv 线程池。已把路径查询和轮询改到 background，浏览会话保留 interactive，并给协议读加 2 路并发门。调度器 interactive 互斥未改（避免回归切库饿死）。见[开发日志](development/2026-09-14-network-library-interactive-starvation-development-log.md)。不关闭 `Serpent-3kfe` / `Serpent-e9a66b`。packaged/真实网络库待用户复验。
+
 - **2026-09-13 PERF2-01 协议与基线**：`codex/performance-20260913` 上落地 `consumerId` / `catalogSequence` / `minCatalogSequence` / 有界 `mutationReceipt` 与 persist 计时入口。同步自旋 barrier 证明已开始的 mutation 不能被 browse 抢占。20k 合集 SQL persist 与一次真实 SMB 空库 persist 已记入[开发日志](development/2026-09-13-perf2-01-catalog-protocol-development-log.md)；UI 首屏、解码分母、packaged 未执行。不关闭 `Serpent-3kfe` / `Serpent-sa65`。
 
 - **2026-09-13 交互性能设计与拆分**：针对文件夹切换、NAS、资源加载和新建文件夹反馈慢，形成[第二阶段顶层设计](implementation/2026-09-13-interactive-performance-design.md)与[执行安排](development/2026-09-13-interactive-performance-execution.md)。采用受控只读执行隔离、有界首屏、NAS版本化快照、提交后局部投影及定向刷新。PERF2-01 协议已开始实施；产品能力验收仍未执行；不替代历史用户工单关闭证据。

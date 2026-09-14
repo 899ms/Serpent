@@ -2,6 +2,12 @@ import { constants, type ReadStream } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 
+import { AsyncGate } from './async-gate';
+
+/** Leave spare libuv slots for other Main I/O; never match the full threadpool. */
+export const ARTIFACT_READ_CONCURRENCY = 2;
+const artifactReadGate = new AsyncGate(ARTIFACT_READ_CONCURRENCY);
+
 function responseBody(
   stream: ReadStream,
   onStreamError?: (error: Error) => void,
@@ -109,58 +115,60 @@ export async function createArtifactResponse(
   const streamError = options.onStreamError;
   const abortSignal = options.signal ?? null;
 
-  const flags = process.platform === 'win32'
-    ? constants.O_RDONLY
-    : constants.O_RDONLY | constants.O_NOFOLLOW;
-  const handle = await open(absolutePath, flags);
-  try {
-    const fileStat = await handle.stat();
-    if (!fileStat.isFile()) {
-      await handle.close();
-      throw new Error('Artifact is not a regular file.');
-    }
-    const size = fileStat.size;
-    const commonHeaders = {
-      'Accept-Ranges': 'bytes',
-      'Cache-Control': 'public, max-age=31536000, immutable',
-      'Content-Type': mimeType,
-    };
+  return artifactReadGate.run(async () => {
+    const flags = process.platform === 'win32'
+      ? constants.O_RDONLY
+      : constants.O_RDONLY | constants.O_NOFOLLOW;
+    const handle = await open(absolutePath, flags);
+    try {
+      const fileStat = await handle.stat();
+      if (!fileStat.isFile()) {
+        await handle.close();
+        throw new Error('Artifact is not a regular file.');
+      }
+      const size = fileStat.size;
+      const commonHeaders = {
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'Content-Type': mimeType,
+      };
 
-    if (!rangeHeader) {
-      // FileHandle.createReadStream closes the HANDLE itself on close — never
-      // build a raw-fd stream from an open FileHandle, or the handle's GC
-      // finalizer later re-closes the descriptor and crashes Main with EBADF.
-      return new Response(responseBody(handle.createReadStream(), streamError, abortSignal), {
-        status: 200,
-        headers: { ...commonHeaders, 'Content-Length': String(size) },
+      if (!rangeHeader) {
+        // FileHandle.createReadStream closes the HANDLE itself on close — never
+        // build a raw-fd stream from an open FileHandle, or the handle's GC
+        // finalizer later re-closes the descriptor and crashes Main with EBADF.
+        return new Response(responseBody(handle.createReadStream(), streamError, abortSignal), {
+          status: 200,
+          headers: { ...commonHeaders, 'Content-Length': String(size) },
+        });
+      }
+
+      const range = parseByteRange(rangeHeader, size);
+      if (!range) {
+        await handle.close();
+        return new Response(null, {
+          status: 416,
+          headers: { ...commonHeaders, 'Content-Range': `bytes */${size}` },
+        });
+      }
+
+      const length = range.end - range.start + 1;
+      return new Response(responseBody(handle.createReadStream({
+        start: range.start,
+        end: range.end,
+      }), streamError, abortSignal), {
+        status: 206,
+        headers: {
+          ...commonHeaders,
+          'Content-Length': String(length),
+          'Content-Range': `bytes ${range.start}-${range.end}/${size}`,
+        },
       });
+    } catch (error) {
+      // Failure before the stream owns the handle: release it. Once handed off,
+      // handle.createReadStream auto-closes it and this path is unreachable.
+      await handle.close().catch(() => undefined);
+      throw error;
     }
-
-    const range = parseByteRange(rangeHeader, size);
-    if (!range) {
-      await handle.close();
-      return new Response(null, {
-        status: 416,
-        headers: { ...commonHeaders, 'Content-Range': `bytes */${size}` },
-      });
-    }
-
-    const length = range.end - range.start + 1;
-    return new Response(responseBody(handle.createReadStream({
-      start: range.start,
-      end: range.end,
-    }), streamError, abortSignal), {
-      status: 206,
-      headers: {
-        ...commonHeaders,
-        'Content-Length': String(length),
-        'Content-Range': `bytes ${range.start}-${range.end}/${size}`,
-      },
-    });
-  } catch (error) {
-    // Failure before the stream owns the handle: release it. Once handed off,
-    // handle.createReadStream auto-closes it and this path is unreachable.
-    await handle.close().catch(() => undefined);
-    throw error;
-  }
+  });
 }

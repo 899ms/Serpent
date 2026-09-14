@@ -44,6 +44,12 @@
 
 > 2026-08-27 P0：从硬盘删除后再导入同一份 Serpent ZIP，导入库 ID 不变；删除时的 `serpent://` 读取拦住若泄漏，全部卡片会变成裂开图标。见 LIB-ZIP-001（已通过）。
 
+### 2026-09-14 网络资源库浏览响应
+
+| ID | 功能 | 状态 | 人类操作 | 预期结果 | 证据 | 结果/反馈 |
+| --- | --- | --- | --- | --- | --- | --- |
+| NAS-NAV-001 / `Serpent-52eed4` | 网络库打开后画布可点、切文件夹不被后台工作卡住 | 待人类验收 | ① **完全退出**当前 Electron 后再 `npm start`（主进程/Worker 改动不会热更新）。② 打开网络共享上的资源库。③ 等卡片出现后立刻点击/框选画布。④ 在侧栏连续点几个文件夹（含从「所有资产」点进小文件夹）；观察名称和选中高亮是否马上跟上，以及卡顿时卡片是否仍能点。 | 点文件夹后名称和选中马上变；卡顿期间卡片和其它文件夹仍能点（不要再出现 hover 有效、点击全无效）。内容可以稍后到。开库仍可能超过 3 秒才进主界面。切文件夹本身变快属于 PERF2，不在本条已交付范围内。 | [开发日志](../development/2026-09-14-network-library-interactive-starvation-development-log.md) / `src/worker/library-service.ts` `createBrowseSession` / `src/renderer/App.tsx` `acknowledgeWorkspaceNavigation` / `src/renderer/styles.css` `.workspace-navigation-hold` | 2026-09-14 第二轮用户确认：**切文件夹卡顿仍在，但不再阻碍操作**（卡片/文件夹可点）。操作假死视为消除；内容切换耗时仍走 `Serpent-e9a66b` / PERF2。第一轮曾不通过（hover 有效、点击全无效）。定向 4 files / 44 passed，`tsc --noEmit` 通过。packaged 未执行。 |
+
 ### 2026-09-13 资源库切换与侧栏导航
 
 | ID | 功能 | 状态 | 人类操作 | 预期结果 | 证据 | 结果/反馈 |

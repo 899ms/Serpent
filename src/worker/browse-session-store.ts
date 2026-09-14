@@ -1,12 +1,21 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-import type { SearchQuery, SortDefinition } from '../shared/asset-types';
+import type {
+  FilterClause,
+  SearchQuery,
+  SearchScope,
+  SortDefinition,
+} from '../shared/asset-types';
 
 /**
  * Worker-owned snapshot of an ordered browse scope. The snapshot contains
  * asset ids plus the small query context needed to enrich later pages with
  * search snippets; summaries, artifact descriptors and media bytes remain
  * outside the session store and are read for the requested page.
+ *
+ * `assetIds` may be only the first painted page. `declaredTotal` is the COUNT
+ * at open; later pages re-query the stored definition until the ordered index
+ * is completed (select-all / ids read).
  */
 export interface BrowseSessionSnapshot {
   readonly sessionId: string;
@@ -16,9 +25,30 @@ export interface BrowseSessionSnapshot {
   readonly queryFingerprint: string;
   /** Original query/sort are retained only to enrich later pages (snippets). */
   readonly query: SearchQuery | null;
+  readonly filters: readonly FilterClause[] | null;
+  readonly scope: SearchScope | null;
   readonly sort: SortDefinition | null;
+  readonly showIgnored: boolean;
+  /** Scope COUNT when the session opened. May exceed `assetIds.length`. */
+  readonly declaredTotal: number;
   readonly assetIds: readonly string[];
   readonly createdAt: number;
+}
+
+export function browseSessionIndexComplete(session: BrowseSessionSnapshot): boolean {
+  return session.assetIds.length >= session.declaredTotal;
+}
+
+/** True when this window can be sliced from the ids already snapshotted. */
+export function browseSessionPageUsesSnapshot(
+  session: BrowseSessionSnapshot,
+  offset: number,
+  limit: number,
+): boolean {
+  if (browseSessionIndexComplete(session)) return true;
+  const start = Math.max(0, offset);
+  const size = Math.max(0, limit);
+  return start + size <= session.assetIds.length;
 }
 
 export type BrowseSessionLookup =
@@ -49,10 +79,15 @@ export class BrowseSessionStore {
     changeSequence: number;
     queryFingerprint: string;
     query?: SearchQuery | null;
+    filters?: readonly FilterClause[] | null;
+    scope?: SearchScope | null;
     sort?: SortDefinition | null;
+    showIgnored?: boolean;
+    declaredTotal?: number;
     assetIds: readonly string[];
     createdAt?: number;
   }): BrowseSessionSnapshot {
+    const assetIds = [...input.assetIds];
     const session: BrowseSessionSnapshot = {
       sessionId: randomUUID(),
       libraryId: input.libraryId,
@@ -60,13 +95,33 @@ export class BrowseSessionStore {
       changeSequence: input.changeSequence,
       queryFingerprint: input.queryFingerprint,
       query: input.query ?? null,
+      filters: input.filters ? [...input.filters] : null,
+      scope: input.scope ?? null,
       sort: input.sort ?? null,
-      assetIds: [...input.assetIds],
+      showIgnored: input.showIgnored === true,
+      declaredTotal: input.declaredTotal ?? assetIds.length,
+      assetIds,
       createdAt: input.createdAt ?? Date.now(),
     };
     this.#sessions.set(session.sessionId, session);
     this.#evictOldest();
     return session;
+  }
+
+  replaceAssetIds(
+    libraryId: string,
+    sessionId: string,
+    assetIds: readonly string[],
+  ): BrowseSessionSnapshot | null {
+    const session = this.#sessions.get(sessionId);
+    if (!session || session.libraryId !== libraryId) return null;
+    const next: BrowseSessionSnapshot = {
+      ...session,
+      assetIds: [...assetIds],
+      declaredTotal: assetIds.length,
+    };
+    this.#sessions.set(sessionId, next);
+    return next;
   }
 
   lookup(input: {

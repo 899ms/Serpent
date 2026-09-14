@@ -4647,6 +4647,12 @@ function AppInner() {
     if (location.kind === "trash") setTrashBrowseTombstoneId(location.tombstoneId);
   }
 
+  /** Sidebar selection and chrome must move on the click, not after Worker SQL. */
+  function acknowledgeWorkspaceNavigation(location: WorkspaceNavLocation): void {
+    applyWorkspaceLocationFlags(location);
+    closeContextMenu();
+  }
+
   function virtualLayoutSnapshotForCurrentViewport(): WorkspaceVirtualLayoutSnapshot | null {
     if (!virtualBrowseLayout) return null;
     const viewport = captureWorkspaceNavViewport(workspaceCanvasRef.current);
@@ -5561,6 +5567,16 @@ function AppInner() {
       : scope !== "all" && scope !== "root"
         ? isFolderRecursiveEnabled(folderRecursivePrefs, targetLibraryId, scope)
         : false;
+    acknowledgeWorkspaceNavigation(
+      scope === "all"
+        ? { kind: "all" }
+        : scope === "root"
+          ? { kind: "root" }
+          : { kind: "folder", folderId: scope },
+    );
+    folderRecursiveRef.current = recursive;
+    setFolderRecursive(recursive);
+    managedImportTargetFolderIdRef.current = folderId;
     let commitPreparedContent: (() => void) | undefined;
     try {
       // REQ-VIEW-004: leave the browse affiliate viewer when the browse scope changes.
@@ -5645,6 +5661,7 @@ function AppInner() {
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
+    acknowledgeWorkspaceNavigation({ kind: "trash", tombstoneId });
     await closeAssetPreview(false);
     if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
     if (showTrash && !request.deferReveal) {
@@ -5974,13 +5991,14 @@ function AppInner() {
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
-    await closeAssetPreview(false);
-    if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
     const tag = tags.find((candidate) => candidate.tagId === tagId);
     if (!tag) {
       setWorkspaceNavigationPending(false);
       return;
     }
+    acknowledgeWorkspaceNavigation({ kind: "tag", tagId });
+    await closeAssetPreview(false);
+    if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
     try {
       const definition = request.browseState
         ? queryDefinitionForWorkspaceBrowseState(request.browseState)
@@ -6500,11 +6518,16 @@ function AppInner() {
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
-    await closeAssetPreview(false);
-    if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
     if (request.browseState) {
       recursive = request.browseState.collectionRecursive;
     }
+    acknowledgeWorkspaceNavigation({
+      kind: "collection",
+      collectionId,
+      recursive,
+    });
+    await closeAssetPreview(false);
+    if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
     try {
       const definition = request.browseState
         ? queryDefinitionForWorkspaceBrowseState(request.browseState)
@@ -7828,6 +7851,10 @@ function AppInner() {
     const targetLibraryId = library.libraryId;
     const viewSession = ensureLibraryView(targetLibraryId);
     if (!viewSession) return;
+    acknowledgeWorkspaceNavigation({
+      kind: "smart-collection",
+      collectionId,
+    });
     await closeAssetPreview(false);
     if (!request.isCurrent() || !isCurrentLibraryView(viewSession)) return;
     try {
@@ -12502,7 +12529,7 @@ function AppInner() {
         )}
         <div
           aria-busy={workspaceNavigationPending}
-          className={`workspace-canvas-host${previewAsset ? " is-viewing" : previewRestoring ? " is-restoring" : ""}`}
+          className={`workspace-canvas-host${previewAsset ? " is-viewing" : previewRestoring ? " is-restoring" : ""}${workspaceNavigationPending ? " is-navigating" : ""}`}
         >
           {renderedToastStack.length > 0
             ? createPortal(
