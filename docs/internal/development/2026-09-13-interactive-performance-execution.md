@@ -16,7 +16,7 @@
 | 编号 / 工单 | 交付边界 | 技术前置 | 模型 / 状态 |
 | --- | --- | --- | --- |
 | PERF2-01 / `Serpent-41426d` | 端到端性能基线与读版本/提交回执协议 | 无 | 协议与基线已交付；见 PERF2-01 开发日志。读隔离未做 |
-| PERF2-02 / `Serpent-6dc70b` | 提取共享纯读目录服务，分离隐藏物化写入 | PERF2-01 | Luna Extra High；未开始 |
+| PERF2-02 / `Serpent-6dc70b` | 提取共享纯读目录服务，分离隐藏物化写入 | PERF2-01 | Luna Extra High；实现与独立双轴复审通过；整体性能 / 产品验收未完成，工单保持 in_progress |
 | PERF2-03 / `Serpent-0ecab5` | 只读UtilityProcess直达路由与真正的导航抢占 | PERF2-02 | Luna Extra High；未开始 |
 | PERF2-04 / `Serpent-078a15` | 首屏优先的两阶段BrowseSession与稳定顺序 | PERF2-03 | Luna Extra High；未开始 |
 | PERF2-05 / `Serpent-f60a3f` | NAS快照持久命中、版本发布与写后可见 | PERF2-03、PERF2-04 | Luna Extra High；未开始 |
@@ -26,6 +26,16 @@
 | PERF2-09 / `Serpent-312c29` | 元数据队列有界入队与维护写事务预算 | PERF2-05、PERF2-07 | Luna Extra High；未开始 |
 | PERF2-10 / `Serpent-6db419` | 最终独立双轴审查与本地/SMB性能验收 | PERF2-04、PERF2-05、PERF2-06、PERF2-07、PERF2-08、PERF2-09 | Luna Extra High；未开始 |
 <!-- PERF2_TICKETS_END -->
+
+2026-09-14 当前实例诊断补充了三个窄前置，详见[文件夹切换与资源加载性能优化方向](../implementation/2026-09-14-folder-switch-and-resource-loading-optimization.md)：
+
+| 工单 | 交付边界 | 关系 / 状态 |
+| --- | --- | --- |
+| `Serpent-26f22b` | 打开对账消除逐文件探针放大并补齐阶段指标 | PERF2-07 前置；未开始 |
+| `Serpent-e97c00` | 任务状态事件化与有界 single-flight 轮询 | `Serpent-52eed4` 剩余根因；未开始 |
+| `Serpent-1de919` | ready artifact 与冗余派生任务队列收敛 | PERF2-09 前置；未开始 |
+
+这三个工单只细化已实测的瓶颈，不取代 PERF2-02/03/04/08 的读隔离、首屏和媒体缓存直达范围。
 
 ## 模型、所有权与串行规则
 

@@ -166,10 +166,6 @@ import {
   createAutomationImportPlanHash,
 } from '../shared/automation-file-plan';
 import { hasMeaningfulSmartCollectionCondition } from '../shared/smart-collection-query';
-import {
-  colorFilterSql,
-  parseColorFilterIds,
-} from '../shared/color-filter-presets';
 import type {
   LibraryChangedEvent,
   MissingAssetRecoveryProbe,
@@ -624,13 +620,32 @@ import {
   resolveWritableLibraryParent,
 } from './library-parent';
 import {
-  buildTrigramFts5Query,
-  canUseTrigramSearch,
   normalizeSearchText,
   tokenizeForFts,
   type SearchClause,
-  type SearchGroup,
 } from './search-query';
+import {
+  buildCatalogAssetVisibilityPredicates,
+  buildCatalogCollectionScope,
+  buildCatalogContextualSearchWhere,
+  buildCatalogExplicitIgnoreSql,
+  buildCatalogFilterWhere,
+  buildCatalogFolderScopeClause,
+  buildCatalogFtsQuery,
+  buildCatalogSortOrder,
+  catalogAssetSummaryFromRow,
+  catalogBrowseLayoutEntryFromRow,
+  catalogFtsCanNarrowSearchGroups,
+  countCatalogNavigationAssets,
+  foldCatalogImageSequenceSummaries,
+  hasPositiveCatalogSearchClause,
+  isDefaultCatalogBrowseIndexRequest,
+  normalizedCatalogSearchGroups,
+  readCatalogArtifactDescriptor,
+  readCatalogThumbnailArtifacts,
+  type CatalogAssetSummaryRow,
+  type CatalogSearchGroup as SearchGroup,
+} from './catalog-read';
 import {
   GIF_GOOD_PAGE_SCORE_THRESHOLD,
   GIF_THUMBNAIL_PROBE_SIZE,
@@ -727,7 +742,6 @@ import {
 } from './image-color-space';
 import {
   countTextLines,
-  expandFormatFilterTokens,
   isTextFileName,
   TEXT_SAVE_MAX_BYTES,
   TEXT_VIEWER_MAX_BYTES,
@@ -740,7 +754,6 @@ import {
   detectImageSequences,
   findImageSequenceContaining,
   formatImageSequenceDisplayName,
-  parseImageSequenceFileName,
   type ImageSequenceFrameCandidate,
 } from '../shared/image-sequence';
 import { isImportConflictPlan, isImportSourceFailurePlan } from '../shared/import-outcome';
@@ -5822,49 +5835,21 @@ function ensurePluginDerivedFieldsSchema(connection: DatabaseConnection): void {
   );
 }
 
-const SEARCH_INDEX_FIELDS = [
-  'filename',
-  'tags',
-  'description',
-  'source_url',
-  'author',
-  'folder_path',
-  'metadata_text',
-] as const;
-type SearchIndexField = (typeof SEARCH_INDEX_FIELDS)[number];
-
 function normalizedSearchGroups(query: {
   clauses: SearchClause[];
   groups?: SearchGroup[];
 }): SearchGroup[] {
-  if (query.groups && query.groups.length > 0) return query.groups;
-  return query.clauses.length > 0 ? [query.clauses] : [];
+  return normalizedCatalogSearchGroups(query);
 }
 
 function hasPositiveSearchClause(groups: SearchGroup[]): boolean {
-  return groups.some((group) => group.some((clause) => !clause.exclude));
+  return hasPositiveCatalogSearchClause(groups);
 }
 
 function ftsCanNarrowSearchGroups(groups: SearchGroup[]): boolean {
-  return (
-    groups.length > 0 &&
-    groups.every((group) => group.some((clause) => !clause.exclude)) &&
-    canUseTrigramSearch(groups)
-  );
+  return catalogFtsCanNarrowSearchGroups(groups);
 }
 
-function searchFieldsForClause(field: string | null): readonly SearchIndexField[] {
-  if (field === null) return SEARCH_INDEX_FIELDS;
-  return SEARCH_INDEX_FIELDS.includes(field as SearchIndexField)
-    ? [field as SearchIndexField]
-    : [];
-}
-
-/**
- * Exact contains predicate applied after the FTS candidate lookup (or alone
- * for one/two-character terms). It is deliberately parameterized: user text
- * never becomes SQL, even when a saved smart collection is malformed.
- */
 function buildContextualSearchWhere(
   groups: SearchGroup[],
   assetOnly = false,
@@ -5872,112 +5857,7 @@ function buildContextualSearchWhere(
   sql: string;
   params: string[];
 } {
-  const params: string[] = [];
-  const groupExpressions: string[] = [];
-  for (const group of groups) {
-    const clauseExpressions: string[] = [];
-    for (const clause of group) {
-      const fields = searchFieldsForClause(clause.field);
-      const normalizedValues = clause.values
-        .map((value) => normalizeSearchText(value).trim())
-        .filter(Boolean);
-      if (fields.length === 0 || normalizedValues.length === 0) {
-        clauseExpressions.push('0');
-        continue;
-      }
-      const valueExpressions = normalizedValues.map((value) => {
-        // Serpent-verg.2 — lenient read (0031 §1): libraries without the
-        // asset_search_index table degrade to a filename substring match on
-        // the assets table; non-filename fields are not searchable there and
-        // degrade to no match.
-        const fieldExpressions = fields
-          .map((field) => {
-            if (assetOnly) {
-              if (field !== 'filename' && field !== 'folder_path') return null;
-              params.push(value);
-              return `instr(a.relative_file_path, ?) > 0`;
-            }
-            params.push(value);
-            return `instr(sc.${field}, ?) > 0`;
-          })
-          .filter((expression): expression is string => expression !== null);
-        if (fieldExpressions.length === 0) {
-          return '0';
-        }
-        return fieldExpressions.length === 1
-          ? fieldExpressions[0]!
-          : `(${fieldExpressions.join(' OR ')})`;
-      });
-      const clauseExpression =
-        valueExpressions.length === 1
-          ? valueExpressions[0]!
-          : `(${valueExpressions.join(' OR ')})`;
-      clauseExpressions.push(
-        clause.exclude ? `NOT (${clauseExpression})` : `(${clauseExpression})`,
-      );
-    }
-    if (clauseExpressions.length > 0) {
-      groupExpressions.push(`(${clauseExpressions.join(' AND ')})`);
-    }
-  }
-  return {
-    sql:
-      groupExpressions.length === 0
-        ? '0'
-        : groupExpressions.length === 1
-          ? groupExpressions[0]!
-          : `(${groupExpressions.join(' OR ')})`,
-    params,
-  };
-}
-
-/**
- * Stable relevance tiers for contextual search. Exact beats prefix, prefix
- * beats arbitrary contains, and ties favour filename then tags before the
- * remaining indexed fields. Multiple positive terms retain the best tier.
- */
-function buildContextualSearchRank(groups: SearchGroup[]): {
-  sql: string;
-  params: string[];
-} {
-  const params: string[] = [];
-  const termRanks: string[] = [];
-  for (const clause of groups.flat()) {
-    if (clause.exclude) continue;
-    const fields = searchFieldsForClause(clause.field);
-    for (const rawValue of clause.values) {
-      const value = normalizeSearchText(rawValue).trim();
-      if (!value || fields.length === 0) continue;
-      const fieldRanks = fields.map((field) => {
-        const fieldPriority = SEARCH_INDEX_FIELDS.indexOf(field);
-        params.push(value, value, value);
-        return `CASE
-          WHEN sc.${field} = ? THEN ${fieldPriority}
-          WHEN instr(sc.${field}, ?) = 1 THEN ${10 + fieldPriority}
-          WHEN instr(sc.${field}, ?) > 0 THEN ${20 + fieldPriority}
-          ELSE 99
-        END`;
-      });
-      termRanks.push(
-        fieldRanks.length === 1
-          ? fieldRanks[0]!
-          : `MIN(${fieldRanks.join(', ')})`,
-      );
-    }
-  }
-  return {
-    // Serpent-verg.2 — an empty rank must not emit a bare numeric literal:
-    // SQLite parses ORDER BY <number> as a column ordinal, so `ORDER BY 99`
-    // crashed every search whose fields were not indexed. Callers treat an
-    // empty sql as "no relevance tier" and fall back to the default sort.
-    sql:
-      termRanks.length === 0
-        ? ''
-        : termRanks.length === 1
-          ? termRanks[0]!
-          : `MIN(${termRanks.join(', ')})`,
-    params,
-  };
+  return buildCatalogContextualSearchWhere(groups, assetOnly);
 }
 
 /**
@@ -14382,30 +14262,13 @@ export class LibraryService {
   }): number {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     const connection = openLibrary.connection;
-    const whereParts = [
-      input.scope === 'trash' ? 'a.deleted_at IS NOT NULL' : 'a.deleted_at IS NULL',
-    ];
-    if (input.scope === 'root') {
-      whereParts.push("a.location_kind = 'managed' AND a.managed_folder_id IS NULL");
-    }
-    if (hasTable(connection, 'linked_ignored_assets')) {
-      whereParts.push(
-        'NOT EXISTS (SELECT 1 FROM linked_ignored_assets ignored WHERE ignored.asset_id = a.asset_id)',
-      );
-    }
-    whereParts.push(this.explicitIgnoreSql(connection, 'a', input.showIgnored));
-    if (hasTable(connection, 'asset_sequence_frames')) {
-      whereParts.push(`NOT EXISTS (
-        SELECT 1
-          FROM asset_sequence_frames hidden_sequence_frame
-         WHERE hidden_sequence_frame.asset_id = a.asset_id
-           AND hidden_sequence_frame.position > 0
-      )`);
-    }
-    const row = connection
-      .prepare(`SELECT COUNT(*) AS total FROM assets a WHERE ${whereParts.join(' AND ')}`)
-      .get() as { total: number };
-    return row.total;
+    return countCatalogNavigationAssets(connection, {
+      scope: input.scope,
+      showIgnored: input.showIgnored,
+      explicitIgnoreSql: this.explicitIgnoreSql(connection, 'a', input.showIgnored),
+      hasLinkedIgnoredAssets: hasTable(connection, 'linked_ignored_assets'),
+      hasSequenceFrames: hasTable(connection, 'asset_sequence_frames'),
+    });
   }
 
   /**
@@ -14655,19 +14518,14 @@ export class LibraryService {
       .filter((ref) => ref.locationKind === 'managed')
       .map((ref) => ref.folderId);
     if (managedIds.length > 0) {
-      const rows = withSqliteInPredicate(
-        openLibrary.connection,
-        'folder_id',
-        managedIds,
-        (sql, params) =>
-          openLibrary.connection
-            .prepare(
-              `SELECT folder_id, parent_folder_id, name, relative_path, path_identity
-                 FROM managed_folders
-                WHERE ${sql}`,
-            )
-            .all(...params) as ManagedFolderRow[],
-      );
+      const rows = sqliteAllInChunks<string, ManagedFolderRow>({
+        connection: openLibrary.connection,
+        values: managedIds,
+        buildSql: (placeholders) =>
+          `SELECT folder_id, parent_folder_id, name, relative_path, path_identity
+             FROM managed_folders
+            WHERE folder_id IN (${placeholders})`,
+      });
       const rowById = new Map(rows.map((row) => [row.folder_id, row]));
       const visibleIds = rows
         .filter(
@@ -16467,7 +16325,12 @@ export class LibraryService {
       .filter((asset) => primaryMembershipIds.has(asset.assetId))
       .map((asset) => asset.assetId);
     if (primaryIds.length === 0) {
-      return visible.map((asset) => ({ ...asset, sequence: null }));
+      return foldCatalogImageSequenceSummaries({
+        assets,
+        memberships,
+        frameRows: [],
+        artifacts: new Map(),
+      });
     }
     const sequenceArtifactColumns = columnsFor(openLibrary.connection, 'revision_artifacts');
     const sequenceSourceDimensionColumns = sequenceArtifactColumns.has('width') && sequenceArtifactColumns.has('height')
@@ -16523,67 +16386,11 @@ export class LibraryService {
       openLibrary.summary.libraryId,
       frameRows.map((row) => row.asset_id),
     );
-    const sequences = new Map<string, AssetSummary['sequence']>();
-    const sequenceByteSizes = new Map<string, number>();
-    for (const row of frameRows) {
-      const current = sequences.get(row.primary_asset_id) ?? {
-        sequenceId: row.sequence_id,
-        fps: row.fps,
-        frameCount: 0,
-        frames: [],
-      };
-      current.frames.push({
-        assetId: row.asset_id,
-        displayName: path.posix.basename(row.relative_file_path),
-        relativeFilePath: row.relative_file_path,
-        currentRevisionId: row.current_revision_id,
-        frameNumber: row.frame_number,
-        thumbnailArtifactId: artifacts.get(row.asset_id)?.artifactId ?? null,
-        ...(row.availability === 'available'
-          && !row.deleted_at
-          && isSourceDirectPreview({
-            fileName: row.relative_file_path,
-            mediaType: 'image',
-            byteSize: row.byte_size,
-            width: row.source_width,
-            height: row.source_height,
-          })
-          ? {
-              previewKind: 'source' as const,
-              previewRevisionId: row.current_revision_id,
-            }
-          : {}),
-      });
-      current.frameCount = current.frames.length;
-      sequences.set(row.primary_asset_id, current);
-      sequenceByteSizes.set(
-        row.primary_asset_id,
-        (sequenceByteSizes.get(row.primary_asset_id) ?? 0) + row.byte_size,
-      );
-    }
-    return visible.map((asset) => {
-      const sequence = sequences.get(asset.assetId) ?? null;
-      if (!sequence || sequence.frames.length === 0) {
-        return { ...asset, sequence: null };
-      }
-      const first = sequence.frames[0]!;
-      const last = sequence.frames.at(-1)!;
-      const parsed = parseImageSequenceFileName(first.relativeFilePath);
-      const displayName = parsed
-        ? formatImageSequenceDisplayName({
-            prefix: parsed.prefix,
-            firstFrame: first.frameNumber,
-            lastFrame: last.frameNumber,
-            numberStyle: parsed.numberStyle,
-            numericWidth: parsed.numericWidth,
-          })
-        : asset.displayName;
-      return {
-        ...asset,
-        byteSize: sequenceByteSizes.get(asset.assetId) ?? asset.byteSize,
-        displayName,
-        sequence,
-      };
+    return foldCatalogImageSequenceSummaries({
+      assets,
+      memberships,
+      frameRows,
+      artifacts,
     });
   }
 
@@ -26034,63 +25841,17 @@ export class LibraryService {
       this.artifactDescriptorCache.set(cacheKey, null, changeSequence);
       return null;
     }
-    const expectedGeneratorClause = options.expectedGeneratorVersion === undefined
-      ? ''
-      : 'AND generator_version = ?';
-    const row = connection
-      .prepare(
-        `SELECT ${present.join(', ')}
-           FROM revision_artifacts
-          WHERE revision_id = ?
-            AND kind = ?
-            ${artifactColumns.has('invalidated_at') ? 'AND invalidated_at IS NULL' : ''}
-            ${expectedGeneratorClause}
-          ORDER BY generated_at DESC, artifact_id DESC
-          LIMIT 1`,
-      )
-      .get(
-        assetRow.current_revision_id,
-        kind,
-        ...(options.expectedGeneratorVersion === undefined
-          ? []
-          : [options.expectedGeneratorVersion]),
-      ) as {
-        artifact_id?: string;
-        file_path?: string;
-        mime_type?: string;
-        generator_version?: string;
-        artifact_role?: string | null;
-        generator_id?: string | null;
-        settings_hash?: string | null;
-        artifact_key?: string | null;
-        status?: string;
-        error_code?: string | null;
-        width?: number | null;
-        height?: number | null;
-        generated_at?: string | null;
-      } | undefined;
-
-    if (!row) {
+    const descriptor = readCatalogArtifactDescriptor(connection, {
+      revisionId: assetRow.current_revision_id,
+      kind,
+      selectedColumns: present,
+      hasInvalidatedAt: artifactColumns.has('invalidated_at'),
+      expectedGeneratorVersion: options.expectedGeneratorVersion,
+    });
+    if (!descriptor) {
       this.artifactDescriptorCache.set(cacheKey, null, changeSequence);
       return null;
     }
-    const descriptor: ArtifactDescriptor = {
-      artifactId: row.artifact_id ?? '',
-      filePath: row.file_path ?? '',
-      mimeType: row.mime_type ?? '',
-      generatorVersion: row.generator_version ?? '',
-      artifactRole: row.artifact_role ?? null,
-      generatorId: row.generator_id ?? null,
-      settingsHash: row.settings_hash ?? null,
-      artifactKey: row.artifact_key ?? null,
-      // A missing status degrades to a non-ready value so callers treat the
-      // artifact as absent instead of failing.
-      status: row.status ?? '',
-      errorCode: row.error_code ?? null,
-      width: row.width ?? null,
-      height: row.height ?? null,
-      generatedAt: row.generated_at ?? null,
-    };
     this.artifactDescriptorCache.set(cacheKey, descriptor, changeSequence);
     return descriptor;
   }
@@ -30649,73 +30410,7 @@ export class LibraryService {
     if (!columnsFor(openLibrary.connection, 'revision_artifacts').has('status')) {
       return new Map();
     }
-
-    const rows = withSqliteInPredicate(
-      openLibrary.connection,
-      'a.asset_id',
-      assetIds,
-      (sql, params) =>
-        openLibrary.connection
-          .prepare(
-            `SELECT a.asset_id, ra.status AS thumbnail_status,
-                    ra.artifact_id AS thumbnail_artifact_id,
-                    COALESCE(ra.width, video_meta.width) AS artifact_width,
-                    COALESCE(ra.height, video_meta.height) AS artifact_height,
-                    video_meta.duration_ms AS artifact_duration_ms
-               FROM assets a
-               LEFT JOIN revision_artifacts ra
-                 ON ra.revision_id = a.current_revision_id
-                AND ra.kind = CASE
-                  WHEN LOWER(a.relative_file_path) LIKE '%.mp4'
-                    OR LOWER(a.relative_file_path) LIKE '%.webm'
-                    OR LOWER(a.relative_file_path) LIKE '%.mov'
-                    OR LOWER(a.relative_file_path) LIKE '%.avi'
-                    OR LOWER(a.relative_file_path) LIKE '%.wmv'
-                    OR LOWER(a.relative_file_path) LIKE '%.mkv'
-                    OR LOWER(a.relative_file_path) LIKE '%.m4v'
-                  THEN 'video_poster'
-                  ELSE 'thumbnail'
-                END
-                AND ra.invalidated_at IS NULL
-               LEFT JOIN revision_artifacts video_meta
-                 ON video_meta.revision_id = a.current_revision_id
-                AND video_meta.kind = 'extracted_metadata'
-                AND video_meta.status = 'ready'
-                AND video_meta.invalidated_at IS NULL
-              WHERE ${sql}`,
-          )
-          .all(...params) as Array<{
-            asset_id: string;
-            thumbnail_status: 'ready' | 'pending' | 'generating' | 'failed' | null;
-            thumbnail_artifact_id: string | null;
-            artifact_width: number | null;
-            artifact_height: number | null;
-            artifact_duration_ms: number | null;
-          }>,
-    );
-
-    const map = new Map<string, {
-      status: 'ready' | 'pending' | 'failed' | null;
-      artifactId: string | null;
-      width: number | null;
-      height: number | null;
-      durationMs: number | null;
-    }>();
-    for (const row of rows) {
-      const status = row.thumbnail_status === 'ready' ? 'ready'
-        : row.thumbnail_status === 'failed' ? 'failed'
-        : row.thumbnail_status === 'generating' || row.thumbnail_status === 'pending' ? 'pending'
-        : null;
-      map.set(row.asset_id, {
-        status,
-        artifactId: status === 'ready' ? row.thumbnail_artifact_id : null,
-        width: row.artifact_width,
-        height: row.artifact_height,
-        durationMs: row.artifact_duration_ms,
-      });
-    }
-
-    return map;
+    return readCatalogThumbnailArtifacts(openLibrary.connection, assetIds);
   }
 
   /** Return only statuses for callers that do not need artifact ids. */
@@ -30740,18 +30435,12 @@ export class LibraryService {
     query?: { clauses: SearchClause[]; groups?: SearchGroup[] } | null;
     filters?: FilterClause[] | null;
     scope?: SearchScope | null;
-    sort?: { field: string; order: 'asc' | 'desc' } | null;
+    sort?: SortDefinition | null;
     scopeMode?: boolean | null;
     idsOnly?: boolean | null;
     showIgnored?: boolean;
   }): boolean {
-    return input.query == null
-      && (input.filters?.length ?? 0) === 0
-      && input.scope == null
-      && input.sort == null
-      && input.scopeMode !== true
-      && input.idsOnly !== true
-      && input.showIgnored !== true;
+    return isDefaultCatalogBrowseIndexRequest(input);
   }
 
   private buildFilterWhere(
@@ -30761,170 +30450,7 @@ export class LibraryService {
       hasAiAssetTags: true,
     },
   ): { sql: string; params: unknown[] } {
-    const conditions: string[] = [];
-    const params: unknown[] = [];
-
-    for (const filter of filters) {
-      if ('ranges' in filter) {
-        const width = 'COALESCE(duration_meta.width, technical_thumbnail.width)';
-        const height = 'COALESCE(duration_meta.height, technical_thumbnail.height)';
-        // long_edge (REQ-FILTER-010): resolution buckets are defined on the
-        // longer side so portrait and landscape assets share one definition.
-        // Both dimensions missing -> NULLIF(...,0) -> NULL, so positive
-        // filters omit metadata-less assets like the other numeric fields.
-        const longEdge =
-          `NULLIF(MAX(COALESCE(${width}, 0), COALESCE(${height}, 0)), 0)`;
-        const column = filter.field === 'width'
-          ? width
-          : filter.field === 'height'
-            ? height
-            : filter.field === 'duration_ms'
-              ? 'duration_meta.duration_ms'
-              : filter.field === 'long_edge'
-                ? longEdge
-                : `(CAST(${width} AS REAL) / NULLIF(${height}, 0))`;
-        const rangeClauses = filter.ranges.map((range) => {
-          const bounds: string[] = [];
-          if (range.min !== undefined) {
-            bounds.push(`${column} >= ?`);
-            params.push(range.min);
-          }
-          if (range.max !== undefined) {
-            bounds.push(`${column} <= ?`);
-            params.push(range.max);
-          }
-          return `(${bounds.join(' AND ')})`;
-        });
-        const matchesAnyRange = `(${rangeClauses.join(' OR ')})`;
-        // SQL comparisons with NULL evaluate to UNKNOWN. A positive technical
-        // filter intentionally omits assets whose metadata has not been
-        // extracted; an exclusion filter retains them because they do not
-        // belong to the excluded numeric range.
-        conditions.push(filter.exclude
-          ? `(${column} IS NULL OR NOT ${matchesAnyRange})`
-          : matchesAnyRange);
-        continue;
-      }
-      // favorite + source_url are existence/boolean filters: they take no
-      // values (the presence/absence IS the filter). Handle before the
-      // empty-values skip so `values: []` does not silently drop them.
-      if (filter.field === 'favorite') {
-        conditions.push(
-          filter.exclude ? `(COALESCE(m.favorite, 0) != 1)` : `(COALESCE(m.favorite, 0) = 1)`,
-        );
-        continue;
-      }
-      if (filter.field === 'source_url') {
-        const hasUrl = `(m.source_page_url IS NOT NULL AND m.source_page_url != '')`;
-        conditions.push(filter.exclude ? `(NOT ${hasUrl})` : `(${hasUrl})`);
-        continue;
-      }
-      if (filter.values.length === 0) continue;
-
-      switch (filter.field) {
-        case 'format': {
-          const formatValues = expandFormatFilterTokens(filter.values);
-          if (formatValues.length === 0) break;
-          const likes = formatValues.map(() => `LOWER(a.relative_file_path) LIKE ?`);
-          const clause = filter.exclude
-            ? `NOT (${likes.join(' OR ')})`
-            : `(${likes.join(' OR ')})`;
-          conditions.push(clause);
-          for (const v of formatValues) {
-            params.push(`%.${v.toLowerCase()}`);
-          }
-          break;
-        }
-        case 'tag': {
-          // Human + AI tags both count by default. The explicit switch is
-          // filter-only; sorting and display keep the combined result.
-          const includeAi = filter.includeAi !== false && options.hasAiAssetTags;
-          const taggedAssetsSubquery = (nameParamCount: number) => {
-            const phs = Array.from({ length: nameParamCount }, () => '?').join(',');
-            const human = `SELECT hat.asset_id FROM human_asset_tags hat
-                      JOIN tags t ON t.tag_id = hat.tag_id
-                      WHERE t.name COLLATE NOCASE IN (${phs})`;
-            if (!includeAi) return human;
-            return `${human}
-                    UNION
-                    SELECT aat.asset_id FROM ai_asset_tags aat
-                      JOIN tags t ON t.tag_id = aat.tag_id
-                      WHERE t.name COLLATE NOCASE IN (${phs})`;
-          };
-          if (filter.exclude && filter.values.length > 1) {
-            const notClauses = filter.values.map(
-              () => `a.asset_id NOT IN (${taggedAssetsSubquery(1)})`,
-            );
-            conditions.push(`(${notClauses.join(' AND ')})`);
-            for (const value of filter.values) {
-              params.push(value);
-              if (includeAi) params.push(value);
-            }
-          } else if (filter.exclude) {
-            conditions.push(
-              `(a.asset_id NOT IN (${taggedAssetsSubquery(1)}))`,
-            );
-            params.push(filter.values[0]!);
-            if (includeAi) params.push(filter.values[0]!);
-          } else {
-            conditions.push(
-              `(a.asset_id IN (${taggedAssetsSubquery(filter.values.length)}))`,
-            );
-            params.push(...filter.values);
-            if (includeAi) params.push(...filter.values);
-          }
-          break;
-        }
-        case 'rating': {
-          const phs = filter.values.map(() => '?').join(',');
-          const aiRating = options.hasAiContent
-            ? `(SELECT CAST(ac.value AS INTEGER) FROM ai_content ac
-                 WHERE ac.asset_id = a.asset_id AND ac.field_name = 'rating'
-                 ORDER BY ac.generated_at DESC, ac.ai_content_id DESC LIMIT 1)`
-            : 'NULL';
-          const effectiveRating = filter.includeAi === false
-            ? 'COALESCE(m.rating, 0)'
-            : `COALESCE(NULLIF(m.rating, 0), ${aiRating}, 0)`;
-          const clause = filter.exclude
-            ? `${effectiveRating} NOT IN (${phs})`
-            : `${effectiveRating} IN (${phs})`;
-          conditions.push(`(${clause})`);
-          for (const v of filter.values) {
-            params.push(Number(v));
-          }
-          break;
-        }
-        case 'availability': {
-          const phs = filter.values.map(() => '?').join(',');
-          const clause = filter.exclude
-            ? `a.availability NOT IN (${phs})`
-            : `a.availability IN (${phs})`;
-          conditions.push(`(${clause})`);
-          params.push(...filter.values);
-          break;
-        }
-        case 'color': {
-          const ids = parseColorFilterIds(filter.values.join(','));
-          const built = colorFilterSql(
-            'palette_meta.dominant_hue',
-            ids,
-            filter.exclude,
-          );
-          if (!built) {
-            conditions.push('1 = 0');
-            break;
-          }
-          conditions.push(built.sql);
-          params.push(...built.params);
-          break;
-        }
-        default:
-          // Unknown field: force no results.
-          conditions.push('1 = 0');
-      }
-    }
-
-    return { sql: conditions.length > 0 ? conditions.join(' AND ') : '', params };
+    return buildCatalogFilterWhere(filters, options);
   }
 
   createBrowseSession(input: {
@@ -31230,7 +30756,7 @@ export class LibraryService {
     query?: { clauses: SearchClause[]; groups?: SearchGroup[] } | null;
     filters?: FilterClause[] | null;
     scope?: SearchScope | null;
-    sort?: { field: string; order: 'asc' | 'desc' } | null;
+    sort?: SortDefinition | null;
     limit?: number | null;
     offset?: number | null;
     /** Serpent-6w7n: fetch entire browse scope (lightweight rows, capped). */
@@ -31307,7 +30833,7 @@ export class LibraryService {
     // search instead of referencing a missing MATCH table.
     const useTrigramIndex = hasQuery && hasSearchIndex && hasSearchFts && ftsCanNarrowSearchGroups(searchGroups);
     const fts5Query = useTrigramIndex
-      ? buildTrigramFts5Query(searchGroups)
+      ? buildCatalogFtsQuery(searchGroups)
       : null;
     const { sql: contextualSearchWhere, params: contextualSearchParams } = hasQuery
       ? buildContextualSearchWhere(searchGroups, !hasSearchIndex)
@@ -31324,170 +30850,35 @@ export class LibraryService {
     // correlated ORDER BY subquery for every candidate asset, which made a
     // recursive collection disproportionately slower than an equivalent
     // folder browse on large libraries.
-    const collectionScope = input.scope?.kind === 'collection'
-      ? (() => {
-          const collection = connection
-            .prepare('SELECT collection_id FROM collections WHERE collection_id = ? AND library_id = ?')
-            .get(input.scope.collectionId, openLibrary.summary.libraryId);
-          if (!collection) throw new LibraryServiceError('FOLDER_NOT_FOUND');
-          if (input.scope.recursive) {
-            // Serpent-4bdd26: a leaf collection's recursive scope is exactly
-            // its own membership — the recursive CTE + GROUP BY shape forces a
-            // full collection_assets scan (~37ms on 20k) for the same rows.
-            // One indexed child probe picks the cheap shape.
-            const hasChildren = connection
-              .prepare(
-                'SELECT 1 FROM collections WHERE parent_id = ? AND library_id = ? LIMIT 1',
-              )
-              .get(input.scope.collectionId, openLibrary.summary.libraryId);
-            if (!hasChildren) {
-              return {
-                queryPrefix: `WITH collection_scope AS (
-                  SELECT asset_id, position AS collection_position
-                    FROM collection_assets
-                   WHERE collection_id = ?
-                ) `,
-                join: 'JOIN collection_scope ON collection_scope.asset_id = a.asset_id',
-                params: [input.scope.collectionId],
-              };
-            }
-            return {
-              queryPrefix: `WITH RECURSIVE collection_descendants(collection_id) AS (
-                SELECT collection_id FROM collections WHERE collection_id = ? AND library_id = ?
-                UNION ALL
-                SELECT child.collection_id FROM collections child
-                  JOIN collection_descendants parent ON child.parent_id = parent.collection_id
-                 WHERE child.library_id = ?
-              ),
-              collection_scope AS (
-                SELECT ca.asset_id, MIN(ca.position) AS collection_position
-                  FROM collection_assets ca
-                  JOIN collection_descendants d ON d.collection_id = ca.collection_id
-                 GROUP BY ca.asset_id
-              ) `,
-              join: 'JOIN collection_scope ON collection_scope.asset_id = a.asset_id',
-              params: [
-                input.scope.collectionId,
-                openLibrary.summary.libraryId,
-                openLibrary.summary.libraryId,
-              ],
-            };
-          }
-          return {
-            queryPrefix: `WITH collection_scope AS (
-              SELECT asset_id, position AS collection_position
-                FROM collection_assets
-               WHERE collection_id = ?
-            ) `,
-            join: 'JOIN collection_scope ON collection_scope.asset_id = a.asset_id',
-            params: [input.scope.collectionId],
-          };
-        })()
+    const collectionScopeResult = input.scope?.kind === 'collection'
+      ? buildCatalogCollectionScope(connection, {
+          libraryId: openLibrary.summary.libraryId,
+          collectionId: input.scope.collectionId,
+          recursive: input.scope.recursive,
+        })
+      : null;
+    if (collectionScopeResult?.status === 'missing') {
+      throw new LibraryServiceError('FOLDER_NOT_FOUND');
+    }
+    const collectionScope = collectionScopeResult?.status === 'ready'
+      ? collectionScopeResult.scope
       : null;
 
-    // Build ORDER BY clause. Search relevance parameters appear after WHERE
-    // parameters in the final data query; collection scope parameters belong
-    // to the CTE prefix and are supplied before the WHERE parameters below.
-    let orderBy: string;
-    const orderParams: unknown[] = [];
-    if (hasPositiveQuery && !input.sort) {
-      // Serpent-verg.2 — relevance ranking requires the search index table;
-      // without it (or when no field ranks apply) fall back to the default
-      // name sort instead of emitting an invalid ORDER BY ordinal.
-      const relevance = hasSearchIndex
-        ? buildContextualSearchRank(searchGroups)
-        : { sql: '', params: [] };
-      if (relevance.sql) {
-        orderBy = `${relevance.sql} ASC, a.relative_file_path ASC, a.asset_id ASC`;
-        orderParams.push(...relevance.params);
-      } else {
-        orderBy = `a.relative_file_path ASC, a.asset_id ASC`;
-      }
-    } else if (input.sort) {
-      const sortField = input.sort.field;
-      const dir = input.sort.order === 'desc' ? 'DESC' : 'ASC';
-      // Serpent-verg.2 — lenient read: sorting by a column that an older
-      // library does not have degrades to the default name sort instead of
-      // failing the query.
-      const sortableByStructure = {
-        modified_at: revisionColumns.has('modified_at'),
-        byte_size: revisionColumns.has('byte_size'),
-        rating: metadataColumns.has('rating'),
-        author: metadataColumns.has('author'),
-        duration: artifactColumns.has('duration_ms'),
-        long_edge: artifactColumns.has('width') && artifactColumns.has('height'),
-        color: artifactColumns.has('dominant_hue') && artifactColumns.has('dominant_lightness'),
-      };
-      const defaultNameSort = `a.relative_file_path ASC, a.asset_id ASC`;
-      switch (sortField) {
-        case 'name':
-          orderBy = `a.relative_file_path ${dir}, a.asset_id ASC`;
-          break;
-        case 'modified_at':
-          orderBy = sortableByStructure.modified_at
-            ? `r.modified_at ${dir}, a.asset_id ASC`
-            : defaultNameSort;
-          break;
-        case 'created_at':
-          orderBy = `a.created_at ${dir}, a.asset_id ASC`;
-          break;
-        case 'byte_size':
-          orderBy = sortableByStructure.byte_size
-            ? `r.byte_size ${dir}, a.asset_id ASC`
-            : defaultNameSort;
-          break;
-        case 'long_edge': {
-          if (!sortableByStructure.long_edge) {
-            orderBy = defaultNameSort;
-            break;
-          }
-          // Same long-edge expression as REQ-FILTER-010 numeric filters.
-          const width =
-            'COALESCE(duration_meta.width, technical_thumbnail.width)';
-          const height =
-            'COALESCE(duration_meta.height, technical_thumbnail.height)';
-          const longEdge =
-            `NULLIF(MAX(COALESCE(${width}, 0), COALESCE(${height}, 0)), 0)`;
-          orderBy = `${longEdge} IS NULL ASC, ${longEdge} ${dir}, a.asset_id ASC`;
-          break;
-        }
-        case 'duration':
-          orderBy = sortableByStructure.duration
-            ? `duration_meta.duration_ms IS NULL ASC, duration_meta.duration_ms ${dir}, a.asset_id ASC`
-            : defaultNameSort;
-          break;
-        case 'rating':
-          orderBy = sortableByStructure.rating
-            ? `${hasAiContent
-              ? `COALESCE(NULLIF(m.rating, 0), (SELECT CAST(ac.value AS INTEGER) FROM ai_content ac WHERE ac.asset_id = a.asset_id AND ac.field_name = 'rating' ORDER BY ac.generated_at DESC, ac.ai_content_id DESC LIMIT 1), 0)`
-              : 'COALESCE(m.rating, 0)'} ${dir}, a.asset_id ASC`
-            : defaultNameSort;
-          break;
-        case 'author':
-          orderBy = sortableByStructure.author
-            ? `COALESCE(m.author, '') = '' ASC, COALESCE(m.author, '') COLLATE NOCASE ${dir}, a.asset_id ASC`
-            : defaultNameSort;
-          break;
-        case 'color':
-          orderBy = sortableByStructure.color
-            ? `palette_meta.dominant_hue IS NULL ASC,
-               palette_meta.dominant_hue ${dir},
-               palette_meta.dominant_lightness ${dir},
-               a.asset_id ASC`
-            : defaultNameSort;
-          break;
-        default:
-          orderBy = defaultNameSort;
-      }
-    } else if (sessionMode) {
-      orderBy = 'a.asset_id ASC';
-    } else if (collectionScope) {
-      orderBy = 'collection_scope.collection_position ASC, a.relative_file_path ASC, a.asset_id ASC';
-    } else if (input.scope?.kind === 'trash') {
-      orderBy = `a.deleted_at DESC, a.asset_id ASC`;
-    } else {
-      orderBy = `a.relative_file_path ASC, a.asset_id ASC`;
-    }
+    // Collection CTE bindings precede WHERE bindings; relevance bindings are
+    // appended after them in the data query.
+    const { sql: orderBy, params: orderParams } = buildCatalogSortOrder({
+      hasPositiveQuery,
+      searchGroups,
+      hasSearchIndex,
+      sort: input.sort,
+      revisionColumns,
+      metadataColumns,
+      artifactColumns,
+      hasAiContent,
+      sessionMode,
+      collectionScoped: collectionScope !== null,
+      trashScope: input.scope?.kind === 'trash',
+    });
 
     // Keep the ordinary browse/count path narrow. These artifact joins used
     // to run for every browse and search request even though they are only
@@ -31618,27 +31009,13 @@ export class LibraryService {
       );
       allParams.push(...pageAssetIds);
     } else {
-      // Soft-deleted assets retain their organization relationships for restore.
-      // They are only exposed through the explicit trash scope; every other
-      // discovery query excludes them.
-      whereParts.push(input.scope?.kind === 'trash'
-        ? 'a.deleted_at IS NOT NULL'
-        : 'a.deleted_at IS NULL');
-      // Serpent-verg.2 — lenient read: the ignore/sequence-frame subqueries
-      // reference tables that older libraries do not have; the conditions are
-      // only added when the tables exist.
-      if (hasIgnoreTable) {
-        whereParts.push('NOT EXISTS (SELECT 1 FROM linked_ignored_assets ignored WHERE ignored.asset_id = a.asset_id)');
-      }
-      whereParts.push(this.explicitIgnoreSql(connection, 'a', input.showIgnored === true));
-      if (hasSequenceFrames) {
-        whereParts.push(`NOT EXISTS (
-          SELECT 1
-            FROM asset_sequence_frames hidden_sequence_frame
-           WHERE hidden_sequence_frame.asset_id = a.asset_id
-             AND hidden_sequence_frame.position > 0
-        )`);
-      }
+      whereParts.push(...buildCatalogAssetVisibilityPredicates({
+        scopeKind: input.scope?.kind === 'trash' ? 'trash' : 'all',
+        showIgnored: input.showIgnored === true,
+        explicitIgnoreSql: this.explicitIgnoreSql(connection, 'a', input.showIgnored === true),
+        hasLinkedIgnoredAssets: hasIgnoreTable,
+        hasSequenceFrames,
+      }));
 
       if (filterWhere.length > 0) {
         whereParts.push(filterWhere);
@@ -31646,67 +31023,15 @@ export class LibraryService {
       }
 
     if (input.scope?.kind === 'folder') {
-      if (input.scope.folderId === null) {
-        whereParts.push(
-          input.scope.recursive
-            ? `a.location_kind = 'managed'`
-            : `a.location_kind = 'managed' AND a.managed_folder_id IS NULL`,
-        );
-      } else {
-        const folderId = input.scope.folderId;
-        const managed = connection
-          // A library database owns exactly one library, so managed_folders
-          // intentionally has no library_id column. linked_folders does.
-          .prepare('SELECT folder_id FROM managed_folders WHERE folder_id = ?')
-          .get(folderId);
-        const linked = connection
-          .prepare('SELECT folder_id FROM linked_folders WHERE folder_id = ? AND library_id = ?')
-          .get(folderId, openLibrary.summary.libraryId);
-        if (managed) {
-          if (input.scope.recursive) {
-            whereParts.push(`a.managed_folder_id IN (
-              WITH RECURSIVE descendants(folder_id) AS (
-                SELECT folder_id FROM managed_folders WHERE folder_id = ?
-                UNION ALL
-                SELECT child.folder_id FROM managed_folders child
-                  JOIN descendants parent ON child.parent_folder_id = parent.folder_id
-              )
-              SELECT folder_id FROM descendants
-            )`);
-            allParams.push(folderId);
-          } else {
-            whereParts.push('a.managed_folder_id = ?');
-            allParams.push(folderId);
-          }
-        } else {
-          const linkedScope = this.resolveLinkedFolderScope(openLibrary, folderId);
-          if (!linkedScope && !linked) throw new LibraryServiceError('FOLDER_NOT_FOUND');
-          const linkedFolderId = linkedScope?.linkedFolderId ?? folderId;
-          const relativePath = linkedScope?.relativePath ?? '';
-          whereParts.push('a.linked_folder_id = ?');
-          allParams.push(linkedFolderId);
-          if (!input.scope.recursive) {
-            if (relativePath === '') {
-              whereParts.push(`instr(a.relative_file_path, '/') = 0`);
-            } else {
-              const escaped = relativePath
-                .replaceAll('\\', '\\\\')
-                .replaceAll('%', '\\%')
-                .replaceAll('_', '\\_');
-              whereParts.push(
-                `a.relative_file_path LIKE ? ESCAPE '\\' AND instr(substr(a.relative_file_path, ?), '/') = 0`,
-              );
-              allParams.push(`${escaped}/%`, relativePath.length + 2);
-            }
-          } else if (relativePath !== '') {
-            const prefix = `${relativePath}/`;
-            whereParts.push(
-              `(a.relative_file_path = ? OR substr(a.relative_file_path, 1, ?) = ?)`,
-            );
-            allParams.push(relativePath, [...prefix].length, prefix);
-          }
-        }
+      const folderScope = buildCatalogFolderScopeClause(connection, {
+        libraryId: openLibrary.summary.libraryId,
+        scope: input.scope,
+      });
+      if (folderScope.status === 'missing') {
+        throw new LibraryServiceError('FOLDER_NOT_FOUND');
       }
+      whereParts.push(folderScope.sql);
+      allParams.push(...folderScope.params);
     }
     }
 
@@ -31855,37 +31180,10 @@ export class LibraryService {
       const layout = new Array<object>(rows.length);
       for (let index = 0; index < rows.length; index++) {
         const row = rows[index]!;
-        const width = row.layout_width ?? null;
-        const height = row.layout_height ?? null;
         const mediaType = LibraryService.toSummaryMediaType(
           LibraryService.detectMediaType(row.relative_file_path),
         );
-        const sourceDirect = row.layout_availability === 'available'
-          && !row.layout_deleted_at
-          && isSourceDirectPreview({
-            fileName: row.relative_file_path,
-            mediaType,
-            byteSize: row.layout_byte_size ?? 0,
-            width,
-            height,
-          });
-        const entry: Record<string, unknown> = {
-          assetId: row.asset_id,
-          width,
-          height,
-          previewArtifactId: row.layout_preview_artifact_id ?? null,
-          displayName: path.posix.basename(row.relative_file_path),
-          relativeFilePath: row.relative_file_path,
-          mediaType,
-        };
-        if (sourceDirect) {
-          entry.previewKind = 'source';
-          entry.previewRevisionId = row.layout_revision_id ?? null;
-        }
-        if (row.layout_byte_size != null) entry.byteSize = row.layout_byte_size;
-        if (row.layout_modified_at != null) entry.modifiedAt = row.layout_modified_at;
-        if (row.layout_rating != null) entry.rating = row.layout_rating;
-        layout[index] = entry;
+        layout[index] = catalogBrowseLayoutEntryFromRow(row, mediaType);
       }
       if (defaultBrowseIndexRequest) {
         const browseIndexSequenceAfter = this.getBrowseChangeSequence(input.libraryId);
@@ -32922,87 +32220,9 @@ export class LibraryService {
   }
 
   private assetSummaryFromRow(
-    row: {
-      asset_id: string;
-      location_kind: 'managed' | 'linked';
-      managed_folder_id: string | null;
-      linked_folder_id?: string | null;
-      relative_file_path: string;
-      current_revision_id: string;
-      availability: 'available' | 'missing';
-      byte_size: number;
-      modified_at: string;
-      rating: number;
-      favorite: number;
-      deleted_at?: string | null;
-      trashed_from_relative_path?: string | null;
-      trashed_from_tombstone_id?: string | null;
-      thumbnail_status?: 'ready' | 'pending' | 'failed' | null;
-      thumbnail_artifact_id?: string | null;
-      media_type?: 'image' | 'video' | 'audio' | 'text' | 'model' | 'document' | 'other' | null;
-      artifact_width?: number | null;
-      artifact_height?: number | null;
-      artifact_duration_ms?: number | null;
-    },
+    row: CatalogAssetSummaryRow,
   ): AssetSummary {
-    let remainingDays: number | null = null;
-    if (row.deleted_at) {
-      const deletedMs = new Date(row.deleted_at).getTime();
-      const expiryMs = deletedMs + 30 * 24 * 60 * 60 * 1000;
-      remainingDays = Math.max(0, Math.ceil((expiryMs - Date.now()) / (24 * 60 * 60 * 1000)));
-    }
-    const mediaType = row.media_type ?? 'other';
-    // Probe writes width/height 0 for audio-only streams; AssetSummary
-    // requires positive-or-null, so coerce zeros before both serialization and
-    // the bounded source-direct decision.
-    const width =
-      row.artifact_width != null && row.artifact_width > 0
-        ? row.artifact_width
-        : null;
-    const height =
-      row.artifact_height != null && row.artifact_height > 0
-        ? row.artifact_height
-        : null;
-    const sourceDirect = row.availability === 'available'
-      && !row.deleted_at
-      && isSourceDirectPreview({
-        fileName: row.relative_file_path,
-        mediaType,
-        byteSize: row.byte_size,
-        width,
-        height,
-      });
-    return {
-      assetId: row.asset_id,
-      locationKind: row.location_kind,
-      managedFolderId: row.managed_folder_id,
-      linkedFolderId: row.linked_folder_id ?? null,
-      relativeFilePath: row.relative_file_path,
-      displayName: path.posix.basename(row.relative_file_path),
-      currentRevisionId: row.current_revision_id,
-      byteSize: row.byte_size,
-      modifiedAt: row.modified_at,
-      availability: row.availability,
-      rating: row.rating,
-      favorite: row.favorite !== 0,
-      deletedAt: row.deleted_at ?? null,
-      trashedFromPath: row.trashed_from_relative_path ?? null,
-      trashedFromTombstoneId: row.trashed_from_tombstone_id ?? null,
-      remainingDays,
-      thumbnailStatus: row.thumbnail_status ?? null,
-      thumbnailArtifactId: row.thumbnail_artifact_id ?? null,
-      ...(sourceDirect
-        ? {
-            previewKind: 'source' as const,
-            previewRevisionId: row.current_revision_id,
-          }
-        : {}),
-      mediaType,
-      width,
-      height,
-      durationMs: row.artifact_duration_ms ?? null,
-      sequence: null,
-    };
+    return catalogAssetSummaryFromRow(row);
   }
 
   private managedMoveSummaries(openLibrary: OpenLibrary, assetIds: string[]): AssetSummary[] {
@@ -38418,46 +37638,23 @@ export class LibraryService {
     alias = 'a',
     showIgnored = false,
   ): string {
-    if (showIgnored) return '1 = 1';
+    if (showIgnored) {
+      return buildCatalogExplicitIgnoreSql({
+        alias,
+        showIgnored,
+        hasExplicitIgnorePaths: false,
+        hasGitignoreIgnoredPaths: false,
+      });
+    }
     // Serpent-verg.2 — lenient read (0031 §1): libraries predating the
     // ignore-rule tables have no ignored paths to exclude; skip the
     // subqueries instead of failing on the missing tables.
-    if (
-      !hasTable(connection, 'explicit_ignored_paths') ||
-      !hasTable(connection, 'gitignore_ignored_paths')
-    ) {
-      return '1 = 1';
-    }
-    return `NOT EXISTS (
-      SELECT 1
-        FROM explicit_ignored_paths ignored_path
-       WHERE ignored_path.location_kind = ${alias}.location_kind
-         AND ignored_path.linked_folder_id = COALESCE(${alias}.linked_folder_id, '')
-         AND (
-           (ignored_path.path_kind = 'asset' AND ignored_path.relative_path = ${alias}.relative_file_path)
-           OR (ignored_path.path_kind = 'folder' AND (
-             ignored_path.relative_path = ''
-             OR ${alias}.relative_file_path = ignored_path.relative_path
-             OR ${alias}.relative_file_path LIKE ignored_path.relative_path || '/%'
-           ))
-           OR (ignored_path.path_kind = 'extension' AND
-             LOWER(${alias}.relative_file_path) LIKE '%.' || LOWER(ignored_path.relative_path))
-         )
-    )
-    AND NOT EXISTS (
-      SELECT 1
-        FROM gitignore_ignored_paths gitignore_path
-       WHERE ${alias}.location_kind = 'managed'
-         AND (
-           (gitignore_path.path_kind = 'asset' AND
-             gitignore_path.relative_path = ${alias}.relative_file_path)
-           OR (gitignore_path.path_kind = 'folder' AND (
-             gitignore_path.relative_path = ''
-             OR ${alias}.relative_file_path = gitignore_path.relative_path
-             OR ${alias}.relative_file_path LIKE gitignore_path.relative_path || '/%'
-           ))
-         )
-    )`;
+    return buildCatalogExplicitIgnoreSql({
+      alias,
+      showIgnored,
+      hasExplicitIgnorePaths: hasTable(connection, 'explicit_ignored_paths'),
+      hasGitignoreIgnoredPaths: hasTable(connection, 'gitignore_ignored_paths'),
+    });
   }
 
   private explicitFolderIgnored(
