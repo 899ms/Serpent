@@ -27,15 +27,19 @@
 | PERF2-10 / `Serpent-6db419` | 最终独立双轴审查与本地/SMB性能验收 | PERF2-04、PERF2-05、PERF2-06、PERF2-07、PERF2-08、PERF2-09 | Luna Extra High；未开始 |
 <!-- PERF2_TICKETS_END -->
 
-2026-09-14 当前实例诊断补充了三个窄前置，详见[文件夹切换与资源加载性能优化方向](../implementation/2026-09-14-folder-switch-and-resource-loading-optimization.md)：
+2026-09-14 两轮当前实例诊断补充了七个窄边界，详见[文件夹切换与资源加载性能优化方向](../implementation/2026-09-14-folder-switch-and-resource-loading-optimization.md)：
 
 | 工单 | 交付边界 | 关系 / 状态 |
 | --- | --- | --- |
 | `Serpent-26f22b` | 打开对账消除逐文件探针放大并补齐阶段指标 | PERF2-07 前置；未开始 |
 | `Serpent-e97c00` | 任务状态事件化与有界 single-flight 轮询 | `Serpent-52eed4` 剩余根因；未开始 |
 | `Serpent-1de919` | ready artifact 与冗余派生任务队列收敛 | PERF2-09 前置；未开始 |
+| `Serpent-be29a9` | 对账时间片归还后台许可，消除预览路径优先级反转 | PERF2-07 调度前置；未开始 |
+| `Serpent-8ee170` | thumbnail 完成后的 drag-cache 预热有界合并 | 独立小边界；未开始 |
+| `Serpent-217028` | 2,000 后台任务下 navigation span 与对照回放 | 前台资源预算的测量前置；未开始 |
+| `Serpent-7ac453` | foreground epoch 与后台媒体自适应降载 | 依赖 `Serpent-217028`；未开始 |
 
-这三个工单只细化已实测的瓶颈，不取代 PERF2-02/03/04/08 的读隔离、首屏和媒体缓存直达范围。
+这些工单只细化已实测的瓶颈，不取代 PERF2-02/03/04/08 的读隔离、首屏和媒体缓存直达范围。当前实例只直接证明二十多秒的 maintenance admission 占用、路径等待和队列增长；用户观察的忙碌近一分钟与暂停后低于 0.5 秒保留为现场对照，待 `Serpent-217028` 用同一 navigationId 补齐端到端证据。
 
 ## 模型、所有权与串行规则
 
